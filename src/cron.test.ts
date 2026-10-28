@@ -25,7 +25,6 @@ function cronHandler(): CronHandler {
 /** 记录所有调用，用来断言「空闲时没碰 DO」 */
 function mockCtx(options: {
   dueSchedules?: unknown[]
-  pendingDrain?: boolean
   enableSchedule?: boolean
   conversations?: string[]
 } = {}) {
@@ -46,7 +45,6 @@ function mockCtx(options: {
     kv: {
       async get(key: string) {
         calls.kvGet += 1
-        if (key === 'pending_drain') return options.pendingDrain ? '1' : null
         return null
       },
       async getJSON(key: string) {
@@ -105,7 +103,7 @@ function mockCtx(options: {
 
 describe('cron 空闲时不浪费额度', () => {
   it('没有定时任务、没有待跑 run 时，一次 DO 都不调', async () => {
-    const { ctx, calls } = mockCtx({ enableSchedule: false, pendingDrain: false })
+    const { ctx, calls } = mockCtx({ enableSchedule: false })
     await cronHandler()({ ctx, job: 'tick', scheduledAt: Date.now() })
 
     expect(calls.durableGet).toBe(0)
@@ -126,25 +124,31 @@ describe('cron 空闲时不浪费额度', () => {
     expect(calls.durableGet).toBe(0)
   })
 
-  it('空闲时 KV 只读一两次（不读 conversations 列表）', async () => {
-    const { ctx, calls } = mockCtx({ enableSchedule: false, pendingDrain: false })
-    await cronHandler()({ ctx, job: 'tick', scheduledAt: Date.now() })
-
-    // 只读了 pending_drain 一次；没有遍历会话列表
-    expect(calls.kvGet).toBeLessThanOrEqual(2)
-  })
-
-  it('有待跑 run 标记时才逐个会话 poll，且一个会话只取一次 stub', async () => {
+  it('cron 不再轮询消息队列（队列由 release 链式处理）', async () => {
     const { ctx, calls } = mockCtx({
       enableSchedule: false,
-      pendingDrain: true,
       conversations: ['group:g1', 'c2c:u1'],
     })
 
     await cronHandler()({ ctx, job: 'tick', scheduledAt: Date.now() })
 
-    // 两个会话各一次。上一版清理和捡队列各遍历一遍，同一个会话会被取两次
-    expect(calls.durableGet).toBe(2)
+    // 即使有已知会话，cron 也不该去 poll——那是事件处理器的活
+    expect(calls.durableGet).toBe(0)
+  })
+
+  it('清理到期时才会碰 DO（每 10 分钟一次）', async () => {
+    const { ctx, calls } = mockCtx({
+      enableSchedule: false,
+      conversations: ['group:g1', 'c2c:u1'],
+    })
+
+    // 第一次 tick：节流状态初始为 0，会触发清理
+    await cronHandler()({ ctx, job: 'tick', scheduledAt: Date.now() })
+    const afterFirst = calls.durableGet
+
+    // 第二次 tick：节流未到期，不碰 DO
+    await cronHandler()({ ctx, job: 'tick', scheduledAt: Date.now() })
+    expect(calls.durableGet).toBe(afterFirst)
   })
 
   it('有到期定时任务时才会跑 fireDueSchedules', async () => {

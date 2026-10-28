@@ -30,7 +30,7 @@ import { AgentObject } from './do/agent-object.js'
 import type { HistoryRow } from './do/agent-object.js'
 import type { InboundMessage } from './types.js'
 import type { LLMService } from './llm/contract.js'
-import { executeRun, replyFromSession } from './agent/run.js'
+import { executeRun, replyFromSession, type RunDeps } from './agent/run.js'
 import { conversationKey, isTextMessage, toInboundMessage } from './agent/inbound.js'
 import { hydrateImageAttachments } from './agent/media.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
@@ -177,41 +177,40 @@ export default definePlugin<AgentConfig>({
 
   cron: {
     /**
-     * 每分钟一次。三件事：捡队列、跑定时任务、清理。
+     * 每分钟一次。**只做两件事**：检查到期的定时任务、清理过期数据。
+     *
+     * ## 为什么不在这里轮询消息队列
+     *
+     * 队列里的 run 只有一种来源：同会话正忙时新消息入队。而上一个 run 跑完后
+     * `release()` 会顺手认领下一个并返回，事件处理器接着跑完（见 runUntilQueueEmpty）。
+     * 所以队列正常情况下永远是空的。
+     *
+     * 每分钟对每个会话 poll 一次纯属浪费：20 个会话 = 每天 28,800 次 DO 唤醒，
+     * 而 DO 按 GB-秒计费（免费版 13,000 GB-s/日）。之前的设计正是这样，
+     * 已改成事件驱动。
+     *
+     * ## 为什么定时任务必须靠 cron
+     *
+     * 它们的触发时间散落在未来，没有任何请求会主动唤醒。这是 cron 唯一不可替代的职责。
+     * 只有 enable_schedule 打开时才查，且没到期任务时一次 D1 查询就退出。
      *
      * 注意 QFlareBot 的 cron 是**所有插件串行**跑在同一个 invocation 里，
-     * 一次 15 分钟墙钟上限。所以这里每次只处理少量 run，
-     * 单次控制在 20 秒内，不拖累别的插件。
+     * 墙钟上限 15 分钟。所以这里单次控制在 20 秒内，不拖累别的插件。
      */
     tick: {
       cron: '* * * * *',
       async handler({ ctx }) {
-        // 先花一次 D1 查询判断「今天有没有活」。
-        //
-        // 上一版直接 drainQueues：读 KV 拿到会话列表，再对**每个会话**调一次 DO poll()。
-        // 即使队列全空也照做——20 个会话就是每天 28,800 次 DO 唤醒。
-        // DO 按 GB-秒计费，空转唤醒纯浪费。
-        //
-        // 现在：没有到期的定时任务、也没有待跑 run 时，一次 D1 查询就退出。
         const hasDueSchedule = ctx.config.enable_schedule
           ? (await listDueSchedules(ctx.db, Date.now(), 1)).length > 0
           : false
 
-        if (!hasDueSchedule) {
-          // 队列里的 run 由事件处理器的 waitUntil 兜着跑完；
-          // 只有事件处理器超预算时才会留下尾巴，那种情况由下面兜底
-          const pending = await hasPendingRuns(ctx)
-          if (!pending) return
-        }
-
-        const now = Date.now()
-        const prune = shouldPrune(ctx, now)
-        if (prune) pruneThrottle.at = now
-
         if (hasDueSchedule) await fireDueSchedules(ctx)
 
-        // 一次遍历同时做「捡队列」和「清理终态 run」，避免对每个会话取两次 stub
-        await drainQueues(ctx, { prune })
+        const now = Date.now()
+        if (shouldPrune(ctx, now)) {
+          pruneThrottle.at = now
+          await pruneSettledRuns(ctx)
+        }
         await maybePruneAudit(ctx)
       },
     },
@@ -285,7 +284,7 @@ async function handleMessage(
   //
   // 正确做法：超时只停止"等待"，任务本身仍然跑完并自己 release。
   // 超时那一刻告诉用户一声，但不再补第二条。
-  const running = executeRun(
+  const running = runUntilQueueEmpty(
     { ctx, logger, config, llm, agent: stub, reply },
     claimed.runId,
     message,
@@ -300,20 +299,35 @@ async function handleMessage(
     })
     // 只提示一次，不 await 任务本身
     await reply('这个问题要多花点时间，我处理完会直接回复你。').catch(() => false)
-    // 设标记让 cron 知道「可能有尾巴要捡」。
-    // 正常情况下 running 会在 waitUntil 里跑完并自己 release，
-    // 标记只是兜底——真跑完了 cron 那边 poll 也是空转一次就清掉
-    await ctx.kv.put('pending_drain', '1').catch(() => {})
+    // 让任务在本次请求的后台继续跑完（ctx.waitUntil 保证它不会被提前取消）。
+    // runUntilQueueEmpty 会一路把队列跑空，所以不需要额外标记让 cron 兜底。
+    ctx.waitUntil(running.catch(() => undefined))
+  }
+}
 
-    // 让任务在本次请求的后台继续（ctx.waitUntil 保证它不会被提前取消）
-    ctx.waitUntil(
-      running
-        .catch(() => undefined)
-        .finally(() => {
-          // 跑完了就清标记，cron 不用再挨个 poll
-          void ctx.kv.delete('pending_drain').catch(() => {})
-        }),
-    )
+/**
+ * 跑一个 run，跑完接着跑队列里的下一个，直到队列空或超出预算。
+ *
+ * **为什么不需要 cron 定期唤醒**：队列里的 run 只有两种情况——
+ * 1. 同会话正忙时新消息入队 → 上一个跑完就立刻接着跑，延迟只有几秒
+ * 2. 事件处理器超预算 → `ctx.waitUntil` 里这条链会继续跑到队列空
+ *
+ * 所以正常情况下队列永远是空的，cron 不需要每分钟轮询它。
+ * cron 唯一的职责是「检查有没有到期的定时任务」。
+ */
+async function runUntilQueueEmpty(
+  deps: RunDeps,
+  runId: string,
+  message: InboundMessage,
+): Promise<void> {
+  // executeRun 内部的 release() 会顺手认领队列里的下一个并返回，
+  // 所以这里循环到「没有下一个」为止。
+  // 上限 5 个：防止某个会话积压几十条消息时一次请求跑太久
+  for (let i = 0; i < 5; i += 1) {
+    const next = await executeRun(deps, runId, message)
+    if (!next.next?.acquired || !next.next.runId || !next.next.message) return
+    runId = next.next.runId
+    message = next.next.message
   }
 }
 
@@ -338,53 +352,24 @@ function tryLLM(ctx: PluginContext<AgentConfig>): LLMService | null {
   }
 }
 
+
 /**
- * 有没有「事件处理器没跑完、留下尾巴」的 run。
+ * 清理各会话 DO 里的终态 run。
  *
- * 正常情况下事件处理器会在 `waitUntil` 里把 run 跑完并 release，
- * 只有超预算时才会留 pending。所以这个标记由 handleMessage 在超预算时设置，
- * cron 看到标记才去逐个 poll——空闲时一次 KV 读就够。
+ * 只做清理，不捡队列——队列由 `release()` 链式处理（见 runUntilQueueEmpty）。
+ * 节流到 10 分钟一次（DELETE 类操作不必每分钟做）。
  */
-async function hasPendingRuns(ctx: PluginContext<AgentConfig>): Promise<boolean> {
-  return (await ctx.kv.get('pending_drain')) === '1'
-}
-
-/** 捡队列：每个会话的 DO 各问一次。只在 hasPendingRuns 为真时调用 */
-async function drainQueues(
-  ctx: PluginContext<AgentConfig>,
-  options: { prune: boolean },
-): Promise<void> {
-  const llm = tryLLM(ctx)
-  if (!llm) return
-
+async function pruneSettledRuns(ctx: PluginContext<AgentConfig>): Promise<void> {
   const known = (await ctx.kv.getJSON<string[]>('conversations')) ?? []
 
   for (const conversation of known) {
-    // 一个会话只取一次 stub，捡队列和清理共用
-    const stub = agentStub(ctx, conversation)
-
-    if (options.prune) {
-      try {
-        await stub.prune(RUN_RETENTION_MS)
-      } catch (error) {
-        // 某个会话的 DO 挂了不该挡住别的会话
-        ctx.logger.warn('清理 DO 里的 run 失败', { conversation, error: String(error) })
-      }
+    try {
+      await agentStub(ctx, conversation).prune(RUN_RETENTION_MS)
+    } catch (error) {
+      // 某个会话的 DO 挂了不该挡住别的会话
+      ctx.logger.warn('清理 DO 里的 run 失败', { conversation, error: String(error) })
     }
-
-    const polled = await stub.poll()
-    if (!polled.acquired || !polled.runId || !polled.message) continue
-
-    const reply = makeApiReply(ctx, polled.message)
-    await executeRun(
-      { ctx, logger: ctx.logger, config: ctx.config, llm, agent: stub, reply },
-      polled.runId,
-      polled.message,
-    )
   }
-
-  // 扫完一轮，清标记——下一分钟不必再挨个 poll
-  await ctx.kv.delete('pending_drain').catch(() => {})
 }
 
 /**

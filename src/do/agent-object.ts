@@ -177,7 +177,7 @@ export class AgentObject extends PluginDurableObject {
   async release(
     runId: string,
     result: { ok: boolean; error?: string; history?: HistoryRow[] },
-  ): Promise<void> {
+  ): Promise<AcquireResult> {
     const now = Date.now()
     const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
 
@@ -196,6 +196,13 @@ export class AgentObject extends PluginDurableObject {
     }
 
     await this.ctx.storage.delete('lock')
+
+    // 队列里还有活就立刻认领下一个并返回给调用方——调用方（事件处理器）
+    // 可以接着跑，不必等 cron。
+    //
+    // 这是「不需要定期唤醒」的关键：上一版跑完就撒手，队列里的 run 只能靠
+    // cron 每分钟轮询捡，而 DO 按 GB-秒计费，空转唤醒是纯浪费。
+    return this.claim(now)
   }
 
   /**
@@ -203,7 +210,7 @@ export class AgentObject extends PluginDurableObject {
    *
    * 与 `release` 的区别：不写历史、状态回 pending、保留 attempts 计数。
    */
-  async retryLater(runId: string, reason: string): Promise<void> {
+  async retryLater(runId: string, reason: string): Promise<AcquireResult> {
     const now = Date.now()
     const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
 
@@ -219,6 +226,10 @@ export class AgentObject extends PluginDurableObject {
     }
 
     await this.ctx.storage.delete('lock')
+
+    // **不立刻重新认领**：退回的 run 会马上被捡回来，等于无限重试，
+    // 而上游限流这类错误需要等一会儿再试。交给 cron 或下一次用户消息触发。
+    return { acquired: false }
   }
 
   // ------------------------------------------------------------ 历史

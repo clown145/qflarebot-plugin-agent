@@ -24,10 +24,20 @@ import { createScheduleTools } from '../tools/schedule.js'
 import { createVfsTools } from '../tools/vfs/tools.js'
 import { bumpDailyStats, recordToolAudit } from '../store/d1.js'
 
+/** release / retryLater 之后可能返回「队列里下一个已认领的 run」 */
+export interface NextRun {
+  acquired: boolean
+  runId?: string
+  message?: InboundMessage
+}
+
 export interface AgentStub {
   history(limit: number): Promise<HistoryRow[]>
-  release(runId: string, result: { ok: boolean; error?: string; history?: HistoryRow[] }): Promise<void>
-  retryLater(runId: string, reason: string): Promise<void>
+  release(
+    runId: string,
+    result: { ok: boolean; error?: string; history?: HistoryRow[] },
+  ): Promise<NextRun>
+  retryLater(runId: string, reason: string): Promise<NextRun>
 }
 
 export interface ReplyFn {
@@ -51,6 +61,8 @@ export interface RunOutcome {
   retryable: boolean
   /** 已经发过回复 */
   replied: boolean
+  /** 队列里顺手认领到的下一个 run。调用方可以接着跑，不必等 cron */
+  next?: NextRun
 }
 
 /**
@@ -152,7 +164,7 @@ export async function executeRun(
         createdAt: now + 1,
       })
     }
-    await agent.release(runId, { ok: true, history: historyRows })
+    const next = await agent.release(runId, { ok: true, history: historyRows })
 
     // 6. 统计（一天一行，不随消息数线性增长）
     await bumpDailyStats(ctx.db, dayKey(config.timezone), {
@@ -171,7 +183,7 @@ export async function executeRun(
       replied,
     })
 
-    return { ok: true, retryable: false, replied }
+    return { ok: true, retryable: false, replied, next }
   } catch (error) {
     const described = describeLoopError(error)
     logger.error('run 失败', {
@@ -182,8 +194,8 @@ export async function executeRun(
 
     if (described.retryable) {
       // 可重试：退回队列，让 cron 稍后捡起来
-      await agent.retryLater(runId, described.text)
-      return { ok: false, retryable: true, replied: false }
+      const next = await agent.retryLater(runId, described.text)
+      return { ok: false, retryable: true, replied: false, next }
     }
 
     // 不可重试：直接告诉用户，并标记失败

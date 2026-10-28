@@ -106,41 +106,38 @@ describe('AgentObject.poll（cron 兜底）', () => {
     expect(result.runId).toBeUndefined()
   })
 
-  it('队列里有 run 时能捡起来', async () => {
+  it('release 之后直接返回队列里的下一个（不必等 cron 轮询）', async () => {
     const { obj } = makeObject()
     await obj.submit(message({ text: '第一条' }))
     await obj.submit(message({ text: '第二条' })) // 进队列
 
-    // 模拟第一个 run 跑完释放锁
-    const first = await obj.poll()
-    expect(first.acquired).toBe(false) // 锁还在
-
-    // 这里不 release，直接等租约过期不现实，改用 release 模拟
     const locked = await (obj as unknown as { ctx: { storage: { get(k: string): Promise<{ runId: string } | undefined> } } }).ctx.storage.get('lock')
-    await obj.release(locked!.runId, { ok: true })
+    // release 的返回值就是下一个认领到的 run
+    const next = await obj.release(locked!.runId, { ok: true })
 
-    const second = await obj.poll()
-    expect(second.acquired).toBe(true)
-    expect(second.message?.text).toBe('第二条')
+    expect(next.acquired).toBe(true)
+    expect(next.message?.text).toBe('第二条')
   })
 
   it('FIFO：同一毫秒入队时也按入队顺序（靠单调序号，不靠时间戳）', async () => {
     const { obj } = makeObject()
-    // 第一条抢到锁，后面两条进队列
+    // A 抢到锁，B、C 进队列（锁被 A 占着，所以后两条都进队列）
     await obj.submit(message({ text: 'A' }))
     await obj.submit(message({ text: 'B' }))
     await obj.submit(message({ text: 'C' }))
 
-    // 释放 A 的锁，让队列里的 B、C 能被捡
     const lock = await (obj as unknown as { ctx: { storage: { get(k: string): Promise<{ runId: string } | undefined> } } }).ctx.storage.get('lock')
-    await obj.release(lock!.runId, { ok: true })
 
-    const first = await obj.poll()
+    // release(A) 顺手认领 B，release(B) 再认领 C —— 顺序必须是 B 再 C
+    const first = await obj.release(lock!.runId, { ok: true })
     expect(first.message?.text).toBe('B')
-    await obj.release(first.runId!, { ok: true })
 
-    const second = await obj.poll()
+    const second = await obj.release(first.runId!, { ok: true })
     expect(second.message?.text).toBe('C')
+
+    // 队列空了
+    const third = await obj.release(second.runId!, { ok: true })
+    expect(third.acquired).toBe(false)
   })
 
   it('租约过期后能接管上一个执行者没跑完的 run', async () => {
@@ -224,14 +221,15 @@ describe('AgentObject.retryLater', () => {
     expect(await storage.get('lock')).toBeUndefined()
   })
 
-  it('退回后能被 poll 重新捡起来', async () => {
-    const { obj } = makeObject()
+  it('retryLater 不立刻重新认领（否则限流时会无限重试）', async () => {
+    const { obj, storage } = makeObject()
     const { runId } = await obj.submit(message({ text: '重试我' }))
-    await obj.retryLater(runId!, '限流')
+    const next = await obj.retryLater(runId!, '限流')
 
-    const taken = await obj.poll()
-    expect(taken.acquired).toBe(true)
-    expect(taken.message?.text).toBe('重试我')
+    expect(next.acquired).toBe(false)
+    // run 退回 pending，等 cron 或下一次用户消息触发
+    const run = await storage.get<{ status: string }>(`run:${runId}`)
+    expect(run?.status).toBe('pending')
   })
 })
 

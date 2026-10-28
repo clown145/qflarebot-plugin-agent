@@ -58,8 +58,8 @@ type ReleaseArg = {
 function fakeStub(overrides: Partial<AgentStub> = {}): AgentStub {
   return {
     history: async () => [],
-    release: vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {}),
-    retryLater: vi.fn<(runId: string, reason: string) => Promise<void>>(async () => {}),
+    release: vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false })),
+    retryLater: vi.fn<(runId: string, reason: string) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false })),
     ...overrides,
   } as AgentStub
 }
@@ -93,7 +93,7 @@ function replySpy(): ReplyFn & { calls: string[] } {
 describe('executeRun', () => {
   it('正常一轮：回复、写历史、release 成功', async () => {
     const reply = replySpy()
-    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
     const outcome = await executeRun(
       {
         ctx: context(),
@@ -117,7 +117,7 @@ describe('executeRun', () => {
   })
 
   it('历史里 user 行记的是 displayText（保留其他人的 @）', async () => {
-    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
     await executeRun(
       {
         ctx: context(),
@@ -141,7 +141,7 @@ describe('executeRun', () => {
   })
 
   it('模型没给文本时不写空的 assistant 行（否则占掉 history_limit 名额）', async () => {
-    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
     await executeRun(
       {
         ctx: context(),
@@ -162,8 +162,8 @@ describe('executeRun', () => {
 
   it('上游限流时退回队列，不标记失败、不回复错误文案', async () => {
     const reply = replySpy()
-    const retryLater = vi.fn<(runId: string, reason: string) => Promise<void>>(async () => {})
-    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
+    const retryLater = vi.fn<(runId: string, reason: string) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
 
     const llm = {
       ...fakeLLM(),
@@ -190,8 +190,8 @@ describe('executeRun', () => {
 
   it('不可重试错误（如认证失败）回复用户并标记失败', async () => {
     const reply = replySpy()
-    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
-    const retryLater = vi.fn<(runId: string, reason: string) => Promise<void>>(async () => {})
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
+    const retryLater = vi.fn<(runId: string, reason: string) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
 
     const llm = {
       ...fakeLLM(),
@@ -290,7 +290,7 @@ describe('executeRun', () => {
   it('定时任务以 scheduler 身份跑时不会被权限拦下（actorId 保留在消息里）', async () => {
     // 这条验证 run 把 message.userId 传进工具上下文，
     // 而 permissions/default-policy 对 actorId === 'scheduler' 有特判
-    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
     const outcome = await executeRun(
       {
         ctx: context(),
