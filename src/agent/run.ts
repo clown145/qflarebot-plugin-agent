@@ -14,7 +14,7 @@ import type { HistoryRow } from '../do/agent-object.js'
 import type { InboundMessage } from '../types.js'
 import type { LLMService } from '../llm/contract.js'
 import type { ToolRegistry } from '../tools/registry.js'
-import { buildMessages, toHistoryRows } from './context.js'
+import { buildMessages } from './context.js'
 import { describeLoopError, runAgentLoop } from './loop.js'
 import { createToolRegistry } from '../tools/registry.js'
 import { createTimeTool } from '../tools/time.js'
@@ -120,12 +120,27 @@ export async function executeRun(
       replied = await reply(result.reply.trim())
     }
 
-    // 5. 写历史（工具已经发过消息时，把 assistant 的文本也记下来）
-    const historyRows = toHistoryRows(
-      message.displayText || message.text,
-      result.reply ?? '',
-      [],
-    )
+    // 5. 写历史。
+    //
+    // 只写真正产生过的内容：assistant 那一行要有文本才写。工具已经把消息发出去时
+    // `result.reply` 是空的，硬写一条空的 assistant 行会让模型下次看到「自己说了空话」，
+    // 也会白白占掉 history_limit 的名额。
+    const historyRows: HistoryRow[] = [
+      {
+        role: 'user',
+        content: message.displayText || message.text,
+        toolCallsJson: null,
+        createdAt: Date.now(),
+      },
+    ]
+    if (result.reply?.trim()) {
+      historyRows.push({
+        role: 'assistant',
+        content: result.reply.trim(),
+        toolCallsJson: null,
+        createdAt: Date.now() + 1,
+      })
+    }
     await agent.release(runId, { ok: true, history: historyRows })
 
     // 6. 统计（一天一行，不随消息数线性增长）

@@ -54,6 +54,9 @@ const INLINE_BUDGET_MS = 18_000
 /** 审计数据保留多久 */
 const AUDIT_RETENTION_MS = 7 * 24 * 3600 * 1000
 
+/** 终态 run 在 DO 里保留多久（供处理器查询结果），之后清掉 */
+const RUN_RETENTION_MS = 10 * 60 * 1000
+
 /** 清理节流：最多每 10 分钟跑一次（删除也算 D1 写入） */
 const PRUNE_INTERVAL_MS = 10 * 60 * 1000
 
@@ -291,15 +294,36 @@ async function fireDueSchedules(
   }
 }
 
-/** 清理：节流 + 只在开启审计时清审计表 */
+/**
+ * 清理。两件事，都做节流：
+ *
+ * 1. **DO 里的终态 run**：`release()` 把 run 标成 completed/failed 但保留记录，
+ *    让处理器还能查到结果。不清的话 DO storage 会一直涨（DO storage 没有 TTL）。
+ * 2. **D1 里的工具审计**：只在开了审计时才需要。
+ *
+ * 节流用 KV（十分钟一次），比每次 cron 都全扫一遍便宜。
+ */
 async function maybePrune(ctx: PluginContext<AgentConfig>): Promise<void> {
-  if (!ctx.config.enable_audit) return
-
   const last = Number((await ctx.kv.get('last_prune')) ?? '0')
   const now = Date.now()
   if (now - last < PRUNE_INTERVAL_MS) return
 
   await ctx.kv.put('last_prune', String(now))
+
+  // DO 侧的终态 run：保留一段时间供查询，之后清掉
+  const known = (await ctx.kv.getJSON<string[]>('conversations')) ?? []
+  let prunedRuns = 0
+  for (const conversation of known) {
+    try {
+      prunedRuns += await agentStub(ctx, conversation).prune(RUN_RETENTION_MS)
+    } catch (error) {
+      // 某个会话的 DO 挂了不该挡住清理其他会话
+      ctx.logger.warn('清理 DO 里的 run 失败', { conversation, error: String(error) })
+    }
+  }
+  if (prunedRuns > 0) ctx.logger.info('清理终态 run', { count: prunedRuns })
+
+  if (!ctx.config.enable_audit) return
   const removed = await pruneToolAudit(ctx.db, now - AUDIT_RETENTION_MS)
   if (removed > 0) ctx.logger.info('清理过期审计', { removed })
 }
@@ -313,6 +337,7 @@ type AgentStub = {
   release(runId: string, result: { ok: boolean; error?: string; history?: HistoryRow[] }): Promise<void>
   retryLater(runId: string, reason: string): Promise<void>
   reset(): Promise<void>
+  prune(olderThanMs: number): Promise<number>
 }
 
 function agentStub(
