@@ -5,36 +5,38 @@
  * 它做的 HTML → 文本转换（去 script/style、压空白、按块加换行）足够 agent 读正文，
  * 而且不引入任何第三方解析库（插件体积与 CPU 都是全机器人共享的）。
  */
-import type { RegisteredTool, ToolResult } from './registry.js'
+import type { RegisteredTool, ToolResult } from './types.js'
 import { validateFetchUrl } from './http/url-safety.js'
 import { extractPageContent } from './web/extract.js'
 
 const MAX_PAGE_BYTES = 2 * 1024 * 1024
-
-interface FetchPageInput {
-  url: string
-}
+const MAX_CHARS = 20_000
 
 export function createWebTool(): RegisteredTool {
   return {
     definition: {
       name: 'web.fetch_page',
+      title: '抓取网页',
       description:
         '抓取一个网页并返回可读的正文文本（已去掉脚本、样式与标签）。' +
         '适合读文档、文章、公告。单页上限 2MB。',
-      parameters: {
+      inputSchema: {
         type: 'object',
         properties: {
           url: { type: 'string', description: '要抓取的网页地址，必须是 http 或 https' },
         },
         required: ['url'],
       },
+      // 只读、无副作用，level 1 人人可用
+      permission: { level: 1, scopes: [] },
       sideEffect: 'none',
       timeoutMs: 20_000,
+      annotations: { readOnlyHint: true, openWorldHint: true },
     },
+    source: { type: 'builtin', id: 'web', name: '网页' },
 
-    execute: async (input) => {
-      const url = (input as Partial<FetchPageInput>)?.url
+    execute: async (context) => {
+      const url = (context.input as Partial<{ url: string }>)?.url
       if (!url || typeof url !== 'string') return fail('bad_request', '缺少 url')
 
       const invalid = validateFetchUrl(url)
@@ -54,23 +56,21 @@ export function createWebTool(): RegisteredTool {
         return fail('network', error instanceof Error ? error.message : String(error))
       }
 
-      if (!response.ok) {
-        return fail('http_error', `HTTP ${response.status}`)
-      }
+      if (!response.ok) return fail('http_error', `HTTP ${response.status}`)
 
       const contentType = response.headers.get('content-type') ?? ''
       const raw = await readCapped(response, MAX_PAGE_BYTES)
 
       // 非 HTML 直接返回原文（JSON 接口、纯文本公告都常见）
       if (!contentType.includes('html')) {
-        return { status: 'success', output: { url, contentType, text: raw.slice(0, 20_000) } }
+        return { status: 'success', output: { url, contentType, text: raw.slice(0, MAX_CHARS) } }
       }
 
       const extracted = extractPageContent({
         body: raw,
         contentType,
         baseUrl: url,
-        maxChars: 20_000,
+        maxChars: MAX_CHARS,
         includeLinks: false,
       })
       return {

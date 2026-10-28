@@ -207,23 +207,31 @@ async function handleMessage(
     return
   }
 
-  // 抢到执行权：立刻跑，带软预算
-  const outcome = await withBudget(
-    executeRun(
-      { ctx, logger, config, llm, agent: stub, reply },
-      claimed.runId,
-      message,
-    ),
-    INLINE_BUDGET_MS,
+  // 抢到执行权：立刻跑，带软预算。
+  //
+  // 关键：超时后**不能**丢弃这个 Promise。上一版用 Promise.race 直接放弃等待，
+  // 结果原任务继续跑完并 reply()，同时 cron 因租约到期把同一个 run 重跑一遍，
+  // 用户收到两条回复、还写了两份历史。
+  //
+  // 正确做法：超时只停止"等待"，任务本身仍然跑完并自己 release。
+  // 超时那一刻告诉用户一声，但不再补第二条。
+  const running = executeRun(
+    { ctx, logger, config, llm, agent: stub, reply },
+    claimed.runId,
+    message,
   )
 
+  const outcome = await withBudget(running, INLINE_BUDGET_MS)
+
   if (outcome === 'timeout') {
-    // 超预算：不 release，让租约到期后由 cron 接管重跑
-    logger.warn('内联执行超预算，交给 cron 兜底', {
+    logger.warn('内联执行超预算，任务继续在后台跑', {
       conversation: message.conversation,
       runId: claimed.runId,
     })
-    await reply('这个问题需要多花点时间，我处理完会直接回复你。').catch(() => false)
+    // 只提示一次，不 await 任务本身
+    await reply('这个问题要多花点时间，我处理完会直接回复你。').catch(() => false)
+    // 让任务在本次请求的后台继续（ctx.waitUntil 保证它不会被提前取消）
+    ctx.waitUntil(running.catch(() => undefined))
   }
 }
 
@@ -277,19 +285,30 @@ async function fireDueSchedules(
     const stub = agentStub(ctx, schedule.conversation)
     const reply = makeApiReply(ctx, message)
 
-    try {
-      // 定时任务直接跑，不进队列——它自己就是"已经到点"的语义
-      const claimed = await stub.submit(message)
-      if (claimed.acquired && claimed.runId) {
-        await executeRun(
-          { ctx, logger: ctx.logger, config: ctx.config, llm, agent: stub, reply },
-          claimed.runId,
-          message,
-        )
-      }
-    } finally {
-      // 无论跑没跑成都推进时间，否则会每分钟重试同一个任务直到天荒地老
+    // 定时任务进队列。
+    //
+    // 上一版在这里写成：抢不到执行权就跳过，但 finally 里照样推进时间——
+    // 结果是会话正忙时，这个提醒被永久吞掉，用户永远收不到。
+    //
+    // 现在：submit 一定会把 run 入队。抢到就当场跑，抢不到就留给 cron，
+    // 只有真正跑过（或明确失败）才推进时间。
+    const claimed = await stub.submit(message)
+    let fired = false
+
+    if (claimed.acquired && claimed.runId) {
+      const outcome = await executeRun(
+        { ctx, logger: ctx.logger, config: ctx.config, llm, agent: stub, reply },
+        claimed.runId,
+        message,
+      )
+      fired = outcome.ok || !outcome.retryable
+    }
+
+    // 只有跑过才推进；没抢到执行权时不动 due_at，让 cron 下一分钟再试
+    if (fired) {
       await advanceSchedule(ctx.db, schedule, Date.now())
+    } else {
+      ctx.logger.info('定时任务入队等待，下次 cron 继续', { scheduleId: schedule.id })
     }
   }
 }

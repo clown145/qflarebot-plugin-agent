@@ -7,7 +7,7 @@ QFlareBot 的 Agent 插件：带工具调用的多轮对话、会话记忆、联
 ## 它做什么
 
 - **多轮对话**：每个会话（群 / 单聊）一段独立记忆，存在 Durable Object 里。
-- **工具调用**：模型可以联网查资料（`web.fetch_page`）、发 HTTP 请求（`http.request`）、看时间（`time.now`），可选开启动态定时任务。
+- **工具调用**：模型可以联网查资料、发 HTTP 请求、看时间、读写工作区文件、建定时任务。每类工具都有独立的权限级别。
 - **群聊/单聊都能用**：群里 @机器人 直接说话，不用打命令。
 
 ## 它不做什么
@@ -75,12 +75,47 @@ D1 只用来存需要跨会话全局查询的东西：定时任务、按天统�
 | `history_limit` | 20 | 每次带多少条历史。条数越多越贵 |
 | `request_timeout_ms` | 20000 | 单次模型调用超时 |
 | `enable_tools` | 开 | 工具调用总开关 |
-| `enable_vfs` | 关 | 虚拟工作区（需要 R2） |
+| `enable_vfs` | 关 | 虚拟工作区：模型可读写文件。小文本存 D1，>8KB 存 R2 |
 | `enable_schedule` | 关 | 动态定时任务 |
-| `enable_mcp` | 关 | MCP 工具 |
 | `enable_audit` | 关 | 工具调用写 D1，排障用 |
 | `show_typing` | 开 | 单聊"正在输入" |
 | `timezone` | Asia/Shanghai | 影响时间工具与提示词 |
+
+## 工具与权限
+
+权限是 6 级 + scope 的模型（照搬 serverless-agent），与 QFlareBot 的
+「命令能不能触发」是三档是两回事：命令门槛决定插件能不能跑，
+这里决定**模型能不能用某个工具**。
+
+| 工具 | 级别 | scope | 谁能用 |
+| --- | --- | --- | --- |
+| `time.now` | 1 | — | 所有人 |
+| `web.fetch_page` | 1 | — | 所有人 |
+| `vfs.read_file` / `list_dir` / `search` | 1 | `workspace:read` | 所有人（需开 `enable_vfs`） |
+| `vfs.write_file` / `mkdir` | 2 | `workspace:write` | 群成员及以上 |
+| `http.request` | 3 | `http:request` | 群主与管理员 |
+| `vfs.delete` | 3 | `workspace:write` | 群主与管理员 |
+| `schedule.create` / `cancel` | 3 | `schedule:write` | 群主与管理员（需开 `enable_schedule`） |
+| `schedule.list` | 1 | — | 所有人（需开 `enable_schedule`） |
+
+角色基线（`src/permissions/default-policy.ts`）：
+
+| 角色 | 级别 | scope |
+| --- | --- | --- |
+| 群主 / 管理员 | 4 | workspace 读写 + web + http + schedule |
+| 群成员 | 2 | workspace 读写 |
+| 单聊 / 角色未知 | 1 | workspace 只读 |
+| 定时任务（`actorId === 'scheduler'`） | 3 | 同群主 |
+
+单聊没有群角色，所以 `http.request` 和 `schedule.*` 在单聊里用不了——
+这是有意的：单聊是陌生人就能触达的入口，不该让它直接发任意 HTTP 请求。
+
+D1 里的 `{policies}` 表可以按 user / role / conversation / platform 叠加策略，
+**只能放宽不能收紧**（`maxLevel` 取最大、scopes 求并）。目前没有管理页编辑入口，
+需要手工写表。
+
+`sideEffect: 'dangerous'` 或级别 5 的工具会先要求确认：模型会向用户要一句明确答复，
+下一轮带上 `allowDangerous` 才真执行。目前没有这类工具，机制已就位。
 
 ## 命令
 
@@ -101,7 +136,12 @@ D1 只用来存需要跨会话全局查询的东西：定时任务、按天统�
 | KV 写 | 仅首次见到新会话时 | 1,000 次/日 | 够用 |
 | Worker 请求 | 1 次/消息 + cron 1,440/日 | 100,000 次/日 | 够用 |
 
-**前提**：需要 Workers Paid（$5/月）。免费版 Worker 请求 CPU 只有 10 ms、子请求上限 50——一次带工具的 agent loop 跑不完。DO 的 CPU 上限是 30 秒，但事件处理器在 Worker 里，那一段仍然受限。
+**免费版能用**。CPU 是唯一需要留意的：免费版 Worker 请求与 cron 都是 10 ms CPU（I/O 等待不计入），一次多步工具调用的 loop 可能接近这个量。真撞到限制（表现是整个 Worker 偶发 1102）有两个解法：
+
+1. 调小 `max_model_steps`（默认 8，可以降到 4）。
+2. 把 loop 挪进 DO 跑——DO 的 CPU 上限比 Worker 请求宽得多（serverless-agent 就是这么做的：它的 agent loop 跑在 DO 的 `alarm()` 里，所以免费版够用）。本插件目前 loop 在事件处理器与 cron 里跑，挪进 DO 需要框架再给 `DurableContext` 加 `service()`（现在只有 `api`），是后续可以做的优化。
+
+付费版（$5/月）把这两个限制都放开，省心。
 
 ## 开发
 
@@ -148,22 +188,33 @@ src/
 
 ## 从 serverless-agent 搬了什么
 
-本插件的 agent loop、工具协议、上下文装配、DO mailbox 思路来自 [serverless-agent](https://github.com/clown145/serverless-agent)（GPL-3.0-or-later）。按行数算，那边 36,487 行里约 5,500 行可零改动复制、13,000 行改存储后可用，其余（平台适配 5,741 行、Worker 路由 5,866 行、模型层 2,358 行、面板 13,670 行）没有迁移价值。
+本插件的设计来自 [serverless-agent](https://github.com/clown145/serverless-agent)（GPL-3.0-or-later）。
+**原样复制**的只有两个文件，其余是参考结构与思路后重写的：
 
-实际搬过来的：
+| 来源 | 处理方式 | 说明 |
+| --- | --- | --- |
+| `src/tools/http/url-safety.ts` | 原样复制（151 行） | SSRF 黑名单，零依赖 |
+| `src/tools/web/extract.ts` | 原样复制（172 行） | HTML → 文本，零依赖 |
+| `src/vfs/core/path.ts` | 原样复制（69 行） | 路径归一化，改中文错误信息 |
+| `src/core/agent-tool-loop.ts` | 参考结构重写 | 保留双限额、`sentMessageTool` 累加、超限抛错 |
+| `src/core/agent-tool-executor.ts` | 参考结构重写 | 保留白名单、`preventsFinalResponse` |
+| `src/core/agent-context.ts` | 参考结构重写 | 保留历史回放的两个细节 |
+| `src/tools/registry/tool-registry.ts` | 参考结构重写 | 保留权限→执行→审计顺序，审计改可选 |
+| `src/permissions/*` | 参考结构重写 | 6 级 + scope、角色基线、策略叠加 |
+| `src/agents/agent-mailbox*` | 参考思路重写 | 租约、FIFO 队列、终态清理 |
+| `src/tools/time/tools.ts` | 参考重写 | 时区处理 |
+| `src/tools/schedule/*` | 参考协议重写 | 去掉 Queue 依赖，改 cron 扫表 |
+| `src/tools/vfs/*` | 参考设计重写 | 砍掉 revisions，小文本 D1 / 大文件 R2 |
 
-| 来源 | 用途 |
-| --- | --- |
-| `src/tools/http/url-safety.ts` | SSRF 黑名单，原样复制 |
-| `src/tools/web/extract.ts` | HTML → 文本，原样复制 |
-| `src/core/agent-tool-loop.ts` | loop 结构（步数/工具数上限） |
-| `src/core/agent-context.ts` | 上下文装配（历史回放） |
-| `src/tools/time/` | 时间工具 |
-| `src/agents/agent-mailbox*` | DO 队列/租约/恢复的思路 |
+**没有搬**（约 24,000 行）：
 
-没有搬的：平台适配（QFlareBot 的 `session`/`ctx.api` 更强）、模型层（plugin-llm 已覆盖）、Admin WebUI（插件 UI 只能单 HTML）、RayNeo/WeCom/WeixinOC（私有协议或无价值）。
+- `src/adapters/`（5,741）——QFlareBot 的 `session` / `ctx.api` 更强
+- `src/worker/`（5,866）——插件用 `routes` 与 `cron`
+- `src/core/model/`（2,358）——plugin-llm 已覆盖
+- `src/rayneo/`（1,390）、`src/platforms/`（1,260）——私有协议
+- `apps/admin-web/`（13,670）——插件 UI 只能单 HTML
 
-许可证：本插件 MIT；serverless-agent 是 GPL-3.0-or-later，如果你要复用它的代码到自己的 GPL 项目之外，注意许可证兼容性。
+许可证：本插件 MIT；serverless-agent 是 GPL-3.0-or-later，把它的代码复用到别的项目时注意兼容性。
 
 ## License
 

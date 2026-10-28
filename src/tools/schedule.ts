@@ -11,7 +11,7 @@
  * - 重复任务用 `repeat_seconds`，推进时**跳过已错过的周期**（机器人离线一天后
  *   不该补跑几十次）。
  */
-import type { RegisteredTool } from './registry.js'
+import type { RegisteredTool } from './types.js'
 import { cancelSchedule, createSchedule, listSchedules } from '../store/d1.js'
 import type { ReplyScene } from '../types.js'
 import { isValidTimeZone } from './time.js'
@@ -45,10 +45,11 @@ function createScheduleTool(): RegisteredTool {
   return {
     definition: {
       name: 'schedule.create',
+      title: '创建定时任务',
       description:
         '创建一个定时任务。到点后你会收到 prompt 里的话并据此回复。' +
         '支持一次性提醒与重复任务。只能给当前会话创建。',
-      parameters: {
+      inputSchema: {
         type: 'object',
         properties: {
           delay_seconds: {
@@ -74,13 +75,14 @@ function createScheduleTool(): RegisteredTool {
         },
         required: ['prompt'],
       },
+      permission: { level: 3, scopes: ['schedule:write'] },
       sideEffect: 'workspace_write',
       timeoutMs: 5_000,
-      requires: 'schedule',
     },
+    source: { type: 'builtin', id: 'schedule', name: '定时任务' },
 
-    execute: async (input, context) => {
-      const parsed = input as Partial<CreateInput>
+    execute: async (context) => {
+      const parsed = context.input as Partial<CreateInput>
       if (!parsed?.prompt?.trim()) {
         return fail('bad_request', '缺少 prompt')
       }
@@ -104,13 +106,13 @@ function createScheduleTool(): RegisteredTool {
       const id = crypto.randomUUID()
       await createSchedule(context.db, {
         id,
-        conversation: context.conversation,
+        conversation: context.conversationId,
         scene: context.scene as ReplyScene,
         targetId: context.targetId,
         prompt: parsed.prompt.trim(),
         dueAt,
         ...(parsed.repeat_seconds ? { repeatSeconds: parsed.repeat_seconds } : {}),
-        createdBy: context.userId,
+        createdBy: context.actorId,
       })
 
       return {
@@ -130,19 +132,22 @@ function listSchedulesTool(): RegisteredTool {
   return {
     definition: {
       name: 'schedule.list',
+      title: '列出定时任务',
       description: '列出当前会话里所有还没触发的定时任务。',
-      parameters: {
+      inputSchema: {
         type: 'object',
         properties: { limit: { type: 'integer', minimum: 1, maximum: 50 } },
       },
+      permission: { level: 1, scopes: [] },
       sideEffect: 'none',
       timeoutMs: 5_000,
-      requires: 'schedule',
+      annotations: { readOnlyHint: true },
     },
+    source: { type: 'builtin', id: 'schedule', name: '定时任务' },
 
-    execute: async (input, context) => {
-      const limit = (input as Partial<ListInput>)?.limit ?? 20
-      const rows = await listSchedules(context.db, context.conversation, limit)
+    execute: async (context) => {
+      const limit = (context.input as Partial<ListInput>)?.limit ?? 20
+      const rows = await listSchedules(context.db, context.conversationId, limit)
       return {
         status: 'success',
         output: rows.map((row) => ({
@@ -160,22 +165,24 @@ function cancelScheduleTool(): RegisteredTool {
   return {
     definition: {
       name: 'schedule.cancel',
+      title: '取消定时任务',
       description: '取消一个定时任务。先用 schedule.list 拿到 id。',
-      parameters: {
+      inputSchema: {
         type: 'object',
         properties: { id: { type: 'string', description: 'schedule.list 返回的 id' } },
         required: ['id'],
       },
+      permission: { level: 3, scopes: ['schedule:write'] },
       sideEffect: 'workspace_write',
       timeoutMs: 5_000,
-      requires: 'schedule',
     },
+    source: { type: 'builtin', id: 'schedule', name: '定时任务' },
 
-    execute: async (input, context) => {
-      const id = (input as Partial<CancelInput>)?.id
+    execute: async (context) => {
+      const id = (context.input as Partial<CancelInput>)?.id
       if (!id) return fail('bad_request', '缺少 id')
 
-      const cancelled = await cancelSchedule(context.db, id, context.conversation)
+      const cancelled = await cancelSchedule(context.db, id, context.conversationId)
       if (!cancelled) return fail('not_found', '没有找到这个任务，或者它已经不在活动状态')
       return { status: 'success', output: { id, cancelled: true } }
     },

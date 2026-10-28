@@ -127,18 +127,13 @@
       "enable_vfs": {
         "type": "boolean",
         "title": "启用虚拟工作区",
-        "description": "模型可以读写文件。文件存在 R2 里，需要绑定 R2",
+        "description": "模型可以读写工作区文件。小文本存 D1，超过 8KB 的存 R2（需要绑定 R2）",
         "default": false
       },
       "enable_schedule": {
         "type": "boolean",
         "title": "启用动态定时任务",
         "description": "模型可以自己创建提醒。需要机器人开启每分钟 cron",
-        "default": false
-      },
-      "enable_mcp": {
-        "type": "boolean",
-        "title": "启用 MCP 工具",
         "default": false
       },
       "enable_audit": {
@@ -170,7 +165,6 @@
     "enable_tools": true,
     "enable_vfs": false,
     "enable_schedule": false,
-    "enable_mcp": false,
     "enable_audit": false,
     "show_typing": true,
     "timezone": "Asia/Shanghai"

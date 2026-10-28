@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseAbsoluteTime, zonedTimeToEpoch } from '../src/tools/schedule.js'
+import { parseAbsoluteTime, zonedTimeToEpoch } from './schedule.js'
 
 describe('parseAbsoluteTime', () => {
   it('带时区偏移的 ISO 8601 直接解析', () => {

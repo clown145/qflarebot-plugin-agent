@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import { hydrateImageAttachments } from '../src/agent/media.js'
-import type { MessageAttachment } from '../src/types.js'
+import { hydrateImageAttachments } from './media.js'
+import type { MessageAttachment } from '../types.js'
 
 describe('hydrateImageAttachments', () => {
   it('没有图片时原样返回，不发起请求', async () => {

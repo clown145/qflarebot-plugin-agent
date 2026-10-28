@@ -33,9 +33,6 @@ export interface AgentConfig {
   /** 动态定时任务（LLM 可自己建提醒） */
   enable_schedule: boolean
 
-  /** MCP 服务器工具 */
-  enable_mcp: boolean
-
   /** 是否把工具调用记进 D1（排障用，吃额度，默认关） */
   enable_audit: boolean
 
@@ -62,7 +59,6 @@ export const defaultConfig: AgentConfig = {
   enable_tools: true,
   enable_vfs: false,
   enable_schedule: false,
-  enable_mcp: false,
   enable_audit: false,
   show_typing: true,
   timezone: 'Asia/Shanghai',
@@ -124,7 +120,7 @@ export const configSchema = {
     enable_vfs: {
       type: 'boolean',
       title: '启用虚拟工作区',
-      description: '模型可以读写文件。文件存在 R2 里，需要绑定 R2',
+      description: '模型可以读写工作区文件。小文本存 D1，超过 8KB 的存 R2（需要绑定 R2）',
       default: defaultConfig.enable_vfs,
     },
     enable_schedule: {
@@ -132,11 +128,6 @@ export const configSchema = {
       title: '启用动态定时任务',
       description: '模型可以自己创建提醒。需要机器人开启每分钟 cron',
       default: defaultConfig.enable_schedule,
-    },
-    enable_mcp: {
-      type: 'boolean',
-      title: '启用 MCP 工具',
-      default: defaultConfig.enable_mcp,
     },
     enable_audit: {
       type: 'boolean',

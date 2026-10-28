@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { Logger, PluginDB, PluginContext } from '@qqbot/sdk'
-import { executeRun } from '../src/agent/run.js'
-import type { AgentStub, ReplyFn } from '../src/agent/run.js'
-import type { AgentConfig } from '../src/config/index.js'
-import type { LLMService } from '../src/llm/contract.js'
-import type { InboundMessage } from '../src/types.js'
-import { defaultConfig } from '../src/config/index.js'
+import type { Logger, PluginContext } from '@qqbot/sdk'
+import { executeRun } from './run.js'
+import type { AgentStub, ReplyFn } from './run.js'
+import type { AgentConfig } from '../config/index.js'
+import { defaultConfig } from '../config/index.js'
+import type { LLMService } from '../llm/contract.js'
+import type { InboundMessage } from '../types.js'
 
 const logger: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
 
@@ -19,6 +19,7 @@ function message(overrides: Partial<InboundMessage> = {}): InboundMessage {
     attachments: [],
     scene: 'group',
     targetId: 'g1',
+    memberRole: 'admin',
     receivedAt: Date.now(),
     ...overrides,
   }
@@ -48,11 +49,17 @@ function fakeLLM(reply = '你好呀'): LLMService {
   }
 }
 
+type ReleaseArg = {
+  ok: boolean
+  error?: string
+  history?: Array<{ role: string; content: string; toolCallsJson: string | null; createdAt: number }>
+}
+
 function fakeStub(overrides: Partial<AgentStub> = {}): AgentStub {
   return {
     history: async () => [],
-    release: vi.fn(async () => {}),
-    retryLater: vi.fn(async () => {}),
+    release: vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {}),
+    retryLater: vi.fn<(runId: string, reason: string) => Promise<void>>(async () => {}),
     ...overrides,
   } as AgentStub
 }
@@ -64,19 +71,13 @@ function context(config: Partial<AgentConfig> = {}): PluginContext<AgentConfig> 
     config: { ...defaultConfig, ...config },
     logger,
     kv: {} as never,
-    db: { run: async () => ({ changes: 0 }) } as unknown as PluginDB,
-    r2: {} as never,
+    db: { run: async () => ({ changes: 0 }) } as never,
+    r2: undefined,
     api: {} as never,
     durable: {} as never,
     service: <T>() => fakeLLM() as unknown as T,
     waitUntil: () => {},
   } as unknown as PluginContext<AgentConfig>
-}
-
-/** 带类型的 release 替身：能直接读 mock.calls 的第二个参数 */
-type ReleaseArg = { ok: boolean; error?: string; history?: Array<{ role: string; content: string; toolCallsJson: string | null; createdAt: number }> }
-function releaseSpy() {
-  return vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
 }
 
 function replySpy(): ReplyFn & { calls: string[] } {
@@ -92,8 +93,8 @@ function replySpy(): ReplyFn & { calls: string[] } {
 describe('executeRun', () => {
   it('正常一轮：回复、写历史、release 成功', async () => {
     const reply = replySpy()
-    const release = releaseSpy()
-    const result = await executeRun(
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
+    const outcome = await executeRun(
       {
         ctx: context(),
         logger,
@@ -106,18 +107,17 @@ describe('executeRun', () => {
       message(),
     )
 
-    expect(result.ok).toBe(true)
+    expect(outcome.ok).toBe(true)
     expect(reply.calls).toEqual(['你好呀'])
     expect(release).toHaveBeenCalledOnce()
 
     const releaseArg = release.mock.calls[0]?.[1]
     expect(releaseArg?.ok).toBe(true)
-    // user + assistant 两行
     expect(releaseArg?.history).toHaveLength(2)
   })
 
   it('历史里 user 行记的是 displayText（保留其他人的 @）', async () => {
-    const release = releaseSpy()
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
     await executeRun(
       {
         ctx: context(),
@@ -141,7 +141,7 @@ describe('executeRun', () => {
   })
 
   it('模型没给文本时不写空的 assistant 行（否则占掉 history_limit 名额）', async () => {
-    const release = releaseSpy()
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
     await executeRun(
       {
         ctx: context(),
@@ -163,7 +163,7 @@ describe('executeRun', () => {
   it('上游限流时退回队列，不标记失败、不回复错误文案', async () => {
     const reply = replySpy()
     const retryLater = vi.fn<(runId: string, reason: string) => Promise<void>>(async () => {})
-    const release = releaseSpy()
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
 
     const llm = {
       ...fakeLLM(),
@@ -174,21 +174,14 @@ describe('executeRun', () => {
       },
     } as LLMService
 
-    const result = await executeRun(
-      {
-        ctx: context(),
-        logger,
-        config: defaultConfig,
-        llm,
-        agent: fakeStub({ retryLater, release }),
-        reply,
-      },
+    const outcome = await executeRun(
+      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub({ retryLater, release }), reply },
       'run-1',
       message(),
     )
 
-    expect(result.ok).toBe(false)
-    expect(result.retryable).toBe(true)
+    expect(outcome.ok).toBe(false)
+    expect(outcome.retryable).toBe(true)
     expect(retryLater).toHaveBeenCalledOnce()
     expect(release).not.toHaveBeenCalled()
     // 可重试错误不该给用户看错误文案——cron 会再试一次
@@ -197,7 +190,7 @@ describe('executeRun', () => {
 
   it('不可重试错误（如认证失败）回复用户并标记失败', async () => {
     const reply = replySpy()
-    const release = releaseSpy()
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
     const retryLater = vi.fn<(runId: string, reason: string) => Promise<void>>(async () => {})
 
     const llm = {
@@ -209,21 +202,14 @@ describe('executeRun', () => {
       },
     } as LLMService
 
-    const result = await executeRun(
-      {
-        ctx: context(),
-        logger,
-        config: defaultConfig,
-        llm,
-        agent: fakeStub({ retryLater, release }),
-        reply,
-      },
+    const outcome = await executeRun(
+      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub({ retryLater, release }), reply },
       'run-1',
       message(),
     )
 
-    expect(result.ok).toBe(false)
-    expect(result.retryable).toBe(false)
+    expect(outcome.ok).toBe(false)
+    expect(outcome.retryable).toBe(false)
     expect(release).toHaveBeenCalledOnce()
     expect(retryLater).not.toHaveBeenCalled()
     expect(reply.calls[0]).toContain('LLM 接口')
@@ -241,14 +227,7 @@ describe('executeRun', () => {
     } as LLMService
 
     await executeRun(
-      {
-        ctx: context(),
-        logger,
-        config: defaultConfig,
-        llm,
-        agent: fakeStub(),
-        reply,
-      },
+      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub(), reply },
       'run-1',
       message(),
     )
@@ -262,13 +241,7 @@ describe('executeRun', () => {
       ...fakeLLM(),
       chat: async (req: { tools?: unknown }) => {
         seenTools = req.tools
-        return {
-          text: '纯聊天',
-          alias: 'chat',
-          provider: 'fake',
-          model: 'fake',
-          latency_ms: 1,
-        }
+        return { text: '纯聊天', alias: 'chat', provider: 'fake', model: 'fake', latency_ms: 1 }
       },
     } as LLMService
 
@@ -286,5 +259,50 @@ describe('executeRun', () => {
     )
 
     expect(seenTools).toBeUndefined()
+  })
+
+  it('enable_vfs 关掉时 vfs 工具不注册（模型看不到）', async () => {
+    let seenTools: Array<{ name: string }> = []
+    const llm = {
+      ...fakeLLM(),
+      chat: async (req: { tools?: Array<{ name: string }> }) => {
+        seenTools = req.tools ?? []
+        return { text: 'ok', alias: 'chat', provider: 'fake', model: 'fake', latency_ms: 1 }
+      },
+    } as LLMService
+
+    await executeRun(
+      {
+        ctx: context({ enable_vfs: false }),
+        logger,
+        config: { ...defaultConfig, enable_vfs: false },
+        llm,
+        agent: fakeStub(),
+        reply: replySpy(),
+      },
+      'run-1',
+      message(),
+    )
+
+    expect(seenTools.map((t) => t.name)).not.toContain('vfs.read_file')
+  })
+
+  it('定时任务以 scheduler 身份跑时不会被权限拦下（actorId 保留在消息里）', async () => {
+    // 这条验证 run 把 message.userId 传进工具上下文，
+    // 而 permissions/default-policy 对 actorId === 'scheduler' 有特判
+    const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<void>>(async () => {})
+    const outcome = await executeRun(
+      {
+        ctx: context(),
+        logger,
+        config: defaultConfig,
+        llm: fakeLLM('提醒你喝水'),
+        agent: fakeStub({ release }),
+        reply: replySpy(),
+      },
+      'run-1',
+      message({ userId: 'scheduler', text: '提醒用户喝水' }),
+    )
+    expect(outcome.ok).toBe(true)
   })
 })

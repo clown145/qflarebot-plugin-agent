@@ -49,6 +49,34 @@ export const SCHEMA_STATEMENTS = [
 
   `CREATE INDEX IF NOT EXISTS {tool_audit_time} ON {tool_audit}(created_at)`,
 
+  // 虚拟工作区：元数据在 D1，内容小的也在 D1、大的走 R2
+  // 照搬 serverless-agent 的 vfs_entries，但砍掉 revisions（每个版本都是额外写入）
+  `CREATE TABLE IF NOT EXISTS {vfs_entries} (
+     path TEXT PRIMARY KEY,
+     name TEXT NOT NULL,
+     parent TEXT NOT NULL DEFAULT '/',
+     kind TEXT NOT NULL,
+     size INTEGER NOT NULL DEFAULT 0,
+     r2_key TEXT,
+     content TEXT,
+     updated_at INTEGER NOT NULL
+   ) WITHOUT ROWID`,
+
+  `CREATE INDEX IF NOT EXISTS {vfs_parent} ON {vfs_entries}(parent)`,
+
+  // 权限策略表。照搬 serverless-agent 的 permission_policies：
+  // 按 subject 叠加，只能放宽不能收紧（见 permissions/policy-resolver.ts）
+  `CREATE TABLE IF NOT EXISTS {policies} (
+     id TEXT PRIMARY KEY,
+     subject_type TEXT NOT NULL,
+     subject_id TEXT NOT NULL,
+     max_level INTEGER NOT NULL,
+     scopes_json TEXT NOT NULL,
+     created_at INTEGER NOT NULL
+   ) WITHOUT ROWID`,
+
+  `CREATE INDEX IF NOT EXISTS {policies_subject} ON {policies}(subject_type, subject_id)`,
+
   // 轻量统计，用于管理页展示「今天跑了多少次」。一天一行，写入量与消息数脱钩
   `CREATE TABLE IF NOT EXISTS {daily_stats} (
      day TEXT PRIMARY KEY,

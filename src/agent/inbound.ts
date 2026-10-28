@@ -33,6 +33,7 @@ export function toInboundMessage(session: Session): InboundMessage {
     attachments,
     // 被动回复凭据：msg_id 优先，没有的话用 event_id（事件类）
     ...(session.messageId ? { passiveMessageId: session.messageId } : {}),
+    ...(session.memberRole ? { memberRole: session.memberRole } : {}),
     scene: toReplyScene(session.scene),
     targetId: session.targetId,
     receivedAt: Date.now(),

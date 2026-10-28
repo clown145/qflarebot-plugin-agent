@@ -1,21 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { Logger } from '@qqbot/sdk'
-import { describeLoopError, LoopLimitError, runAgentLoop } from '../src/agent/loop.js'
-import { LLMCallError } from '../src/llm/client.js'
-import type { LLMService } from '../src/llm/contract.js'
-import type { RegisteredTool, ToolRegistry } from '../src/tools/registry.js'
-import { createToolRegistry } from '../src/tools/registry.js'
-import type { ModelToolCall } from '../src/types.js'
+import type { Logger, PluginDB } from '@qqbot/sdk'
+import { describeLoopError, LoopLimitError, runAgentLoop } from './loop.js'
+import { LLMCallError } from '../llm/client.js'
+import type { LLMService } from '../llm/contract.js'
+import { createToolRegistry } from '../tools/registry.js'
+import type { ToolExecuteInput } from '../tools/registry.js'
+import type { RegisteredTool, ToolDefinition } from '../tools/types.js'
+import type { ModelToolCall } from '../types.js'
 
-const logger: Logger = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-}
+const logger: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
 
 /** 造一个按脚本返回的假 llm */
-function fakeLLM(script: Array<{ text?: string; toolCalls?: ModelToolCall[] }>): LLMService {
+function fakeLLM(script: Array<{ text?: string; toolCalls?: ModelToolCall[] }> = []): LLMService {
   let index = 0
   return {
     contractVersion: 1,
@@ -52,51 +48,53 @@ function fakeLLM(script: Array<{ text?: string; toolCalls?: ModelToolCall[] }>):
   }
 }
 
-function tool(name: string, result: unknown): RegisteredTool {
+function tool(name: string, output: unknown, overrides: Partial<ToolDefinition> = {}): RegisteredTool {
   return {
     definition: {
       name,
       description: name,
-      parameters: { type: 'object', properties: {} },
+      inputSchema: { type: 'object', properties: {} },
+      permission: { level: 1, scopes: [] },
       sideEffect: 'none',
       timeoutMs: 1000,
+      ...overrides,
     },
-    execute: async () => ({ status: 'success', output: result }),
+    source: { type: 'builtin', id: 'test', name: 'test' },
+    execute: async () => ({ status: 'success', output }),
   }
 }
 
-const toolContext = () =>
-  ({
-    db: {} as never,
-    logger,
-    conversation: 'group:g1',
-    userId: 'u1',
-    scene: 'group',
-    targetId: 'g1',
-    runId: 'r1',
-    timezone: 'UTC',
-    markReplied: () => {},
-  }) as Parameters<ToolRegistry['execute']>[2]
+const toolContext = (): Omit<ToolExecuteInput, 'input' | 'toolCallId'> => ({
+  db: {} as PluginDB,
+  logger,
+  conversationId: 'group:g1',
+  actorId: 'u1',
+  actorRole: 'member',
+  scene: 'group',
+  targetId: 'g1',
+  runId: 'r1',
+  stepId: 's1',
+  timezone: 'UTC',
+})
 
-function loopOptions(llm: LLMService, registry: ToolRegistry, overrides = {}) {
+function loopOptions(llm: LLMService, tools: RegisteredTool[], overrides = {}) {
   return {
     llm,
-    registry,
+    registry: createToolRegistry(tools),
     logger,
     model: 'chat',
     messages: [{ role: 'user' as const, content: '你好' }],
     maxModelSteps: 8,
     maxToolCalls: 12,
     requestTimeoutMs: 5000,
-    toolContext,
+    toolContext: toolContext(),
     ...overrides,
   }
 }
 
 describe('runAgentLoop', () => {
   it('模型直接给答复时不调工具，返回文本', async () => {
-    const registry = createToolRegistry([])
-    const result = await runAgentLoop(loopOptions(fakeLLM([{ text: '你好呀' }]), registry))
+    const result = await runAgentLoop(loopOptions(fakeLLM([{ text: '你好呀' }]), []))
     expect(result.reply).toBe('你好呀')
     expect(result.steps).toBe(1)
     expect(result.toolCalls).toBe(0)
@@ -104,44 +102,29 @@ describe('runAgentLoop', () => {
 
   it('模型要求调工具时，执行后把结果回填再问一次', async () => {
     const execute = vi.fn(async () => ({ status: 'success' as const, output: '晴，25 度' }))
-    const registry = createToolRegistry([
-      { ...tool('weather', 'x'), execute },
-    ])
+    const weather = { ...tool('weather', 'x'), execute }
     const llm = fakeLLM([
       { toolCalls: [{ id: 'c1', name: 'weather', arguments: { city: '北京' } }] },
       { text: '北京晴，25 度' },
     ])
-    const result = await runAgentLoop(loopOptions(llm, registry))
+    const result = await runAgentLoop(loopOptions(llm, [weather]))
     expect(execute).toHaveBeenCalledOnce()
     expect(result.reply).toBe('北京晴，25 度')
     expect(result.steps).toBe(2)
     expect(result.toolCalls).toBe(1)
   })
 
-  it('工具结果以 tool 角色消息回填，带 toolCallId', async () => {
-    const registry = createToolRegistry([tool('t', { ok: 1 })])
-    const llm = fakeLLM([
-      { toolCalls: [{ id: 'call-1', name: 't', arguments: {} }] },
-      { text: 'done' },
-    ])
-    const result = await runAgentLoop(loopOptions(llm, registry))
-    expect(result.reply).toBe('done')
-  })
-
   it('超过 maxModelSteps 抛 LoopLimitError，不是无限循环', async () => {
-    // 每次都要求调工具，永远不给最终答复
     const script = Array.from({ length: 20 }, (_, i) => ({
       toolCalls: [{ id: `c${i}`, name: 't', arguments: {} }],
     }))
-    const registry = createToolRegistry([tool('t', 'x')])
-    const llm = fakeLLM(script)
     await expect(
-      runAgentLoop(loopOptions(llm, registry, { maxModelSteps: 3 })),
+      runAgentLoop(loopOptions(fakeLLM(script), [tool('t', 'x')], { maxModelSteps: 3 })),
     ).rejects.toThrow(LoopLimitError)
   })
 
-  it('超过 maxToolCalls 抛 LoopLimitError', async () => {
-    const registry = createToolRegistry([tool('t', 'x')])
+  it('超过 maxToolCalls 抛 LoopLimitError（预留制：超了就停，不执行）', async () => {
+    const execute = vi.fn(async () => ({ status: 'success' as const, output: 'x' }))
     const llm = fakeLLM([
       {
         toolCalls: [
@@ -152,70 +135,95 @@ describe('runAgentLoop', () => {
       { text: 'never' },
     ])
     await expect(
-      runAgentLoop(loopOptions(llm, registry, { maxToolCalls: 1 })),
+      runAgentLoop(loopOptions(llm, [{ ...tool('t', 'x'), execute }], { maxToolCalls: 1 })),
     ).rejects.toThrow(LoopLimitError)
+    // 只执行了一次，第二次在预留阶段就被拦下
+    expect(execute).toHaveBeenCalledOnce()
   })
 
   it('工具返回失败时 loop 继续，把错误交给模型而不是崩掉', async () => {
-    const registry = createToolRegistry([
-      {
-        definition: {
-          name: 'bad',
-          description: 'bad',
-          parameters: { type: 'object', properties: {} },
-          sideEffect: 'none',
-          timeoutMs: 1000,
-        },
-        execute: async () => ({
-          status: 'failed' as const,
-          error: { code: 'boom', message: '炸了', retryable: false },
-        }),
-      },
-    ])
+    const bad: RegisteredTool = {
+      ...tool('bad', 'x'),
+      execute: async () => ({
+        status: 'failed',
+        error: { code: 'boom', message: '炸了', retryable: false },
+      }),
+    }
     const llm = fakeLLM([
       { toolCalls: [{ id: 'c1', name: 'bad', arguments: {} }] },
       { text: '工具挂了，我直接回答' },
     ])
-    const result = await runAgentLoop(loopOptions(llm, registry))
+    const result = await runAgentLoop(loopOptions(llm, [bad]))
     expect(result.reply).toBe('工具挂了，我直接回答')
   })
 
-  it('未知工具返回 failed 而不是抛异常', async () => {
-    const registry = createToolRegistry([])
+  it('模型调用不存在的工具时被白名单拦下，不抛异常', async () => {
     const llm = fakeLLM([
       { toolCalls: [{ id: 'c1', name: 'nonexistent', arguments: {} }] },
       { text: '没有这个工具' },
     ])
-    const result = await runAgentLoop(loopOptions(llm, registry))
+    const result = await runAgentLoop(loopOptions(llm, []))
     expect(result.reply).toBe('没有这个工具')
   })
 
+  it('工具声明 preventsFinalResponse 且成功时，repliedByTool 为真', async () => {
+    const sender = tool('send', 'ok', { behavior: { preventsFinalResponse: true } })
+    const llm = fakeLLM([
+      { toolCalls: [{ id: 'c1', name: 'send', arguments: {} }] },
+      { text: '' },
+    ])
+    const result = await runAgentLoop(loopOptions(llm, [sender]))
+    expect(result.repliedByTool).toBe(true)
+  })
+
+  it('工具失败时即使声明了 preventsFinalResponse 也不算已回复', async () => {
+    const sender: RegisteredTool = {
+      ...tool('send', 'x', { behavior: { preventsFinalResponse: true } }),
+      execute: async () => ({ status: 'failed', error: { code: 'e', message: 'e', retryable: false } }),
+    }
+    const llm = fakeLLM([
+      { toolCalls: [{ id: 'c1', name: 'send', arguments: {} }] },
+      { text: '那我直接说' },
+    ])
+    const result = await runAgentLoop(loopOptions(llm, [sender]))
+    expect(result.repliedByTool).toBe(false)
+  })
+
   it('累计 usage 并返回', async () => {
-    const registry = createToolRegistry([])
-    const llm = fakeLLM([{ text: 'a' }, { text: 'b' }])
-    const result = await runAgentLoop(loopOptions(llm, registry))
+    const result = await runAgentLoop(loopOptions(fakeLLM([{ text: 'a' }]), []))
     expect(result.usage.inputTokens).toBe(10)
     expect(result.usage.outputTokens).toBe(5)
   })
 
   it('onStep 每步都被调用，从 1 开始', async () => {
     const steps: number[] = []
-    const registry = createToolRegistry([tool('t', 'x')])
     const llm = fakeLLM([
       { toolCalls: [{ id: 'c1', name: 't', arguments: {} }] },
       { text: 'done' },
     ])
     await runAgentLoop(
-      loopOptions(llm, registry, { onStep: async (n: number) => void steps.push(n) }),
+      loopOptions(llm, [tool('t', 'x')], { onStep: async (n: number) => void steps.push(n) }),
     )
     expect(steps).toEqual([1, 2])
+  })
+
+  it('enable_tools 关闭时不传 tools 给模型', async () => {
+    let seenTools: unknown
+    const llm = {
+      ...fakeLLM(),
+      chat: async (req: { tools?: unknown }) => {
+        seenTools = req.tools
+        return { text: '纯聊天', alias: 'chat', provider: 'fake', model: 'fake', latency_ms: 1 }
+      },
+    } as LLMService
+    await runAgentLoop(loopOptions(llm, []))
+    expect(seenTools).toBeUndefined()
   })
 })
 
 describe('describeLoopError', () => {
   it('限流错误标记为可重试', () => {
-    const described = describeLoopError(new LLMCallError('429', 'rate_limit'))
-    expect(described.retryable).toBe(true)
+    expect(describeLoopError(new LLMCallError('429', 'rate_limit')).retryable).toBe(true)
   })
 
   it('认证错误标记为不可重试，并提示去改配置', () => {

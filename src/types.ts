@@ -30,6 +30,8 @@ export interface InboundMessage {
   /** 回复目标 */
   scene: ReplyScene
   targetId: string
+  /** 发起人的群角色。决定工具的默认权限级别（见 permissions/default-policy.ts） */
+  memberRole?: 'owner' | 'admin' | 'member' | 'unknown'
   /** 入站时间 */
   receivedAt: number
 }

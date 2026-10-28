@@ -5,9 +5,10 @@
  * 但裁掉了 cookie jar（要加密存 D1，吃额度且极少用到）。
  *
  * 保留的关键部分是 **SSRF 防护**：`validateFetchUrl` 会拒绝回环、内网、
- * 链路本地地址，并跟随重定向后重新校验。模型能构造任意 URL，这一层不能省。
+ * 链路本地地址，并且**每一跳重定向都重新校验**——只校验初始 URL 的话，
+ * 攻击者可以用一个公网地址 302 到 127.0.0.1 绕过。
  */
-import type { RegisteredTool, ToolResult } from './registry.js'
+import type { RegisteredTool, ToolResult } from './types.js'
 import { validateFetchUrl } from './http/url-safety.js'
 
 const MAX_BODY_BYTES = 1024 * 1024
@@ -26,10 +27,11 @@ export function createHttpTool(): RegisteredTool {
   return {
     definition: {
       name: 'http.request',
+      title: 'HTTP 请求',
       description:
         '发起一个 HTTP 请求并返回状态码与响应体。只能访问公网地址，内网与回环地址会被拒绝。' +
         '响应体上限 1MB，超出部分会被截断。',
-      parameters: {
+      inputSchema: {
         type: 'object',
         properties: {
           url: { type: 'string', description: '完整 URL，必须是 http 或 https' },
@@ -51,12 +53,17 @@ export function createHttpTool(): RegisteredTool {
         },
         required: ['url'],
       },
+      // level 3 + http:request scope：普通群成员（level 2）用不了，
+      // 群主与管理员（level 4）能用。这是原文 default-policy 的设计
+      permission: { level: 3, scopes: ['http:request'] },
       sideEffect: 'external_write',
       timeoutMs: 15_000,
+      annotations: { openWorldHint: true },
     },
+    source: { type: 'builtin', id: 'http', name: 'HTTP' },
 
-    execute: async (input) => {
-      const parsed = input as Partial<HttpRequestInput>
+    execute: async (context) => {
+      const parsed = context.input as Partial<HttpRequestInput> | undefined
       if (!parsed?.url || typeof parsed.url !== 'string') {
         return fail('bad_request', '缺少 url')
       }
@@ -64,8 +71,6 @@ export function createHttpTool(): RegisteredTool {
       let current = parsed.url
       const method = (parsed.method ?? 'GET').toUpperCase()
 
-      // 重定向要自己跟，每一跳都重新校验——只校验初始 URL 的话，
-      // 攻击者可以用一个公网地址 302 到 127.0.0.1 绕过
       for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
         const invalid = validateFetchUrl(current)
         if (invalid) return fail('blocked_url', invalid)
@@ -97,9 +102,7 @@ export function createHttpTool(): RegisteredTool {
             url: current,
             contentType: response.headers.get('content-type') ?? '',
             truncated,
-            ...(parsed.binary
-              ? { bodyBase64: toBase64(text) }
-              : { body: text }),
+            ...(parsed.binary ? { bodyBase64: toBase64(text) } : { body: text }),
           },
         }
       }

@@ -4,21 +4,24 @@
  * 模型没有时钟，这一条看着简单但几乎每个带时间的问题都会用到
  * （"现在几点""明天是周几""三小时后提醒我"）。
  */
-import type { RegisteredTool, ToolResult } from './registry.js'
+import type { RegisteredTool, ToolResult } from './types.js'
 
 export function createTimeTool(): RegisteredTool {
   return {
     definition: {
       name: 'time.now',
+      title: '当前时间',
       description: '返回当前日期与时间，包含时区、星期几和 ISO 格式。',
-      parameters: { type: 'object', properties: {} },
+      inputSchema: { type: 'object', properties: {} },
+      permission: { level: 1, scopes: [] },
       sideEffect: 'none',
       timeoutMs: 1_000,
+      annotations: { readOnlyHint: true },
     },
-
-    execute: async (_input, context) => {
+    source: { type: 'builtin', id: 'time', name: '时间' },
+    execute: async (context) => {
       const now = new Date()
-      const timeZone = normalizeTimeZone(context.timezone)
+      const timeZone = context.timezone?.trim() || 'UTC'
 
       try {
         const formatter = new Intl.DateTimeFormat('zh-CN', {
@@ -44,17 +47,12 @@ export function createTimeTool(): RegisteredTool {
             iso: now.toISOString(),
             epochMs: now.getTime(),
             timeZone: 'UTC',
-            note: `配置的时区 ${context.timezone} 无效，已按 UTC 返回`,
+            note: `配置的时区 ${timeZone} 无效，已按 UTC 返回`,
           },
         }
       }
     },
   }
-}
-
-/** 与 serverless-agent 的 normalizeTimeZone 同义：非法时区退回 UTC，交给 Intl 抛错兜底 */
-function normalizeTimeZone(value: string | undefined): string {
-  return value?.trim() || 'UTC'
 }
 
 /** 供 schedule 工具复用的时区校验 */

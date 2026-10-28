@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { buildMessages, toHistoryRows } from '../src/agent/context.js'
-import type { HistoryRow } from '../src/do/agent-object.js'
-import type { InboundMessage } from '../src/types.js'
+import { buildMessages, toHistoryRows } from './context.js'
+import type { HistoryRow } from '../do/agent-object.js'
+import type { InboundMessage } from '../types.js'
 
 function message(overrides: Partial<InboundMessage> = {}): InboundMessage {
   return {
