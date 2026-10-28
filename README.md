@@ -4,6 +4,8 @@ QFlareBot 的 Agent 插件：带工具调用的多轮对话、会话记忆、联
 
 需要配合 [qflarebot-plugin-llm](https://github.com/clown145/qflarebot-plugin-llm) 使用——本插件不含模型接入，只通过它的 `llm` 服务调用模型。
 
+**这是必需依赖**（`depends: { llm: '*' }`）：没装 LLM 插件时，面板安装会被直接拦下并提示先装提供者。装了之后如果又把它停用或卸载，Agent 会回复「需要的 LLM 接口插件没有启用」，而不是抛内部错误。
+
 ## 它做什么
 
 - **多轮对话**：每个会话（群 / 单聊）一段独立记忆，存在 Durable Object 里。

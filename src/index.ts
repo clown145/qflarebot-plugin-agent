@@ -204,8 +204,20 @@ async function handleMessage(
   text: string,
 ): Promise<void> {
   const logger = ctx.logger
-  const llm = ctx.service<LLMService>('llm')
   const config = ctx.config
+
+  // 依赖没满足时给用户一句能看懂的话，而不是让框架抛 "没有在 depends 中声明" 这类内部错误。
+  // 正常情况下安装时就被拦下了（depends: { llm: '*' }），但提供者可能事后被停用或卸载
+  let llm: LLMService
+  try {
+    llm = ctx.service<LLMService>('llm')
+  } catch {
+    await session
+      .reply('Agent 需要的「LLM 接口」插件没有启用。请在面板的插件页启用它，或者先安装。')
+      .catch(() => false)
+    logger.error('llm 服务不可用，无法处理消息', { conversation: conversationKey(session) })
+    return
+  }
 
   const message = toInboundMessage(session)
   // 事件里拿到的正文可能带 /agent 前缀，剥掉
@@ -268,9 +280,29 @@ async function handleMessage(
 
 // ---------------------------------------------------------------- cron 部分
 
+/**
+ * 安全地取 llm 服务。
+ *
+ * `ctx.service()` 在提供者被停用/卸载时会抛错。在事件处理器里让它抛是对的
+ * （用户能立刻看到原因），但在 cron 里抛会让**每分钟都失败一次**、
+ * 把日志刷满，还拖慢同一 invocation 里其他插件的定时任务。
+ * 所以 cron 用这个：取不到就返回 null，由调用方安静跳过。
+ */
+function tryLLM(ctx: PluginContext<AgentConfig>): LLMService | null {
+  try {
+    return ctx.service<LLMService>('llm')
+  } catch (error) {
+    ctx.logger.warn('llm 服务不可用，本次 cron 跳过', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return null
+  }
+}
+
 /** 捡队列：每个会话的 DO 各问一次。会话数量通常很小（群 + 私聊） */
 async function drainQueues(ctx: PluginContext<AgentConfig>): Promise<void> {
-  const llm = ctx.service<LLMService>('llm')
+  const llm = tryLLM(ctx)
+  if (!llm) return
 
   // 已知会话列表存在 KV 里（低频写，只在出现新会话时更新）
   const known = (await ctx.kv.getJSON<string[]>('conversations')) ?? []
@@ -296,7 +328,8 @@ async function fireDueSchedules(
 ): Promise<void> {
   if (!ctx.config.enable_schedule) return
 
-  const llm = ctx.service<LLMService>('llm')
+  const llm = tryLLM(ctx)
+  if (!llm) return
   const due = await listDueSchedules(ctx.db, Date.now(), 3)
   if (due.length === 0) return
 
