@@ -15,7 +15,7 @@ import type { LLMService } from '../llm/contract.js'
 import type { ToolRegistry } from '../tools/registry.js'
 import type { RegisteredTool } from '../tools/types.js'
 import { buildMessages } from './context.js'
-import { describeLoopError, runAgentLoop } from './loop.js'
+import { describeLoopError, runAgentLoop, type LoopResult } from './loop.js'
 import { createToolRegistry } from '../tools/registry.js'
 import { createTimeTool } from '../tools/time.js'
 import { createHttpTool } from '../tools/http.js'
@@ -53,6 +53,8 @@ export interface RunDeps {
   reply: ReplyFn
   /** 用户是否已经明确确认过危险操作（本轮生效） */
   allowDangerous?: boolean
+  /** 可重试错误的等待时间。测试传 0 */
+  retryDelayMs?: number
 }
 
 /** run 的结果。`retryable` 为真时调用方应把 run 退回队列 */
@@ -63,6 +65,121 @@ export interface RunOutcome {
   replied: boolean
   /** 队列里顺手认领到的下一个 run。调用方可以接着跑，不必等 cron */
   next?: NextRun
+}
+
+/**
+ * 可重试错误的重试间隔。429 通常几秒恢复，等太久会吃满 30 秒事件预算。
+ * 测试里通过 RunDeps.retryDelayMs 传 0，避免真的等 3 秒。
+ */
+const RETRY_DELAY_MS = 3_000
+
+/**
+ * 装上下文、建工具集、跑一轮 loop。
+ *
+ * 抽出来是为了让 `runWithRetry` 能整个重跑——重跑时上下文和工具集都会重建，
+ * 不会带着上一轮的部分状态。
+ */
+async function runLoopOnce(input: {
+  ctx: PluginContext<AgentConfig>
+  logger: Logger
+  config: AgentConfig
+  llm: LLMService
+  agent: AgentStub
+  message: InboundMessage
+  runId: string
+  allowDangerous?: boolean
+}): Promise<LoopResult> {
+  const { ctx, logger, config, llm, agent, message, runId } = input
+
+  const history = await agent.history(config.history_limit)
+  const modelInfo = await safeResolveModel(llm, config.model, logger)
+  const messages = buildMessages(message, history, {
+    systemPrompt: config.system_prompt,
+    timezone: config.timezone,
+    historyLimit: config.history_limit,
+    supportsVision: modelInfo?.capabilities.includes('image') ?? false,
+  })
+
+  const registry = buildRegistry(ctx, config)
+
+  return runAgentLoop({
+    llm,
+    registry,
+    logger,
+    model: config.model,
+    messages,
+    maxModelSteps: config.max_model_steps,
+    maxToolCalls: config.max_tool_calls,
+    requestTimeoutMs: config.request_timeout_ms,
+    toolContext: {
+      db: ctx.db,
+      logger,
+      conversationId: message.conversation,
+      actorId: message.userId,
+      actorRole: message.memberRole ?? 'unknown',
+      scene: message.scene,
+      targetId: message.targetId,
+      runId,
+      stepId: `step-${runId}`,
+      timezone: config.timezone,
+      allowDangerous: input.allowDangerous,
+      onAudit: config.enable_audit
+        ? async (entry) => {
+            await recordToolAudit(ctx.db, {
+              id: crypto.randomUUID(),
+              conversation: message.conversation,
+              runId,
+              toolName: entry.toolName,
+              argsJson: entry.inputJson,
+              ...(entry.outputJson ? { resultJson: entry.outputJson } : {}),
+              status: entry.status,
+              durationMs: entry.durationMs,
+            }).catch((error: unknown) => {
+              // 审计写失败不该影响对话
+              logger.warn('工具审计写入失败', { error: String(error) })
+            })
+          }
+        : undefined,
+    },
+  })
+}
+
+/**
+ * 跑一次，遇到可重试错误就等一会儿再跑一次。
+ *
+ * **为什么不在事件处理器里做**：限流发生在 loop 内部（第一次模型调用就可能 429），
+ * 在外面重试等于把整个 loop 重跑，但如果已经执行过工具就会重复副作用。
+ * 所以放在这一层：重试时上下文和工具集重建，loop 从头开始——
+ * 此时还没有产生任何副作用（第一次模型调用就失败了）。
+ *
+ * 重试次数固定为 1：两次都失败说明不是瞬时抖动，继续等只会吃满事件预算。
+ */
+async function runWithRetry(
+  run: () => Promise<LoopResult>,
+  logger: Logger,
+  delayMs: number,
+): Promise<LoopResult> {
+  try {
+    return await run()
+  } catch (error) {
+    const described = describeLoopError(error)
+    if (!described.retryable) throw error
+
+    logger.warn('可重试错误，稍后重试一次', { error: described.text, delayMs })
+    await sleep(delayMs)
+
+    try {
+      return await run()
+    } catch (secondError) {
+      const second = describeLoopError(secondError)
+      logger.error('重试后仍失败', { error: second.text })
+      throw secondError
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
@@ -81,60 +198,26 @@ export async function executeRun(
   const { ctx, logger, config, llm, agent, reply } = deps
 
   try {
-    // 1. 装配上下文
-    const history = await agent.history(config.history_limit)
-    const modelInfo = await safeResolveModel(llm, config.model, logger)
-    const messages = buildMessages(message, history, {
-      systemPrompt: config.system_prompt,
-      timezone: config.timezone,
-      historyLimit: config.history_limit,
-      supportsVision: modelInfo?.capabilities.includes('image') ?? false,
-    })
-
-    // 2. 建工具集
-    const registry = buildRegistry(ctx, config)
-
-    // 3. 跑 loop
-    const result = await runAgentLoop({
-      llm,
-      registry,
+    // 1–3. 装上下文、建工具集、跑 loop。
+    //
+    // 限流/超时这类可重试错误在这里**就地重试一次**，而不是退回队列——
+    // 退回队列会让用户什么都收不到（消息静默消失）。429 通常几秒就恢复，
+    // 而被动回复窗口群聊有 5 分钟，完全等得起。
+    const result = await runWithRetry(
+      () =>
+        runLoopOnce({
+          ctx,
+          logger,
+          config,
+          llm,
+          agent,
+          message,
+          runId,
+          allowDangerous: deps.allowDangerous,
+        }),
       logger,
-      model: config.model,
-      messages,
-      maxModelSteps: config.max_model_steps,
-      maxToolCalls: config.max_tool_calls,
-      requestTimeoutMs: config.request_timeout_ms,
-      toolContext: {
-        db: ctx.db,
-        logger,
-        conversationId: message.conversation,
-        actorId: message.userId,
-        actorRole: message.memberRole ?? 'unknown',
-        scene: message.scene,
-        targetId: message.targetId,
-        runId,
-        stepId: `step-${runId}`,
-        timezone: config.timezone,
-        allowDangerous: deps.allowDangerous,
-        onAudit: config.enable_audit
-          ? async (entry) => {
-              await recordToolAudit(ctx.db, {
-                id: crypto.randomUUID(),
-                conversation: message.conversation,
-                runId,
-                toolName: entry.toolName,
-                argsJson: entry.inputJson,
-                ...(entry.outputJson ? { resultJson: entry.outputJson } : {}),
-                status: entry.status,
-                durationMs: entry.durationMs,
-              }).catch((error: unknown) => {
-                // 审计写失败不该影响对话
-                logger.warn('工具审计写入失败', { error: String(error) })
-              })
-            }
-          : undefined,
-      },
-    })
+      deps.retryDelayMs ?? RETRY_DELAY_MS,
+    )
 
     // 4. 回复。工具已经发过就不重复发
     let replied = false
@@ -192,14 +275,21 @@ export async function executeRun(
       error: error instanceof Error ? error.message : String(error),
     })
 
+    // **无论可不可重试，都要告诉用户**。
+    //
+    // 上一版在可重试时静默退回队列，用户什么都收不到——消息凭空消失，
+    // 比报错更让人困惑。而 runWithRetry 已经在内部重试过一次，
+    // 走到这里说明重试也没成功，该让用户知道。
+    const replied = await reply(described.text).catch(() => false)
+
     if (described.retryable) {
-      // 可重试：退回队列，让 cron 稍后捡起来
+      // 仍然退回队列：用户可能再发一次消息，那时能接着处理。
+      // 但已经告知过用户，不再是静默失败。
       const next = await agent.retryLater(runId, described.text)
-      return { ok: false, retryable: true, replied: false, next }
+      await bumpDailyStats(ctx.db, dayKey(config.timezone), { runs: 1, failed: 1 }).catch(() => {})
+      return { ok: false, retryable: true, replied, next }
     }
 
-    // 不可重试：直接告诉用户，并标记失败
-    const replied = await reply(described.text).catch(() => false)
     await agent.release(runId, { ok: false, error: described.text })
     await bumpDailyStats(ctx.db, dayKey(config.timezone), { runs: 1, failed: 1 }).catch(() => {})
     return { ok: false, retryable: false, replied }

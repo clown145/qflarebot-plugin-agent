@@ -99,6 +99,7 @@ describe('executeRun', () => {
         ctx: context(),
         logger,
         config: defaultConfig,
+        retryDelayMs: 0,
         llm: fakeLLM('你好呀'),
         agent: fakeStub({ release }),
         reply,
@@ -123,6 +124,7 @@ describe('executeRun', () => {
         ctx: context(),
         logger,
         config: defaultConfig,
+        retryDelayMs: 0,
         llm: fakeLLM('收到'),
         agent: fakeStub({ release }),
         reply: replySpy(),
@@ -147,6 +149,7 @@ describe('executeRun', () => {
         ctx: context(),
         logger,
         config: defaultConfig,
+        retryDelayMs: 0,
         llm: fakeLLM(''),
         agent: fakeStub({ release }),
         reply: replySpy(),
@@ -160,7 +163,7 @@ describe('executeRun', () => {
     expect(history[0]?.role).toBe('user')
   })
 
-  it('上游限流时退回队列，不标记失败、不回复错误文案', async () => {
+  it('上游限流：重试一次后仍失败，告知用户并退回队列', async () => {
     const reply = replySpy()
     const retryLater = vi.fn<(runId: string, reason: string) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
     const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
@@ -175,7 +178,7 @@ describe('executeRun', () => {
     } as LLMService
 
     const outcome = await executeRun(
-      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub({ retryLater, release }), reply },
+      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub({ retryLater, release }), reply, retryDelayMs: 0 },
       'run-1',
       message(),
     )
@@ -184,8 +187,10 @@ describe('executeRun', () => {
     expect(outcome.retryable).toBe(true)
     expect(retryLater).toHaveBeenCalledOnce()
     expect(release).not.toHaveBeenCalled()
-    // 可重试错误不该给用户看错误文案——cron 会再试一次
-    expect(reply.calls).toHaveLength(0)
+    // 上一版这里是静默的——用户什么都收不到，消息凭空消失。
+    // 现在会告知「正在限流」，用户至少知道发生了什么
+    expect(reply.calls).toHaveLength(1)
+    expect(reply.calls[0]).toContain('限流')
   })
 
   it('不可重试错误（如认证失败）回复用户并标记失败', async () => {
@@ -203,7 +208,7 @@ describe('executeRun', () => {
     } as LLMService
 
     const outcome = await executeRun(
-      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub({ retryLater, release }), reply },
+      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub({ retryLater, release }), reply, retryDelayMs: 0 },
       'run-1',
       message(),
     )
@@ -227,7 +232,7 @@ describe('executeRun', () => {
     } as LLMService
 
     await executeRun(
-      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub(), reply },
+      { ctx: context(), logger, config: defaultConfig, llm, agent: fakeStub(), reply, retryDelayMs: 0 },
       'run-1',
       message(),
     )
@@ -296,6 +301,7 @@ describe('executeRun', () => {
         ctx: context(),
         logger,
         config: defaultConfig,
+        retryDelayMs: 0,
         llm: fakeLLM('提醒你喝水'),
         agent: fakeStub({ release }),
         reply: replySpy(),
