@@ -86,7 +86,7 @@ export class AgentObject extends PluginDurableObject {
     }
 
     await this.ctx.storage.put(`run:${runId}`, run)
-    await this.ctx.storage.put(queueKey(now, runId), runId)
+    await this.ctx.storage.put(queueKey(await nextSequence(this.ctx.storage), runId), runId)
 
     return this.claim(now)
   }
@@ -120,7 +120,10 @@ export class AgentObject extends PluginDurableObject {
           lockedUntil: undefined,
           updatedAt: now,
         } satisfies RunRecord)
-        await this.ctx.storage.put(queueKey(stale.createdAt, stale.id), stale.id)
+        await this.ctx.storage.put(
+          queueKey(await nextSequence(this.ctx.storage), stale.id),
+          stale.id,
+        )
       }
       await this.ctx.storage.delete('lock')
     }
@@ -212,7 +215,7 @@ export class AgentObject extends PluginDurableObject {
         lockedUntil: undefined,
         updatedAt: now,
       } satisfies RunRecord)
-      await this.ctx.storage.put(queueKey(now, run.id), run.id)
+      await this.ctx.storage.put(queueKey(await nextSequence(this.ctx.storage), run.id), run.id)
     }
 
     await this.ctx.storage.delete('lock')
@@ -256,9 +259,14 @@ export class AgentObject extends PluginDurableObject {
    */
   private async appendHistory(rows: HistoryRow[]): Promise<void> {
     const puts: Record<string, HistoryRow> = {}
+    // 用单调序号而不是 createdAt 做排序键：同一次 release 写入的多条消息
+    // 时间戳可能相同（都取 Date.now()），字典序会退化成比较随机 UUID，顺序就乱了
+    let sequence = (await this.ctx.storage.get<number>('meta:msgSeq')) ?? 0
     for (const row of rows) {
-      puts[`msg:${String(row.createdAt).padStart(16, '0')}:${crypto.randomUUID()}`] = row
+      sequence += 1
+      puts[`msg:${String(sequence).padStart(16, '0')}`] = row
     }
+    await this.ctx.storage.put('meta:msgSeq', sequence)
     await this.ctx.storage.put(puts)
 
     const all = await this.ctx.storage.list<HistoryRow>({ prefix: 'msg:' })
@@ -290,7 +298,22 @@ export class AgentObject extends PluginDurableObject {
   }
 }
 
-/** 队列键：时间戳补零 + runId，字典序即 FIFO */
-function queueKey(at: number, runId: string): string {
-  return `queue:${String(at).padStart(16, '0')}:${runId}`
+/**
+ * 队列键：单调递增序号补零 + runId，字典序即 FIFO。
+ *
+ * **不能用时间戳**：同一毫秒入队的多个 run 会拿到相同的时间戳前缀，
+ * 排序就退化成比较 runId（随机 UUID），FIFO 直接失效——同一毫秒内
+ * 连发两条消息时顺序会乱。序号由 DO storage 里的计数器分配，
+ * DO 单实例串行，所以天然单调。
+ */
+function queueKey(sequence: number, runId: string): string {
+  return `queue:${String(sequence).padStart(16, '0')}:${runId}`
+}
+
+/** 取下一个队列序号。DO 单实例内 `put` 串行，所以读-加-写不会竞争 */
+async function nextSequence(storage: DurableObjectStorage): Promise<number> {
+  const current = (await storage.get<number>('meta:queueSeq')) ?? 0
+  const next = current + 1
+  await storage.put('meta:queueSeq', next)
+  return next
 }
