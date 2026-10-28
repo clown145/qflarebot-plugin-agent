@@ -28,10 +28,11 @@ export function createPageRoutes(): Route<AgentConfig>[] {
       path: '/api/overview',
       auth: 'admin',
       handler: async ({ ctx }) => {
-        const llm = ctx.service<LLMService>('llm')
-
+        // 同 /agent status：提供者缺失时不要把整页打成 500，而是把原因放进 modelStatus。
+        // 否则面板上「插件页面 → Agent」会整页空白，看不出是 llm 插件没启用。
         let modelStatus: { ok: boolean; models?: string[]; error?: string }
         try {
+          const llm = ctx.service<LLMService>('llm')
           const list = await llm.listModels()
           modelStatus = { ok: true, models: list.map((m) => m.alias) }
         } catch (error) {

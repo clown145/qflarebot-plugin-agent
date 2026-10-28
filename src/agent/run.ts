@@ -100,7 +100,10 @@ async function runLoopOnce(input: {
     supportsVision: modelInfo?.capabilities.includes('image') ?? false,
   })
 
-  const registry = buildRegistry(ctx, config)
+  // R2 探测放在这里（而不是 buildRegistry 里）是因为它是异步的，而 buildRegistry
+  // 被设计成同步、好测。探测结果在 isolate 内缓存，正常对话不会多出往返。
+  const r2Ready = config.enable_tools && config.enable_vfs ? await hasR2(ctx) : false
+  const registry = buildRegistry(ctx, config, r2Ready)
 
   return runAgentLoop({
     llm,
@@ -297,6 +300,37 @@ export async function executeRun(
 }
 
 /**
+ * R2 是否真的绑定了。
+ *
+ * **不能只看 `ctx.r2` 是不是 undefined**：宿主在未绑定 R2 时返回的仍然是一个对象——
+ * 每个方法都是「调用即抛」的桩（`packages/runtime/src/scoped.ts` 的 `createScopedR2`）。
+ * 所以 `if (ctx.r2)` 恒为真，`enable_vfs` 会在没有 R2 的机器人上注册一整套
+ * 必然失败的工具，模型只会得到一句「未绑定 R2」的工具错误、反复重试。
+ *
+ * 这里真的探测一次：`head()` 对空 key 在绑定时返回 null、未绑定时抛可读错误。
+ * 探测结果缓存在 isolate 内（绑定不会在一次部署内变化），每个 isolate 最多多一次 R2 往返。
+ */
+const r2Available = new WeakMap<object, boolean>()
+
+export async function hasR2(ctx: PluginContext<AgentConfig>): Promise<boolean> {
+  const r2 = ctx.r2 as ScopedR2 | undefined
+  if (!r2) return false
+
+  const cached = r2Available.get(r2 as object)
+  if (cached !== undefined) return cached
+
+  let ok: boolean
+  try {
+    await r2.head('__probe__')
+    ok = true
+  } catch {
+    ok = false
+  }
+  r2Available.set(r2 as object, ok)
+  return ok
+}
+
+/**
  * 按配置组装工具集。
  *
  * `enable_tools` 是总开关；`enable_vfs` / `enable_schedule` 是分开关。
@@ -306,6 +340,7 @@ export async function executeRun(
 export function buildRegistry(
   ctx: PluginContext<AgentConfig>,
   config: AgentConfig,
+  r2Ready: boolean,
 ): ToolRegistry {
   if (!config.enable_tools) return createToolRegistry([])
 
@@ -320,18 +355,21 @@ export function buildRegistry(
   }
 
   if (config.enable_vfs) {
-    // R2 没绑定时 vfs 不可用（大文件存不进去）。此时只注册 D1 能撑的部分？
-    // 不行——用户开了开关却只能写小文件会困惑，所以直接不注册并记一条日志
-    const r2 = ctx.r2 as ScopedR2 | undefined
-    if (r2) {
-      tools.push(...createVfsTools(ctx.db, r2))
-    } else {
+    // R2 没绑定时 vfs 不可用（大文件存不进去）。用户开了开关却只能写小文件会困惑，
+    // 所以整组不注册，并在选择模型时记一条日志（只记一次，不刷屏）
+    if (r2Ready) {
+      tools.push(...createVfsTools(ctx.db, ctx.r2))
+    } else if (!warnedNoR2) {
+      warnedNoR2 = true
       ctx.logger.warn('enable_vfs 打开了但 R2 未绑定，工作区工具不可用')
     }
   }
 
   return createToolRegistry(tools)
 }
+
+/** 同一个 isolate 里只警告一次，避免每条消息刷一行日志 */
+let warnedNoR2 = false
 
 async function safeResolveModel(llm: LLMService, model: string, logger: Logger) {
   try {

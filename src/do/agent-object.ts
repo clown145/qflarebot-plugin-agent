@@ -61,7 +61,7 @@ export interface AcquireResult {
   retryAfterMs?: number
 }
 
-export class AgentObject extends PluginDurableObject {
+export class Agent extends PluginDurableObject {
   // ------------------------------------------------------------ 入队与认领
 
   /**
@@ -288,7 +288,23 @@ export class AgentObject extends PluginDurableObject {
     if (excess.length) await this.ctx.storage.delete(excess)
   }
 
-  // ------------------------------------------------------------ 清理
+  // ------------------------------------------------------------ 清理与恢复
+
+  /**
+   * cron 的 10 分钟清理轮：**一次 RPC 做完「认领滞留 run」与「清理终态 run」**。
+   *
+   * 合成一次是因为两边都要按会话遍历：分两次调用等于把 DO 唤醒数翻倍，
+   * 而 DO 按 GB-秒计费（免费版 13,000 GB-s/日）。
+   *
+   * 认领为什么要在这里做：执行者被掐断（事件 30 秒硬窗、CPU 1102）时
+   * `release()` 永远跑不到，租约 90 秒后过期却没人来拿。只靠「下一条消息进来
+   * 时顺带认领」在冷会话里等于永远不恢复，排队消息就永久停滞。
+   */
+  async sweep(olderThanMs: number): Promise<{ claimed: AcquireResult; pruned: number }> {
+    const claimed = await this.claim(Date.now())
+    const pruned = await this.prune(olderThanMs)
+    return { claimed, pruned }
+  }
 
   /**
    * 清理终态 run。由 cron 调用。

@@ -292,6 +292,91 @@ describe('executeRun', () => {
     expect(seenTools.map((t) => t.name)).not.toContain('vfs.read_file')
   })
 
+  /**
+   * 回归：宿主的 `ctx.r2` **永远是一个对象**——没绑 R2 时每个方法都是「调用即抛」的桩
+   * （`packages/runtime/src/scoped.ts` 的 `createScopedR2`）。上一版 `if (ctx.r2)` 恒为真，
+   * 于是 enable_vfs 会在没有 R2 的机器人上注册一整套必然失败的工具。
+   * 现在真的探测一次（`head()` 抛错即视为未绑定）。
+   */
+  it('enable_vfs 打开但 R2 未绑定时，vfs 工具不注册（r2 是抛错桩）', async () => {
+    let seenTools: Array<{ name: string }> = []
+    const llm = {
+      ...fakeLLM(),
+      chat: async (req: { tools?: Array<{ name: string }> }) => {
+        seenTools = req.tools ?? []
+        return { text: 'ok', alias: 'chat', provider: 'fake', model: 'fake', latency_ms: 1 }
+      },
+    } as LLMService
+
+    const thrower = async (): Promise<never> => {
+      throw new Error('未绑定 R2（wrangler.jsonc 的 r2_buckets），插件无法使用 ctx.r2')
+    }
+    const unboundR2 = {
+      get: thrower,
+      getText: thrower,
+      getJSON: thrower,
+      getStream: thrower,
+      put: thrower,
+      delete: thrower,
+      head: thrower,
+      list: thrower,
+    }
+
+    await executeRun(
+      {
+        ctx: { ...context({ enable_vfs: true }), r2: unboundR2 } as unknown as PluginContext<AgentConfig>,
+        logger,
+        config: { ...defaultConfig, enable_vfs: true },
+        llm,
+        agent: fakeStub(),
+        reply: replySpy(),
+      },
+      'run-1',
+      message(),
+    )
+
+    expect(seenTools.map((t) => t.name)).not.toContain('vfs.read_file')
+    // 仍然该有时间与网页工具
+    expect(seenTools.map((t) => t.name)).toContain('time.now')
+  })
+
+  it('enable_vfs 打开且 R2 可用时，vfs 工具正常注册', async () => {
+    let seenTools: Array<{ name: string }> = []
+    const llm = {
+      ...fakeLLM(),
+      chat: async (req: { tools?: Array<{ name: string }> }) => {
+        seenTools = req.tools ?? []
+        return { text: 'ok', alias: 'chat', provider: 'fake', model: 'fake', latency_ms: 1 }
+      },
+    } as LLMService
+
+    const boundR2 = {
+      get: async () => null,
+      getText: async () => null,
+      getJSON: async () => null,
+      getStream: async () => null,
+      put: async () => {},
+      delete: async () => {},
+      head: async () => null,
+      list: async () => [],
+    }
+
+    await executeRun(
+      {
+        ctx: { ...context({ enable_vfs: true }), r2: boundR2 } as unknown as PluginContext<AgentConfig>,
+        logger,
+        config: { ...defaultConfig, enable_vfs: true },
+        llm,
+        agent: fakeStub(),
+        reply: replySpy(),
+      },
+      'run-1',
+      message(),
+    )
+
+    expect(seenTools.map((t) => t.name)).toContain('vfs.read_file')
+  })
+
   it('定时任务以 scheduler 身份跑时不会被权限拦下（actorId 保留在消息里）', async () => {
     // 这条验证 run 把 message.userId 传进工具上下文，
     // 而 permissions/default-policy 对 actorId === 'scheduler' 有特判

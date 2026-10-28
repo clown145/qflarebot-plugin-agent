@@ -34,6 +34,9 @@ QFlareBot 的 Agent 插件：带工具调用的多轮对话、会话记忆、联
 { "tag": "p-agent", "new_sqlite_classes": ["P_agent_Agent"] }
 ```
 
+tag 自己定，只要不与已有的重复；类名 `P_agent_Agent` 不能改——它由投影器按
+`P_<插件名>_<类名>` 生成，插件里的导出类名与清单里的键都必须叫 `Agent`。
+
 提交推送、等构建完成后，回面板点「已加好 migrations，确认安装」。
 
 > 这是 QFlareBot 对所有 DO 插件的统一要求，不是本插件的特殊设计。不想要这个手工步骤的话，只能用不带 DO 的简化版（会失去会话串行化与历史）。
@@ -77,7 +80,7 @@ D1 只用来存需要跨会话全局查询的东西：定时任务、按天统�
 | `history_limit` | 20 | 每次带多少条历史。条数越多越贵 |
 | `request_timeout_ms` | 20000 | 单次模型调用超时 |
 | `enable_tools` | 开 | 工具调用总开关 |
-| `enable_vfs` | 关 | 虚拟工作区：模型可读写文件。小文本存 D1，>8KB 存 R2 |
+| `enable_vfs` | 关 | 虚拟工作区：模型可读写文件。小文本存 D1，>8KB 存 R2（**需要绑定 R2**，未绑定时整组工具不注册） |
 | `enable_schedule` | 关 | 动态定时任务 |
 | `enable_audit` | 关 | 工具调用写 D1，排障用 |
 | `show_typing` | 开 | 单聊"正在输入" |
@@ -92,7 +95,7 @@ D1 只用来存需要跨会话全局查询的东西：定时任务、按天统�
 | 工具 | 级别 | scope | 谁能用 |
 | --- | --- | --- | --- |
 | `time.now` | 1 | — | 所有人 |
-| `web.fetch_page` | 1 | — | 所有人 |
+| `web.fetch_page` | 1 | — | 所有人（重定向逐跳校验，内网地址拒绝） |
 | `vfs.read_file` / `list_dir` / `search` | 1 | `workspace:read` | 所有人（需开 `enable_vfs`） |
 | `vfs.write_file` / `mkdir` | 2 | `workspace:write` | 群成员及以上 |
 | `http.request` | 3 | `http:request` | 群主与管理员 |
@@ -108,6 +111,10 @@ D1 只用来存需要跨会话全局查询的东西：定时任务、按天统�
 | 群成员 | 2 | workspace 读写 |
 | 单聊 / 角色未知 | 1 | workspace 只读 |
 | 定时任务（`actorId === 'scheduler'`） | 3 | 同群主 |
+
+定时任务到点重放时以 `scheduler` 身份进 loop（不是创建者的 openid），所以管理员建的、
+需要 `http.request` / `schedule.*` 的提醒到点不会被自己拦下。`created_by` 仍记在
+`{schedules}` 表里，只是不参与权限判定。
 
 单聊没有群角色，所以 `http.request` 和 `schedule.*` 在单聊里用不了——
 这是有意的：单聊是陌生人就能触达的入口，不该让它直接发任意 HTTP 请求。
@@ -135,10 +142,13 @@ D1 里的 `{policies}` 表可以按 user / role / conversation / platform 叠加
 
 | 项目 | 单次对话消耗 | 免费版额度 | 可支撑 |
 | --- | --- | --- | --- |
-| DO | 约 1–3 GB-s（8–25 秒） | 13,000 GB-s/日 | 约 4,000–12,000 次/日 |
+| DO | 约 1–3 GB-s（8–25 秒），另加每 10 分钟一轮清理（每会话一次 RPC） | 13,000 GB-s/日 | 约 4,000–12,000 次/日 |
 | D1 写 | 0 行（历史在 DO） | 100,000 行/日 | 不构成瓶颈 |
 | KV 写 | 仅首次见到新会话时 | 1,000 次/日 | 够用 |
 | Worker 请求 | 1 次/消息 + cron 1,440/日 | 100,000 次/日 | 够用 |
+
+会话列表上限 20 个：每多记一个会话，清理轮就多一次 DO 唤醒（每天 144 次）。
+个人机器人够用；被挤掉的会话下次有消息进来会重新记到列表末尾。
 
 **免费版能用**。CPU 是唯一需要留意的：免费版 Worker 请求与 cron 都是 10 ms CPU（I/O 等待不计入），一次多步工具调用的 loop 可能接近这个量。真撞到限制（表现是整个 Worker 偶发 1102）有两个解法：
 
@@ -220,10 +230,10 @@ src/
 | `src/core/agent-context.ts` | 参考结构重写 | 保留历史回放的两个细节 |
 | `src/tools/registry/tool-registry.ts` | 参考结构重写 | 保留权限→执行→审计顺序，审计改可选 |
 | `src/permissions/*` | 参考结构重写 | 6 级 + scope、角色基线、策略叠加 |
-| `src/agents/agent-mailbox*` | 参考思路重写 | 租约、FIFO 队列、终态清理 |
+| `src/agents/agent-mailbox*` | 参考思路重写 | 租约、FIFO 队列、终态清理；恢复靠 cron 的 10 分钟清理轮而不是 `alarm()`（DO 里没有 `ctx.service()`，跑不了 loop） |
 | `src/tools/time/tools.ts` | 参考重写 | 时区处理 |
 | `src/tools/schedule/*` | 参考协议重写 | 去掉 Queue 依赖，改 cron 扫表 |
-| `src/tools/vfs/*` | 参考设计重写 | 砍掉 revisions，小文本 D1 / 大文件 R2 |
+| `src/tools/vfs/*` | 参考设计重写 | 砍掉 revisions，小文本 D1 / 大文件 R2；覆盖大文件时会删掉旧 R2 对象 |
 
 **没有搬**（约 24,000 行）：
 
@@ -232,6 +242,16 @@ src/
 - `src/core/model/`（2,358）——plugin-llm 已覆盖
 - `src/rayneo/`（1,390）、`src/platforms/`（1,260）——私有协议
 - `apps/admin-web/`（13,670）——插件 UI 只能单 HTML
+
+## 已知限制
+
+- **Gemini 思考模型的多轮工具调用不可用**：plugin-llm 的契约要求把 `thought_signatures`
+  原样回传（Gemini 2.5/3.x 对 functionCall part 的签名严格校验，缺了直接 400），
+  而本插件的本地契约副本没有这个字段。用 Gemini 非思考模型或 OpenAI 兼容协议没影响。
+- **没有 run/step 级可观测性**：不做 `runs` / `run_steps` / `tool_calls` 落库（D1 写额度是
+  全机器人共享的 10 万行/日）。排障走 Workers Logs，工具调用记录是可选开关。
+- **没有 web 搜索 / skills / MCP / pending-action 确认流**：见上表，属于没搬的部分。
+
 
 许可证：本插件 MIT；serverless-agent 是 GPL-3.0-or-later，把它的代码复用到别的项目时注意兼容性。
 

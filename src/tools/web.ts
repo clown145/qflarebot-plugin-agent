@@ -11,6 +11,8 @@ import { extractPageContent } from './web/extract.js'
 
 const MAX_PAGE_BYTES = 2 * 1024 * 1024
 const MAX_CHARS = 20_000
+/** 重定向跳数上限，与 http.request 一致 */
+const MAX_REDIRECTS = 3
 
 export function createWebTool(): RegisteredTool {
   return {
@@ -36,26 +38,44 @@ export function createWebTool(): RegisteredTool {
     source: { type: 'builtin', id: 'web', name: '网页' },
 
     execute: async (context) => {
-      const url = (context.input as Partial<{ url: string }>)?.url
-      if (!url || typeof url !== 'string') return fail('bad_request', '缺少 url')
+      const requested = (context.input as Partial<{ url: string }>)?.url
+      if (!requested || typeof requested !== 'string') return fail('bad_request', '缺少 url')
 
-      const invalid = validateFetchUrl(url)
-      if (invalid) return fail('blocked_url', invalid)
+      // **每一跳都要重新校验**：只校验初始 URL 的话，攻击者用一个公网地址
+      // 302 到 127.0.0.1 / 169.254.169.254 就能绕过。`http.ts` 早就是这么做的，
+      // 这里以前漏了（用的 `redirect: 'follow'`，fetch 自己跟到底，插件拿不到中间地址）。
+      let url = requested
+      let response: Response | null = null
+      for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+        const invalid = validateFetchUrl(url)
+        if (invalid) return fail('blocked_url', invalid)
 
-      let response: Response
-      try {
-        response = await fetch(url, {
-          headers: {
-            // 不带 UA 的话不少站点会直接 403
-            'user-agent': 'Mozilla/5.0 (compatible; QFlareBot-Agent/1.0)',
-            accept: 'text/html,application/xhtml+xml,text/plain',
-          },
-          redirect: 'follow',
-        })
-      } catch (error) {
-        return fail('network', error instanceof Error ? error.message : String(error))
+        try {
+          response = await fetch(url, {
+            headers: {
+              // 不带 UA 的话不少站点会直接 403
+              'user-agent': 'Mozilla/5.0 (compatible; QFlareBot-Agent/1.0)',
+              accept: 'text/html,application/xhtml+xml,text/plain',
+            },
+            redirect: 'manual',
+          })
+        } catch (error) {
+          return fail('network', error instanceof Error ? error.message : String(error))
+        }
+
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get('location')
+          if (!location) return fail('bad_response', '重定向没有 Location 头')
+          url = new URL(location, url).toString()
+          continue
+        }
+        break
       }
 
+      if (!response) return fail('too_many_redirects', `重定向超过 ${MAX_REDIRECTS} 次`)
+      if (response.status >= 300 && response.status < 400) {
+        return fail('too_many_redirects', `重定向超过 ${MAX_REDIRECTS} 次`)
+      }
       if (!response.ok) return fail('http_error', `HTTP ${response.status}`)
 
       const contentType = response.headers.get('content-type') ?? ''

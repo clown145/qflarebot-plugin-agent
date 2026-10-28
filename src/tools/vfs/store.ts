@@ -33,8 +33,7 @@ export interface VfsWorkspace {
   search(query: string, limit?: number): Promise<Array<{ path: string; snippet: string }>>
 }
 
-export function createVfsWorkspace(db: PluginDB, r2: ScopedR2): VfsWorkspace {
-  return {
+export function createVfsWorkspace(db: PluginDB, r2: ScopedR2): VfsWorkspace {  return {
     async readFile(rawPath) {
       const path = normalizeVfsPath(rawPath)
       const entry = await getEntry(db, path)
@@ -55,6 +54,11 @@ export function createVfsWorkspace(db: PluginDB, r2: ScopedR2): VfsWorkspace {
 
       const size = byteLength(content)
       const r2Key = size > INLINE_LIMIT ? `vfs${path}` : null
+
+      // 覆盖已有文件时先记住旧内容的存放位置：大文件改成小文件（或反过来）时，
+      // 旧的那份必须删掉，否则 R2 里的对象永远没人引用、也没人删
+      const previous = await getEntry(db, path)
+      const previousR2Key = previous?.r2Key ?? null
 
       // 大的写 R2，小的写 D1
       if (r2Key) {
@@ -77,6 +81,14 @@ export function createVfsWorkspace(db: PluginDB, r2: ScopedR2): VfsWorkspace {
         r2Key ? null : content,
         Date.now(),
       )
+
+      // 新内容不进 R2（变小了），或换了 key：把旧对象删掉。
+      // 放在 D1 更新之后：先删后写的话，D1 写失败就会留下「元数据指向一个不存在的对象」。
+      if (previousR2Key && previousR2Key !== r2Key) {
+        await r2.delete(previousR2Key).catch(() => {
+          /* 删不掉（R2 抖动）只是留个孤儿对象，不该让写文件失败 */
+        })
+      }
 
       return { path, size }
     },

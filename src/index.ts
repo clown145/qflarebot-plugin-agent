@@ -26,7 +26,7 @@ import { definePlugin } from '@qqbot/sdk'
 import type { PluginContext, Session } from '@qqbot/sdk'
 import type { AgentConfig } from './config/index.js'
 import { configSchema, defaultConfig } from './config/index.js'
-import { AgentObject } from './do/agent-object.js'
+import { Agent } from './do/agent-object.js'
 import type { HistoryRow } from './do/agent-object.js'
 import type { InboundMessage } from './types.js'
 import type { LLMService } from './llm/contract.js'
@@ -43,7 +43,7 @@ import {
 } from './store/d1.js'
 import { createPageRoutes } from './routes.js'
 
-export { AgentObject }
+export { Agent }
 
 /**
  * 事件处理器里同步跑 loop 的软预算。
@@ -62,12 +62,23 @@ const RUN_RETENTION_MS = 10 * 60 * 1000
 /** 清理节流：最多每 10 分钟跑一次（删除也算 D1 写入） */
 const PRUNE_INTERVAL_MS = 10 * 60 * 1000
 
+/**
+ * KV 里记住多少个会话。
+ *
+ * 这个列表唯一的用途是 cron 的 10 分钟清理轮知道该扫哪些 DO（恢复滞留 run、清终态 run）。
+ * 每多记一个会话，就是每天多 144 次 DO 唤醒。
+ */
+const MAX_TRACKED_CONVERSATIONS = 20
+
 export default definePlugin<AgentConfig>({
   name: 'agent',
   displayName: 'Agent',
   description:
     '带工具调用的多轮对话：会话记忆、联网查资料、HTTP 请求、动态定时任务。需要配合「LLM 接口」插件使用。',
-  apiVersion: 1,
+  // 2 = 用到 `ctx.db.batch()`（VFS 写入把元数据与内容合成一批）。
+  // 写 1 的话装在 0.4 以前的机器人上能过安装检查，然后在第一次写文件时
+  // `TypeError: db.batch is not a function`——正是 apiVersion 要防的那种「装上了才炸」。
+  apiVersion: 2,
   permissions: ['net', 'kv', 'db', 'durable', 'proactive'],
 
   depends: { llm: '*' },
@@ -75,7 +86,7 @@ export default definePlugin<AgentConfig>({
   configSchema,
   defaultConfig,
 
-  durableObjects: { Agent: AgentObject },
+  durableObjects: { Agent: Agent },
 
   ui: { path: '/ui/', title: 'Agent' },
 
@@ -141,10 +152,14 @@ export default definePlugin<AgentConfig>({
     'agent status': {
       description: '查看 Agent 状态',
       async handler({ ctx }) {
-        const llm = ctx.service<LLMService>('llm')
+        // `ctx.service()` 在提供者被停用/卸载时会抛错。这里必须兜住：
+        // 让它抛就变成「用户发了命令、什么都没收到」，而实际原因是 LLM 插件没启用。
+        // 与 handleMessage 的降级保持一致，只是这里还能把本地配置照常报出来。
+        let llm: LLMService | null = null
         let models: string[] = []
         let error: string | undefined
         try {
+          llm = ctx.service<LLMService>('llm')
           const list = await llm.listModels()
           models = list.map((m) => m.alias)
         } catch (e) {
@@ -152,7 +167,11 @@ export default definePlugin<AgentConfig>({
         }
         const lines = [
           `模型别名：${ctx.config.model}`,
-          models.length ? `可用别名：${models.join('、')}` : `别名列表读取失败${error ? `：${error}` : ''}`,
+          !llm
+            ? 'LLM 接口插件未启用——请在面板的插件页启用或安装它'
+            : models.length
+              ? `可用别名：${models.join('、')}`
+              : `别名列表读取失败${error ? `：${error}` : ''}`,
           `工具调用：${ctx.config.enable_tools ? '开' : '关'}`,
           `步数上限：${ctx.config.max_model_steps}`,
         ]
@@ -177,17 +196,18 @@ export default definePlugin<AgentConfig>({
 
   cron: {
     /**
-     * 每分钟一次。**只做两件事**：检查到期的定时任务、清理过期数据。
+     * 每分钟一次。**只做三件事**：触发到期的定时任务、恢复被掐断的 run、清理过期数据。
      *
      * ## 为什么不在这里轮询消息队列
      *
-     * 队列里的 run 只有一种来源：同会话正忙时新消息入队。而上一个 run 跑完后
-     * `release()` 会顺手认领下一个并返回，事件处理器接着跑完（见 runUntilQueueEmpty）。
-     * 所以队列正常情况下永远是空的。
+     * 队列里的 run 只有两种来源：同会话正忙时新消息入队（上一个 run 跑完后
+     * `release()` 会顺手认领下一个并返回，事件处理器接着跑完），以及
+     * **执行者中途被掐断**（事件 30 秒硬窗、CPU 1102）。
      *
-     * 每分钟对每个会话 poll 一次纯属浪费：20 个会话 = 每天 28,800 次 DO 唤醒，
-     * 而 DO 按 GB-秒计费（免费版 13,000 GB-s/日）。之前的设计正是这样，
-     * 已改成事件驱动。
+     * 前者不需要 cron；后者必须有兜底——否则租约过期后没有任何人会再来认领，
+     * 这个会话的排队消息就永久停滞，用户再也收不到回复。所以恢复只在
+     * **10 分钟一次的清理轮**里做，平时不碰 DO：每分钟对每个会话 poll 一次是
+     * 20 会话 = 每天 28,800 次 DO 唤醒，而 DO 按 GB-秒计费。
      *
      * ## 为什么定时任务必须靠 cron
      *
@@ -195,23 +215,28 @@ export default definePlugin<AgentConfig>({
      * 只有 enable_schedule 打开时才查，且没到期任务时一次 D1 查询就退出。
      *
      * 注意 QFlareBot 的 cron 是**所有插件串行**跑在同一个 invocation 里，
-     * 墙钟上限 15 分钟。所以这里单次控制在 20 秒内，不拖累别的插件。
+     * 墙钟上限 15 分钟。所以这里整轮控制在 20 秒内，不拖累别的插件。
      */
     tick: {
       cron: '* * * * *',
       async handler({ ctx }) {
+        const startedAt = Date.now()
+
         const hasDueSchedule = ctx.config.enable_schedule
           ? (await listDueSchedules(ctx.db, Date.now(), 1)).length > 0
           : false
 
-        if (hasDueSchedule) await fireDueSchedules(ctx)
+        if (hasDueSchedule) await fireDueSchedules(ctx, startedAt)
 
         const now = Date.now()
-        if (shouldPrune(ctx, now)) {
-          pruneThrottle.at = now
-          await pruneSettledRuns(ctx)
-        }
-        await maybePruneAudit(ctx)
+        // 节流决策只做一次，然后**显式传下去**：
+        // 以前是先置 `pruneThrottle.at = now` 再让 maybePruneAudit 自己重判 `shouldPrune`，
+        // 于是第二次判断永远为假，审计清理一次都没跑过（{tool_audit} 无限增长）。
+        if (!shouldPrune(ctx, now)) return
+        pruneThrottle.at = now
+
+        await maybePruneAudit(ctx, now)
+        await serviceConversationObjects(ctx, startedAt)
       },
     },
   },
@@ -354,29 +379,87 @@ function tryLLM(ctx: PluginContext<AgentConfig>): LLMService | null {
 
 
 /**
- * 清理各会话 DO 里的终态 run。
+ * 一次 cron 轮的总时间预算。
  *
- * 只做清理，不捡队列——队列由 `release()` 链式处理（见 runUntilQueueEmpty）。
- * 节流到 10 分钟一次（DELETE 类操作不必每分钟做）。
+ * QFlareBot 的 cron 是**所有插件串行**跑在同一个 invocation 里（墙钟 15 分钟），
+ * 这个插件拖久了别的插件的定时任务就得排队等。留足余量：整轮 20 秒。
  */
-async function pruneSettledRuns(ctx: PluginContext<AgentConfig>): Promise<void> {
+const CRON_BUDGET_MS = 20_000
+
+/**
+ * 顺带扫一遍各会话的 DO：认领滞留的 run + 清理终态 run。
+ *
+ * ## 为什么必须有这一步
+ *
+ * run 有两种来源：同会话忙时新消息入队（跑完后 `release()` 链式认领，不需要 cron），
+ * 和**执行者中途被掐断**（事件 30 秒硬窗、CPU 1102 都会）。后者 `release()` 永远跑不到，
+ * 租约 90 秒后过期但没人认领——这个会话的排队消息就永久停滞。
+ * 只靠「下一条消息进来时顺带认领」在冷会话里等于永远不恢复。
+ *
+ * ## 为什么节流到 10 分钟
+ *
+ * DO 按 GB-秒计费（免费版 13,000 GB-s/日）。每分钟对每个会话唤醒一次是
+ * 20 会话 × 1,440 = 28,800 次/天，纯浪费。10 分钟一次、且**每个会话只发一次 RPC**
+ * （`sweep` 在 DO 内部一次做完认领与清理）：20 × 144 = 2,880 次/天。
+ *
+ * 会话列表上限因此压到 20：个人机器人远用不到，多出来的会话真的触发时
+ * 会被 `rememberConversation` 记进来（保留最近的）。
+ */
+async function serviceConversationObjects(
+  ctx: PluginContext<AgentConfig>,
+  startedAt: number,
+): Promise<void> {
   const known = (await ctx.kv.getJSON<string[]>('conversations')) ?? []
+  if (known.length === 0) return
+
+  // llm 只在真的要跑滞留 run 时才需要：清理终态 run 与它无关，
+  // 不能因为 LLM 插件被停用就把清理也一起停掉（那会让 DO 里堆满终态 run）。
+  let llm: LLMService | null = null
+  let llmChecked = false
 
   for (const conversation of known) {
+    // 超预算就放弃剩下的会话，下一轮 cron 接着来——宁可晚 10 分钟恢复，
+    // 也不能把同一个 invocation 里别的插件的定时任务拖到超时
+    if (Date.now() - startedAt > CRON_BUDGET_MS) {
+      ctx.logger.warn('cron 超出预算，剩余会话留待下一轮', { remaining: known.length - known.indexOf(conversation) })
+      return
+    }
+
     try {
-      await agentStub(ctx, conversation).prune(RUN_RETENTION_MS)
+      const stub = agentStub(ctx, conversation)
+      // 一次 RPC 同时做「认领滞留 run」与「清理终态 run」
+      const picked = await stub.sweep(RUN_RETENTION_MS)
+      if (!picked.claimed.acquired || !picked.claimed.runId || !picked.claimed.message) continue
+
+      if (!llmChecked) {
+        llmChecked = true
+        llm = tryLLM(ctx)
+      }
+      if (!llm) {
+        // 认领到了却跑不了：把 run 退回队列，别让它挂在 running 状态上
+        await stub.retryLater(picked.claimed.runId, 'llm 服务不可用')
+        continue
+      }
+
+      const message = picked.claimed.message
+      const reply = makeApiReply(ctx, message)
+      await executeRun(
+        { ctx, logger: ctx.logger, config: ctx.config, llm, agent: stub, reply },
+        picked.claimed.runId,
+        message,
+      )
     } catch (error) {
       // 某个会话的 DO 挂了不该挡住别的会话
-      ctx.logger.warn('清理 DO 里的 run 失败', { conversation, error: String(error) })
+      ctx.logger.warn('恢复会话 DO 失败', { conversation, error: String(error) })
     }
   }
 }
 
 /**
- * 这次 cron 要不要顺手清理终态 run。
+ * 这次 cron 要不要顺手清理终态 run / 恢复滞留 run。
  *
- * 清理是 DELETE 类操作，不必每分钟做。用 KV 里的时间戳节流到 10 分钟一次，
- * 和审计清理共用一个节流键。
+ * 清理是 DELETE 类操作、恢复要唤醒 DO，都不必每分钟做。
+ * 用进程内时间戳节流到 10 分钟一次。
  */
 function shouldPrune(ctx: PluginContext<AgentConfig>, now = Date.now()): boolean {
   return now - pruneThrottle.at > PRUNE_INTERVAL_MS
@@ -385,9 +468,23 @@ function shouldPrune(ctx: PluginContext<AgentConfig>, now = Date.now()): boolean
 /** 进程内节流状态。isolate 被回收后重置，最多多做一次清理，无害 */
 const pruneThrottle = { at: 0 }
 
-/** 到期的定时任务：用保存的 prompt 重新跑一轮 agent */
+/**
+ * 到期的定时任务：用保存的 prompt 重新跑一轮 agent。
+ *
+ * ## 关键：**提交即推进**
+ *
+ * `submit()` 一返回，这条提醒的责任就已经交给 DO 的队列了（入队失败会抛）。
+ * 所以立刻推进 `due_at` / 标 `done`，而不是等「跑成功」。
+ *
+ * 以前是「跑成功才推进」，会造成同一条提醒执行两遍：
+ * - 会话正忙 → 没抢到执行权，run 进了队列，`due_at` 不动 → 下一分钟 cron 又 submit 一份；
+ * - 可重试失败 → `executeRun` 内部 `retryLater()` 把 run 退回队列，`due_at` 还不动 → 同样重复。
+ *
+ * 推进失败（D1 抖动）时抛出去，让 cron 记录失败——宁可下一分钟重来，也不要静默吞掉。
+ */
 async function fireDueSchedules(
   ctx: PluginContext<AgentConfig>,
+  startedAt: number,
 ): Promise<void> {
   if (!ctx.config.enable_schedule) return
 
@@ -397,9 +494,18 @@ async function fireDueSchedules(
   if (due.length === 0) return
 
   for (const schedule of due) {
+    if (Date.now() - startedAt > CRON_BUDGET_MS) {
+      ctx.logger.warn('cron 超出预算，剩余定时任务留待下一轮', { scheduleId: schedule.id })
+      return
+    }
+
     const message: InboundMessage = {
       conversation: schedule.conversation,
-      userId: schedule.created_by,
+      // 定时任务由系统发起，不是「那个人正在说话」：用 `scheduler` 这个保留身份，
+      // 权限层把它判成 owner 级（见 permissions/default-policy.ts）。
+      // 以前传的是 created_by，但没带 memberRole → 角色 unknown → 只有 level 1，
+      // 于是管理员建的、需要 http.request/schedule.* 的提醒到点会被自己拦下。
+      userId: 'scheduler',
       userName: '',
       text: schedule.prompt,
       displayText: schedule.prompt,
@@ -412,40 +518,27 @@ async function fireDueSchedules(
     const stub = agentStub(ctx, schedule.conversation)
     const reply = makeApiReply(ctx, message)
 
-    // 定时任务进队列。
-    //
-    // 上一版在这里写成：抢不到执行权就跳过，但 finally 里照样推进时间——
-    // 结果是会话正忙时，这个提醒被永久吞掉，用户永远收不到。
-    //
-    // 现在：submit 一定会把 run 入队。抢到就当场跑，抢不到就留给 cron，
-    // 只有真正跑过（或明确失败）才推进时间。
+    // 先入队：入队失败会抛，那就**不**推进，交给下一轮
     const claimed = await stub.submit(message)
-    let fired = false
+    await advanceSchedule(ctx.db, schedule, Date.now())
 
+    // 抢到执行权就当场跑（用户希望提醒准时到），没抢到就交给 DO 的队列，
+    // 由 release() 链或 10 分钟一次的 sweep 兜底。
     if (claimed.acquired && claimed.runId) {
-      const outcome = await executeRun(
+      await executeRun(
         { ctx, logger: ctx.logger, config: ctx.config, llm, agent: stub, reply },
         claimed.runId,
         message,
       )
-      fired = outcome.ok || !outcome.retryable
-    }
-
-    // 只有跑过才推进；没抢到执行权时不动 due_at，让 cron 下一分钟再试
-    if (fired) {
-      await advanceSchedule(ctx.db, schedule, Date.now())
     } else {
-      ctx.logger.info('定时任务入队等待，下次 cron 继续', { scheduleId: schedule.id })
+      ctx.logger.info('定时任务已入队，等队列执行', { scheduleId: schedule.id })
     }
   }
 }
 
-/** 清理 D1 里的工具审计。只在开了审计时才需要，节流到 10 分钟一次 */
-async function maybePruneAudit(ctx: PluginContext<AgentConfig>): Promise<void> {
+/** 清理 D1 里的工具审计。只在开了审计时才需要 */
+async function maybePruneAudit(ctx: PluginContext<AgentConfig>, now: number): Promise<void> {
   if (!ctx.config.enable_audit) return
-
-  const now = Date.now()
-  if (!shouldPrune(ctx, now)) return
 
   const removed = await pruneToolAudit(ctx.db, now - AUDIT_RETENTION_MS)
   if (removed > 0) ctx.logger.info('清理过期审计', { removed })
@@ -455,12 +548,15 @@ async function maybePruneAudit(ctx: PluginContext<AgentConfig>): Promise<void> {
 
 type AgentStub = {
   submit(message: InboundMessage): Promise<{ acquired: boolean; runId?: string; message?: InboundMessage; retryAfterMs?: number }>
-  poll(): Promise<{ acquired: boolean; runId?: string; message?: InboundMessage; retryAfterMs?: number }>
   history(limit: number): Promise<HistoryRow[]>
   release(runId: string, result: { ok: boolean; error?: string; history?: HistoryRow[] }): Promise<void>
   retryLater(runId: string, reason: string): Promise<void>
   reset(): Promise<void>
-  prune(olderThanMs: number): Promise<number>
+  /** 一次 RPC 同时做「认领滞留 run」与「清理终态 run」，cron 的 10 分钟清理轮用 */
+  sweep(olderThanMs: number): Promise<{
+    claimed: { acquired: boolean; runId?: string; message?: InboundMessage; retryAfterMs?: number }
+    pruned: number
+  }>
 }
 
 /**
@@ -475,8 +571,8 @@ type AgentStub = {
 function agentStub(
   ctx: PluginContext<AgentConfig>,
   conversation: string,
-): DurableObjectStub<AgentObject> {
-  return ctx.durable.get<AgentObject>('Agent', conversation)
+): DurableObjectStub<Agent> {
+  return ctx.durable.get<Agent>('Agent', conversation)
 }
 
 /**
@@ -493,8 +589,11 @@ async function rememberConversation(
   try {
     const list = (await ctx.kv.getJSON<string[]>('conversations')) ?? []
     if (list.includes(conversation)) return
-    // 列表上限 100 个会话，防止无限增长（个人机器人远用不到）
-    const next = [...list, conversation].slice(-100)
+    // 列表上限压到 20：这个列表唯一的用途是「cron 的 10 分钟清理轮要扫哪些会话的 DO」，
+    // 而每次扫都是 DO 唤醒（按 GB-秒计费）。100 个会话 = 每天 14,400 次唤醒，
+    // 正好是 README 里说要消灭的那种空转。个人机器人 20 个会话足够；
+    // 被挤掉的会话下次真有消息进来会重新记到列表末尾。
+    const next = [...list, conversation].slice(-MAX_TRACKED_CONVERSATIONS)
     await ctx.kv.put('conversations', JSON.stringify(next))
   } catch {
     // 记录失败不影响对话

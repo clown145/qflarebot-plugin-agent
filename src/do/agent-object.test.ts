@@ -1,18 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import { PluginDurableObject } from '@qqbot/sdk'
-import { AgentObject, LEASE_MS, MAX_ATTEMPTS } from './agent-object.js'
+import { Agent, LEASE_MS, MAX_ATTEMPTS } from './agent-object.js'
 import type { HistoryRow } from './agent-object.js'
 import type { InboundMessage } from '../types.js'
 
 /**
- * AgentObject 的双段式调度核心。
+ * Agent 的双段式调度核心。
  *
  * DO 由平台构造，测试里直接 new 不了（基类要求作用域工厂）。
  * 这里用 `Object.create` 绕过构造器，只注入它真正用到的东西：
  * `this.ctx.storage`（内存实现）。这样测的是调度逻辑本身，不是平台行为。
  */
 
-/** 内存版 DurableObjectStorage，只实现 AgentObject 用到的方法 */
+/** 内存版 DurableObjectStorage，只实现 Agent 用到的方法 */
 function memoryStorage() {
   const map = new Map<string, unknown>()
   return {
@@ -44,8 +44,8 @@ function memoryStorage() {
 
 function makeObject() {
   const storage = memoryStorage()
-  const obj = Object.create(AgentObject.prototype) as AgentObject
-  // 只注入 ctx.storage —— AgentObject 里没有别的地方碰 this.ctx
+  const obj = Object.create(Agent.prototype) as Agent
+  // 只注入 ctx.storage —— Agent 里没有别的地方碰 this.ctx
   ;(obj as unknown as { ctx: { storage: unknown } }).ctx = { storage }
   return { obj, storage }
 }
@@ -69,7 +69,7 @@ function historyRow(role: 'user' | 'assistant', content: string): HistoryRow {
   return { role, content, toolCallsJson: null, createdAt: Date.now() }
 }
 
-describe('AgentObject.submit', () => {
+describe('Agent.submit', () => {
   it('第一个 submit 抢到执行权', async () => {
     const { obj } = makeObject()
     const result = await obj.submit(message())
@@ -98,7 +98,7 @@ describe('AgentObject.submit', () => {
   })
 })
 
-describe('AgentObject.poll（cron 兜底）', () => {
+describe('Agent.poll（cron 兜底）', () => {
   it('没活干时返回 acquired: false', async () => {
     const { obj } = makeObject()
     const result = await obj.poll()
@@ -169,7 +169,7 @@ describe('AgentObject.poll（cron 兜底）', () => {
   })
 })
 
-describe('AgentObject.release', () => {
+describe('Agent.release', () => {
   it('标记完成、释放锁、写历史', async () => {
     const { obj, storage } = makeObject()
     const { runId } = await obj.submit(message())
@@ -206,7 +206,7 @@ describe('AgentObject.release', () => {
   })
 })
 
-describe('AgentObject.retryLater', () => {
+describe('Agent.retryLater', () => {
   it('把 run 退回 pending 并重新入队', async () => {
     const { obj, storage } = makeObject()
     const { runId } = await obj.submit(message())
@@ -233,7 +233,7 @@ describe('AgentObject.retryLater', () => {
   })
 })
 
-describe('AgentObject.history', () => {
+describe('Agent.history', () => {
   it('按时间顺序返回，limit 取最近的', async () => {
     const { obj } = makeObject()
     const { runId } = await obj.submit(message())
@@ -276,7 +276,7 @@ describe('AgentObject.history', () => {
   })
 })
 
-describe('AgentObject.reset', () => {
+describe('Agent.reset', () => {
   it('清空历史但不动 run', async () => {
     const { obj, storage } = makeObject()
     const { runId } = await obj.submit(message())
@@ -290,7 +290,7 @@ describe('AgentObject.reset', () => {
   })
 })
 
-describe('AgentObject.stats', () => {
+describe('Agent.stats', () => {
   it('返回历史条数、队列长度、是否有锁', async () => {
     const { obj } = makeObject()
     await obj.submit(message())
@@ -303,7 +303,7 @@ describe('AgentObject.stats', () => {
   })
 })
 
-describe('AgentObject.prune', () => {
+describe('Agent.prune', () => {
   it('清掉超期的终态 run，保留未完成的', async () => {
     const { obj, storage } = makeObject()
     const { runId } = await obj.submit(message())
@@ -335,5 +335,50 @@ describe('AgentObject.prune', () => {
 
     expect(await obj.prune(1)).toBe(0)
     expect(await storage.get(`run:${runId}`)).toBeDefined()
+  })
+})
+
+/**
+ * `sweep()`：cron 的 10 分钟清理轮用的单次 RPC（认领滞留 run + 清终态 run）。
+ *
+ * 这是执行者被掐断（事件 30 秒硬窗、CPU 1102）后**唯一**的恢复路径：
+ * `release()` 永远跑不到，租约过期后没人认领，队列里的消息会永久停滞。
+ */
+describe('Agent.sweep', () => {
+  it('一次调用同时认领滞留 run 与清理终态 run', async () => {
+    const { obj, storage } = makeObject()
+
+    // 1) 先造一个超期的终态 run（先做，避免它的 submit 抢到下面那个滞留 run）
+    const done = await obj.submit(message({ text: '已完成的下一条' }))
+    await obj.release(done.runId!, { ok: true })
+    const doneSettled = await storage.get<Record<string, unknown>>(`run:${done.runId}`)
+    await storage.put(`run:${done.runId}`, { ...doneSettled, updatedAt: Date.now() - 3600_000 })
+
+    // 2) 再造一个「执行者挂了」的 run：running + 租约已过期 + 队列里没人管
+    const stalled = await obj.submit(message({ text: '被忘记的消息' }))
+    expect(stalled.acquired).toBe(true)
+    const stalledRun = await storage.get<Record<string, unknown>>(`run:${stalled.runId}`)
+    await storage.put(`run:${stalled.runId}`, {
+      ...stalledRun,
+      status: 'running',
+      lockedUntil: Date.now() - 1_000,
+    })
+    await storage.put('lock', { runId: stalled.runId, expiresAt: Date.now() - 1_000 })
+
+    const result = await obj.sweep(600_000)
+
+    // 滞留的 run 被认领回来，消息跟着回来
+    expect(result.claimed.acquired).toBe(true)
+    expect(result.claimed.runId).toBe(stalled.runId)
+    expect(result.claimed.message?.text).toBe('被忘记的消息')
+    // 终态 run 同时被清掉
+    expect(result.pruned).toBe(1)
+  })
+
+  it('没有滞留 run 时只是清理，不误认领已完成的东西', async () => {
+    const { obj } = makeObject()
+    const result = await obj.sweep(600_000)
+    expect(result.claimed.acquired).toBe(false)
+    expect(result.pruned).toBe(0)
   })
 })

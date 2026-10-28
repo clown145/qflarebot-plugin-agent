@@ -12,6 +12,8 @@ import type { RegisteredTool, ToolResult } from './types.js'
 import { validateFetchUrl } from './http/url-safety.js'
 
 const MAX_BODY_BYTES = 1024 * 1024
+/** 回给模型的字符上限（不是字节）。与 web.fetch_page 保持一致 */
+const MAX_BODY_CHARS = 20_000
 const MAX_REDIRECTS = 3
 
 interface HttpRequestInput {
@@ -95,14 +97,18 @@ export function createHttpTool(): RegisteredTool {
         }
 
         const { text, truncated } = await readCapped(response)
+        // 结果要回到模型上下文里，而 plugin-llm 的请求体上限是 256 KB：
+        // 1 MB 的正文塞进去会让下一条消息直接 bad_request，还会白烧 token。
+        // 按字符截断（与 web.fetch_page 的 20k 一致），二进制走 base64 不截（调用方要完整字节）。
+        const capped = parsed.binary ? text : text.slice(0, MAX_BODY_CHARS)
         return {
           status: 'success',
           output: {
             status: response.status,
             url: current,
             contentType: response.headers.get('content-type') ?? '',
-            truncated,
-            ...(parsed.binary ? { bodyBase64: toBase64(text) } : { body: text }),
+            truncated: truncated || capped.length < text.length,
+            ...(parsed.binary ? { bodyBase64: toBase64(text) } : { body: capped }),
           },
         }
       }

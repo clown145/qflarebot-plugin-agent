@@ -44,6 +44,9 @@ async function resolvePolicy(context: ToolExecutionContext): Promise<ResolvedPol
 
   let policies: Array<{ id: string; maxLevel: number; scopes: string[] }>
   try {
+    // 每次工具调用都查一次 {policies}。看起来可以按 isolate 缓存「表是空的」，
+    // 但那会让手工写进去的策略在 isolate 回收前一直不生效——而这张表本来就只能手工写，
+    // 延迟生效比多一次 D1 读更糟（D1 读额度 500 万行/日，是写的 50 倍）。
     policies = await findMatchingPolicies(context.db, {
       conversationId: context.conversationId,
       subjects: buildSubjects(context),

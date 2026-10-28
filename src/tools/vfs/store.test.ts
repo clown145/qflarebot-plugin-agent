@@ -133,6 +133,35 @@ describe('VFS 工作区', () => {
     expect(await r2.getText('vfs/small.txt')).toBeNull()
   })
 
+  /**
+   * 回归：大文件被小内容覆盖时，旧 R2 对象必须删掉。
+   * 上一版把 `r2_key` 置 NULL 就完事，R2 里那份内容永远没人引用、也没人删（无界增长）。
+   */
+  it('大文件改成小文件时删掉旧的 R2 对象', async () => {
+    const r2 = memoryR2()
+    const ws = createVfsWorkspace(memoryDb(), r2)
+
+    await ws.writeFile('/doc.txt', 'x'.repeat(9000))
+    expect(await r2.getText('vfs/doc.txt')).not.toBeNull()
+
+    await ws.writeFile('/doc.txt', 'small')
+
+    // 内容现在在 D1，R2 里那份应该已经清掉
+    expect(await r2.getText('vfs/doc.txt')).toBeNull()
+    expect((await ws.readFile('/doc.txt')).content).toBe('small')
+  })
+
+  it('小文件改大文件时读回的是 R2 里的新内容', async () => {
+    const r2 = memoryR2()
+    const ws = createVfsWorkspace(memoryDb(), r2)
+
+    await ws.writeFile('/doc.txt', 'small')
+    await ws.writeFile('/doc.txt', 'y'.repeat(9000))
+
+    expect(await r2.getText('vfs/doc.txt')).toHaveLength(9000)
+    expect((await ws.readFile('/doc.txt')).content).toBe('y'.repeat(9000))
+  })
+
   it('拒绝 . 与 .. 段（路径穿越）', async () => {
     const ws = createVfsWorkspace(memoryDb(), memoryR2())
     await expect(ws.writeFile('/a/../b.md', 'x')).rejects.toThrow('..')

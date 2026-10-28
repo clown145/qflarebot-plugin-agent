@@ -168,6 +168,85 @@ describe('web.fetch_page', () => {
       vi.unstubAllGlobals()
     }
   })
+
+  /**
+   * 回归：上一版只校验初始 URL，然后用 `redirect: 'follow'` 让 fetch 自己跟到底。
+   * 公网地址 302 到 127.0.0.1 / 云元数据地址就能绕过 SSRF 黑名单。
+   * `http.request` 一直是逐跳校验的，这里补齐。
+   */
+  it('重定向到内网地址时拒绝（不再 follow 到底）', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('', { status: 302, headers: { location: 'http://127.0.0.1:8080/admin' } })),
+    )
+    try {
+      const result = await web.execute(context({ url: 'https://example.com/redirect' }))
+      expect(result.status).toBe('failed')
+      expect(result.error?.code).toBe('blocked_url')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('重定向到云元数据地址（169.254.169.254）时拒绝', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('', {
+            status: 302,
+            headers: { location: 'http://169.254.169.254/latest/meta-data/' },
+          }),
+      ),
+    )
+    try {
+      const result = await web.execute(context({ url: 'https://example.com/redirect' }))
+      expect(result.status).toBe('failed')
+      expect(result.error?.code).toBe('blocked_url')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('重定向到公网地址时正常跟随并返回正文', async () => {
+    const calls: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        calls.push(String(url))
+        if (calls.length === 1) {
+          return new Response('', { status: 301, headers: { location: 'https://example.com/final' } })
+        }
+        return new Response('<html><body><p>最终正文</p></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        })
+      }),
+    )
+    try {
+      const result = await web.execute(context({ url: 'https://example.com/start' }))
+      expect(result.status).toBe('success')
+      expect((result.output as { text: string }).text).toContain('最终正文')
+      // 两跳都是 manual，插件自己解析 Location
+      expect(calls).toHaveLength(2)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('重定向次数超限时返回 too_many_redirects', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('', { status: 302, headers: { location: 'https://example.com/next' } })),
+    )
+    try {
+      const result = await web.execute(context({ url: 'https://example.com/' }))
+      expect(result.status).toBe('failed')
+      expect(result.error?.code).toBe('too_many_redirects')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
 })
 
 describe('time.now', () => {
