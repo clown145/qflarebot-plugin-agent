@@ -22,7 +22,8 @@
  *
  * 这是双段式调度的核心：**同一个 executeRun，两个调用点**。
  */
-import { definePlugin, PluginDurableObject } from '@qqbot/sdk'
+import { definePlugin } from '@qqbot/sdk'
+import type { PluginContext, Session } from '@qqbot/sdk'
 import type { AgentConfig } from './config/index.js'
 import { configSchema, defaultConfig } from './config/index.js'
 import { AgentObject } from './do/agent-object.js'
@@ -31,6 +32,7 @@ import type { InboundMessage } from './types.js'
 import type { LLMService } from './llm/contract.js'
 import { executeRun, replyFromSession } from './agent/run.js'
 import { conversationKey, isTextMessage, toInboundMessage } from './agent/inbound.js'
+import { hydrateImageAttachments } from './agent/media.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
 import {
   advanceSchedule,
@@ -163,8 +165,8 @@ export default definePlugin<AgentConfig>({
 // ---------------------------------------------------------------- 消息处理
 
 async function handleMessage(
-  session: Parameters<typeof toInboundMessage>[0],
-  ctx: Parameters<typeof replyFromSession> extends never ? never : import('@qqbot/sdk').PluginContext<AgentConfig>,
+  session: Session,
+  ctx: PluginContext<AgentConfig>,
   text: string,
 ): Promise<void> {
   const logger = ctx.logger
@@ -176,11 +178,22 @@ async function handleMessage(
   const cleaned = text.replace(/^\/agent\s*/i, '').trim()
   if (cleaned) message.text = cleaned
 
+  // 图片要在入站时取回来：QQ 的图片 URL 带签名且有效期很短，
+  // 等 cron 段再取可能已经 403。取不到就把说明拼进正文，别让整条消息失败
+  if (message.attachments.some((a) => a.type === 'image')) {
+    const hydrated = await hydrateImageAttachments(message.attachments)
+    message.attachments = hydrated.attachments
+    if (hydrated.notes.length) {
+      message.text = `${message.text}\n\n（${hydrated.notes.join('；')}）`.trim()
+      message.displayText = message.text
+    }
+  }
+
   const stub = agentStub(ctx, message.conversation)
   const reply = replyFromSession(session)
 
   // 单聊先给个"正在输入"，缓解等待焦虑
-  if (config.show_typing && session.scene === 'c2c' && typeof session.typing === 'function') {
+  if (config.show_typing && session.scene === 'c2c') {
     void session.typing(10).catch(() => false)
   }
 
@@ -214,7 +227,7 @@ async function handleMessage(
 // ---------------------------------------------------------------- cron 部分
 
 /** 捡队列：每个会话的 DO 各问一次。会话数量通常很小（群 + 私聊） */
-async function drainQueues(ctx: import('@qqbot/sdk').PluginContext<AgentConfig>): Promise<void> {
+async function drainQueues(ctx: PluginContext<AgentConfig>): Promise<void> {
   const llm = ctx.service<LLMService>('llm')
 
   // 已知会话列表存在 KV 里（低频写，只在出现新会话时更新）
@@ -237,7 +250,7 @@ async function drainQueues(ctx: import('@qqbot/sdk').PluginContext<AgentConfig>)
 
 /** 到期的定时任务：用保存的 prompt 重新跑一轮 agent */
 async function fireDueSchedules(
-  ctx: import('@qqbot/sdk').PluginContext<AgentConfig>,
+  ctx: PluginContext<AgentConfig>,
 ): Promise<void> {
   if (!ctx.config.enable_schedule) return
 
@@ -279,7 +292,7 @@ async function fireDueSchedules(
 }
 
 /** 清理：节流 + 只在开启审计时清审计表 */
-async function maybePrune(ctx: import('@qqbot/sdk').PluginContext<AgentConfig>): Promise<void> {
+async function maybePrune(ctx: PluginContext<AgentConfig>): Promise<void> {
   if (!ctx.config.enable_audit) return
 
   const last = Number((await ctx.kv.get('last_prune')) ?? '0')
@@ -303,7 +316,7 @@ type AgentStub = {
 }
 
 function agentStub(
-  ctx: import('@qqbot/sdk').PluginContext<AgentConfig>,
+  ctx: PluginContext<AgentConfig>,
   conversation: string,
 ): AgentStub {
   // 记录已知会话，供 cron 遍历。低频写 KV（只在第一次见到某个会话时）
@@ -328,7 +341,7 @@ function agentStub(
  * 但那是平台限制，不是 bug。
  */
 function makeApiReply(
-  ctx: import('@qqbot/sdk').PluginContext<AgentConfig>,
+  ctx: PluginContext<AgentConfig>,
   message: InboundMessage,
 ): (text: string) => Promise<boolean> {
   return async (text: string) => {
