@@ -1,0 +1,25 @@
+{
+  "name": "qflarebot-plugin-agent",
+  "version": "0.1.0",
+  "description": "QFlareBot 的 Agent 插件：带工具调用的多轮对话、会话记忆与可选的动态定时任务",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "qflarebot-plugin"
+  ],
+  "scripts": {
+    "build": "qqbot-plugin build",
+    "sync": "qqbot-plugin build && node -e \"require('node:fs').copyFileSync('dist/manifest.json','manifest.json')\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "@qqbot/plugin-cli": "file:../qqbot-workers/packages/plugin-cli",
+    "@qqbot/sdk": "file:../qqbot-workers/packages/sdk",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

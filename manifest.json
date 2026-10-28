@@ -1,0 +1,182 @@
+{
+  "name": "agent",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "permissions": [
+    "net",
+    "kv",
+    "db",
+    "durable",
+    "proactive"
+  ],
+  "depends": {
+    "llm": "*"
+  },
+  "conflicts": [],
+  "commands": [
+    {
+      "name": "agent",
+      "description": "问 Agent 一个问题",
+      "usage": "/agent <问题>"
+    },
+    {
+      "name": "agent reset",
+      "description": "清空当前会话的记忆"
+    },
+    {
+      "name": "agent status",
+      "description": "查看 Agent 状态"
+    }
+  ],
+  "regex": [],
+  "events": [
+    {
+      "event": [
+        "qq.group.at_message"
+      ]
+    },
+    {
+      "event": [
+        "qq.c2c.message"
+      ]
+    }
+  ],
+  "buttons": [],
+  "cron": [
+    {
+      "name": "tick",
+      "cron": "* * * * *"
+    }
+  ],
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/ui/*",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/api/overview",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/api/test",
+      "auth": "admin"
+    }
+  ],
+  "hasMiddleware": false,
+  "services": [],
+  "durableObjects": [
+    "Agent"
+  ],
+  "displayName": "Agent",
+  "description": "带工具调用的多轮对话：会话记忆、联网查资料、HTTP 请求、动态定时任务。需要配合「LLM 接口」插件使用。",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "model": {
+        "type": "string",
+        "title": "模型别名",
+        "description": "plugin-llm 插件里配置的模型别名，默认 `chat`",
+        "default": "chat"
+      },
+      "system_prompt": {
+        "type": "string",
+        "format": "textarea",
+        "title": "系统提示词",
+        "description": "留空则用内置的默认人格",
+        "default": "你是一个运行在 QQ 上的助手。回答要简洁，能一句话说清就不要展开。\n你不确定的事情要直说，不要编造。\n你能调用工具时优先用工具拿事实，不要凭记忆猜。"
+      },
+      "max_model_steps": {
+        "type": "integer",
+        "title": "单次最多模型步数",
+        "description": "一步 = 一次模型调用。失控的循环会烧光时长与 token，建议 8–12",
+        "minimum": 1,
+        "maximum": 30,
+        "default": 8
+      },
+      "max_tool_calls": {
+        "type": "integer",
+        "title": "单次最多工具调用",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 12
+      },
+      "history_limit": {
+        "type": "integer",
+        "title": "会话历史条数",
+        "description": "每次带多少条历史消息给模型。条数越多越贵",
+        "minimum": 0,
+        "maximum": 100,
+        "default": 20
+      },
+      "request_timeout_ms": {
+        "type": "integer",
+        "title": "模型调用超时（毫秒）",
+        "minimum": 1000,
+        "maximum": 25000,
+        "default": 20000
+      },
+      "enable_tools": {
+        "type": "boolean",
+        "title": "启用工具调用",
+        "description": "关掉之后就是纯聊天，模型不会调用任何工具",
+        "default": true
+      },
+      "enable_vfs": {
+        "type": "boolean",
+        "title": "启用虚拟工作区",
+        "description": "模型可以读写文件。文件存在 R2 里，需要绑定 R2",
+        "default": false
+      },
+      "enable_schedule": {
+        "type": "boolean",
+        "title": "启用动态定时任务",
+        "description": "模型可以自己创建提醒。需要机器人开启每分钟 cron",
+        "default": false
+      },
+      "enable_mcp": {
+        "type": "boolean",
+        "title": "启用 MCP 工具",
+        "default": false
+      },
+      "enable_audit": {
+        "type": "boolean",
+        "title": "记录工具调用",
+        "description": "写进 D1，方便排障。会消耗 D1 写入额度",
+        "default": false
+      },
+      "show_typing": {
+        "type": "boolean",
+        "title": "回复前显示\"正在输入\"",
+        "description": "仅单聊有效",
+        "default": true
+      },
+      "timezone": {
+        "type": "string",
+        "title": "时区",
+        "default": "Asia/Shanghai"
+      }
+    }
+  },
+  "defaultConfig": {
+    "model": "chat",
+    "system_prompt": "你是一个运行在 QQ 上的助手。回答要简洁，能一句话说清就不要展开。\n你不确定的事情要直说，不要编造。\n你能调用工具时优先用工具拿事实，不要凭记忆猜。",
+    "max_model_steps": 8,
+    "max_tool_calls": 12,
+    "history_limit": 20,
+    "request_timeout_ms": 20000,
+    "enable_tools": true,
+    "enable_vfs": false,
+    "enable_schedule": false,
+    "enable_mcp": false,
+    "enable_audit": false,
+    "show_typing": true,
+    "timezone": "Asia/Shanghai"
+  },
+  "ui": {
+    "path": "/ui/",
+    "title": "Agent"
+  }
+}
