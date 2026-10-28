@@ -186,9 +186,33 @@ export default definePlugin<AgentConfig>({
     tick: {
       cron: '* * * * *',
       async handler({ ctx }) {
-        await drainQueues(ctx)
-        await fireDueSchedules(ctx)
-        await maybePrune(ctx)
+        // 先花一次 D1 查询判断「今天有没有活」。
+        //
+        // 上一版直接 drainQueues：读 KV 拿到会话列表，再对**每个会话**调一次 DO poll()。
+        // 即使队列全空也照做——20 个会话就是每天 28,800 次 DO 唤醒。
+        // DO 按 GB-秒计费，空转唤醒纯浪费。
+        //
+        // 现在：没有到期的定时任务、也没有待跑 run 时，一次 D1 查询就退出。
+        const hasDueSchedule = ctx.config.enable_schedule
+          ? (await listDueSchedules(ctx.db, Date.now(), 1)).length > 0
+          : false
+
+        if (!hasDueSchedule) {
+          // 队列里的 run 由事件处理器的 waitUntil 兜着跑完；
+          // 只有事件处理器超预算时才会留下尾巴，那种情况由下面兜底
+          const pending = await hasPendingRuns(ctx)
+          if (!pending) return
+        }
+
+        const now = Date.now()
+        const prune = shouldPrune(ctx, now)
+        if (prune) pruneThrottle.at = now
+
+        if (hasDueSchedule) await fireDueSchedules(ctx)
+
+        // 一次遍历同时做「捡队列」和「清理终态 run」，避免对每个会话取两次 stub
+        await drainQueues(ctx, { prune })
+        await maybePruneAudit(ctx)
       },
     },
   },
@@ -238,6 +262,9 @@ async function handleMessage(
   const stub = agentStub(ctx, message.conversation)
   const reply = replyFromSession(session)
 
+  // 记住这个会话，cron 兜底时要遍历。只在收到消息时记，不是每次取 stub 时记
+  await rememberConversation(ctx, message.conversation)
+
   // 单聊先给个"正在输入"，缓解等待焦虑
   if (config.show_typing && session.scene === 'c2c') {
     void session.typing(10).catch(() => false)
@@ -273,8 +300,20 @@ async function handleMessage(
     })
     // 只提示一次，不 await 任务本身
     await reply('这个问题要多花点时间，我处理完会直接回复你。').catch(() => false)
+    // 设标记让 cron 知道「可能有尾巴要捡」。
+    // 正常情况下 running 会在 waitUntil 里跑完并自己 release，
+    // 标记只是兜底——真跑完了 cron 那边 poll 也是空转一次就清掉
+    await ctx.kv.put('pending_drain', '1').catch(() => {})
+
     // 让任务在本次请求的后台继续（ctx.waitUntil 保证它不会被提前取消）
-    ctx.waitUntil(running.catch(() => undefined))
+    ctx.waitUntil(
+      running
+        .catch(() => undefined)
+        .finally(() => {
+          // 跑完了就清标记，cron 不用再挨个 poll
+          void ctx.kv.delete('pending_drain').catch(() => {})
+        }),
+    )
   }
 }
 
@@ -299,20 +338,43 @@ function tryLLM(ctx: PluginContext<AgentConfig>): LLMService | null {
   }
 }
 
-/** 捡队列：每个会话的 DO 各问一次。会话数量通常很小（群 + 私聊） */
-async function drainQueues(ctx: PluginContext<AgentConfig>): Promise<void> {
+/**
+ * 有没有「事件处理器没跑完、留下尾巴」的 run。
+ *
+ * 正常情况下事件处理器会在 `waitUntil` 里把 run 跑完并 release，
+ * 只有超预算时才会留 pending。所以这个标记由 handleMessage 在超预算时设置，
+ * cron 看到标记才去逐个 poll——空闲时一次 KV 读就够。
+ */
+async function hasPendingRuns(ctx: PluginContext<AgentConfig>): Promise<boolean> {
+  return (await ctx.kv.get('pending_drain')) === '1'
+}
+
+/** 捡队列：每个会话的 DO 各问一次。只在 hasPendingRuns 为真时调用 */
+async function drainQueues(
+  ctx: PluginContext<AgentConfig>,
+  options: { prune: boolean },
+): Promise<void> {
   const llm = tryLLM(ctx)
   if (!llm) return
 
-  // 已知会话列表存在 KV 里（低频写，只在出现新会话时更新）
   const known = (await ctx.kv.getJSON<string[]>('conversations')) ?? []
 
   for (const conversation of known) {
+    // 一个会话只取一次 stub，捡队列和清理共用
     const stub = agentStub(ctx, conversation)
+
+    if (options.prune) {
+      try {
+        await stub.prune(RUN_RETENTION_MS)
+      } catch (error) {
+        // 某个会话的 DO 挂了不该挡住别的会话
+        ctx.logger.warn('清理 DO 里的 run 失败', { conversation, error: String(error) })
+      }
+    }
+
     const polled = await stub.poll()
     if (!polled.acquired || !polled.runId || !polled.message) continue
 
-    // cron 里没有 session，用 api 主动发送
     const reply = makeApiReply(ctx, polled.message)
     await executeRun(
       { ctx, logger: ctx.logger, config: ctx.config, llm, agent: stub, reply },
@@ -320,7 +382,23 @@ async function drainQueues(ctx: PluginContext<AgentConfig>): Promise<void> {
       polled.message,
     )
   }
+
+  // 扫完一轮，清标记——下一分钟不必再挨个 poll
+  await ctx.kv.delete('pending_drain').catch(() => {})
 }
+
+/**
+ * 这次 cron 要不要顺手清理终态 run。
+ *
+ * 清理是 DELETE 类操作，不必每分钟做。用 KV 里的时间戳节流到 10 分钟一次，
+ * 和审计清理共用一个节流键。
+ */
+function shouldPrune(ctx: PluginContext<AgentConfig>, now = Date.now()): boolean {
+  return now - pruneThrottle.at > PRUNE_INTERVAL_MS
+}
+
+/** 进程内节流状态。isolate 被回收后重置，最多多做一次清理，无害 */
+const pruneThrottle = { at: 0 }
 
 /** 到期的定时任务：用保存的 prompt 重新跑一轮 agent */
 async function fireDueSchedules(
@@ -377,36 +455,13 @@ async function fireDueSchedules(
   }
 }
 
-/**
- * 清理。两件事，都做节流：
- *
- * 1. **DO 里的终态 run**：`release()` 把 run 标成 completed/failed 但保留记录，
- *    让处理器还能查到结果。不清的话 DO storage 会一直涨（DO storage 没有 TTL）。
- * 2. **D1 里的工具审计**：只在开了审计时才需要。
- *
- * 节流用 KV（十分钟一次），比每次 cron 都全扫一遍便宜。
- */
-async function maybePrune(ctx: PluginContext<AgentConfig>): Promise<void> {
-  const last = Number((await ctx.kv.get('last_prune')) ?? '0')
-  const now = Date.now()
-  if (now - last < PRUNE_INTERVAL_MS) return
-
-  await ctx.kv.put('last_prune', String(now))
-
-  // DO 侧的终态 run：保留一段时间供查询，之后清掉
-  const known = (await ctx.kv.getJSON<string[]>('conversations')) ?? []
-  let prunedRuns = 0
-  for (const conversation of known) {
-    try {
-      prunedRuns += await agentStub(ctx, conversation).prune(RUN_RETENTION_MS)
-    } catch (error) {
-      // 某个会话的 DO 挂了不该挡住清理其他会话
-      ctx.logger.warn('清理 DO 里的 run 失败', { conversation, error: String(error) })
-    }
-  }
-  if (prunedRuns > 0) ctx.logger.info('清理终态 run', { count: prunedRuns })
-
+/** 清理 D1 里的工具审计。只在开了审计时才需要，节流到 10 分钟一次 */
+async function maybePruneAudit(ctx: PluginContext<AgentConfig>): Promise<void> {
   if (!ctx.config.enable_audit) return
+
+  const now = Date.now()
+  if (!shouldPrune(ctx, now)) return
+
   const removed = await pruneToolAudit(ctx.db, now - AUDIT_RETENTION_MS)
   if (removed > 0) ctx.logger.info('清理过期审计', { removed })
 }
@@ -423,22 +478,42 @@ type AgentStub = {
   prune(olderThanMs: number): Promise<number>
 }
 
+/**
+ * 取会话的 DO stub。
+ *
+ * **不再顺带记录会话列表**：上一版每次调用都读一次 KV、必要时再写一次。
+ * cron 里每个会话每分钟调一次，就是每分钟 N 次 KV 读——免费版 KV 只有
+ * 10 万读/日、1,000 写/日，这么用很快打满。
+ *
+ * 现在由 `rememberConversation()` 在**收到消息时**记一次（低频、有去重）。
+ */
 function agentStub(
   ctx: PluginContext<AgentConfig>,
   conversation: string,
-): AgentStub {
-  // 记录已知会话，供 cron 遍历。低频写 KV（只在第一次见到某个会话时）
-  void ctx.kv
-    .getJSON<string[]>('conversations')
-    .then(async (list) => {
-      const current = list ?? []
-      if (!current.includes(conversation)) {
-        await ctx.kv.put('conversations', JSON.stringify([...current, conversation]))
-      }
-    })
-    .catch(() => {})
-
+): DurableObjectStub<AgentObject> {
   return ctx.durable.get<AgentObject>('Agent', conversation)
+}
+
+/**
+ * 记住一个会话，供 cron 兜底时遍历。
+ *
+ * 只在收到消息时调用（不是每次取 stub 时），且列表里有就不写。
+ * KV 写额度免费版只有 1,000 次/日，所以这个函数必须便宜：
+ * 一次读 + 条件写。
+ */
+async function rememberConversation(
+  ctx: PluginContext<AgentConfig>,
+  conversation: string,
+): Promise<void> {
+  try {
+    const list = (await ctx.kv.getJSON<string[]>('conversations')) ?? []
+    if (list.includes(conversation)) return
+    // 列表上限 100 个会话，防止无限增长（个人机器人远用不到）
+    const next = [...list, conversation].slice(-100)
+    await ctx.kv.put('conversations', JSON.stringify(next))
+  } catch {
+    // 记录失败不影响对话
+  }
 }
 
 /**
