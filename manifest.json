@@ -24,6 +24,11 @@
       "description": "清空当前会话的记忆"
     },
     {
+      "name": "agent schedule",
+      "description": "查看本会话的定时任务",
+      "usage": "/agent schedule [cancel <id>]"
+    },
+    {
       "name": "agent status",
       "description": "查看 Agent 状态"
     }

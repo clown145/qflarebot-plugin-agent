@@ -82,6 +82,23 @@ export async function listSchedules(
 }
 
 /**
+ * 列出**所有会话**的活动定时任务。管理页用。
+ *
+ * 注意与 `listSchedules` 的区别：那个按会话过滤（给模型看「我这个会话有哪些提醒」），
+ * 这个跨会话（给管理页看「整个机器人有哪些提醒」）。上一版管理页误用了前者并传了
+ * 空字符串，结果永远是空列表。
+ */
+export async function listAllSchedules(db: PluginDB, limit = 50): Promise<ScheduleRow[]> {
+  return db.all<ScheduleRow>(
+    `SELECT * FROM {schedules}
+     WHERE status = 'active'
+     ORDER BY due_at ASC
+     LIMIT ?`,
+    limit,
+  )
+}
+
+/**
  * 任务跑完后的推进。
  *
  * 单次任务标成 done；重复任务把 due_at 往后推。
@@ -196,6 +213,26 @@ export interface DailyStatsRow {
 export async function listDailyStats(db: PluginDB, limit = 14): Promise<DailyStatsRow[]> {
   return db.all<DailyStatsRow>(
     `SELECT * FROM {daily_stats} ORDER BY day DESC LIMIT ?`,
+    limit,
+  )
+}
+
+export interface ToolAuditRow {
+  id: string
+  conversation: string
+  run_id: string
+  tool_name: string
+  args_json: string
+  result_json: string | null
+  status: string
+  duration_ms: number | null
+  created_at: number
+}
+
+/** 最近的工具调用记录。管理页用，只在 enable_audit 打开时有数据 */
+export async function listToolAudit(db: PluginDB, limit = 30): Promise<ToolAuditRow[]> {
+  return db.all<ToolAuditRow>(
+    `SELECT * FROM {tool_audit} ORDER BY created_at DESC LIMIT ?`,
     limit,
   )
 }

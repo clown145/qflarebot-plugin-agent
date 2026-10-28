@@ -124,6 +124,8 @@ D1 里的 `{policies}` 表可以按 user / role / conversation / platform 叠加
 | `/agent <问题>` | 问 Agent。群里 @机器人 直接说话也行 |
 | `/agent reset` | 清空当前会话记忆 |
 | `/agent status` | 查看模型别名、可用模型、开关状态 |
+| `/agent schedule` | 查看本会话的定时任务 |
+| `/agent schedule cancel <id>` | 取消本会话的一个定时任务 |
 
 ## 额度
 
@@ -142,6 +144,21 @@ D1 里的 `{policies}` 表可以按 user / role / conversation / platform 叠加
 2. 把 loop 挪进 DO 跑——DO 的 CPU 上限比 Worker 请求宽得多（serverless-agent 就是这么做的：它的 agent loop 跑在 DO 的 `alarm()` 里，所以免费版够用）。本插件目前 loop 在事件处理器与 cron 里跑，挪进 DO 需要框架再给 `DurableContext` 加 `service()`（现在只有 `api`），是后续可以做的优化。
 
 付费版（$5/月）把这两个限制都放开，省心。
+
+## 管理页
+
+面板侧栏「插件页面 → Agent」，四块内容：
+
+| 区块 | 内容 |
+| --- | --- |
+| 模型 | 当前别名、可用别名列表、连通性测试 |
+| 能力 | 各开关状态、步数与工具上限、历史条数、时区 |
+| 定时任务 | 全部会话的待触发任务：触发时间、会话、内容、是否重复 |
+| 工具调用 | 最近的工具调用记录（需开 `enable_audit`） |
+| 统计 | 最近 14 天的对话数、失败数、工具调用数 |
+
+工具调用记录默认是空的——`enable_audit` 打开后才会往 D1 写。
+每记一条约消耗 1 行 D1 写入额度（免费版 10 万行/日），所以默认关。
 
 ## 开发
 

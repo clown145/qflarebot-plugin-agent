@@ -36,7 +36,9 @@ import { hydrateImageAttachments } from './agent/media.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
 import {
   advanceSchedule,
+  cancelSchedule,
   listDueSchedules,
+  listSchedules,
   pruneToolAudit,
 } from './store/d1.js'
 import { createPageRoutes } from './routes.js'
@@ -104,6 +106,35 @@ export default definePlugin<AgentConfig>({
         const stub = agentStub(ctx, conversationKey(session))
         await stub.reset()
         return '这个会话的记忆已经清空了。'
+      },
+    },
+
+    'agent schedule': {
+      description: '查看本会话的定时任务',
+      usage: '/agent schedule [cancel <id>]',
+      async handler({ session, ctx, argText }) {
+        const conversation = conversationKey(session)
+        const arg = argText.trim()
+
+        // /agent schedule cancel <id>
+        if (arg.startsWith('cancel ')) {
+          const id = arg.slice('cancel '.length).trim()
+          if (!id) return '用法：/agent schedule cancel <任务 id>'
+          const cancelled = await cancelSchedule(ctx.db, id, conversation)
+          return cancelled ? `已取消任务 ${id}。` : '没有找到这个任务，或者它不在本会话。'
+        }
+
+        const rows = await listSchedules(ctx.db, conversation, 20)
+        if (rows.length === 0) return '本会话没有待触发的定时任务。'
+
+        const lines = rows.map((row) => {
+          const when = formatScheduleTime(row.due_at, ctx.config.timezone)
+          const repeat = row.repeat_seconds
+            ? `（每 ${Math.round(row.repeat_seconds / 60)} 分钟重复）`
+            : '（一次性）'
+          return `${when}${repeat}：${row.prompt}\n  id: ${row.id}`
+        })
+        return ['本会话的定时任务：', ...lines, '', '取消用 /agent schedule cancel <id>'].join('\n')
       },
     },
 
@@ -403,6 +434,19 @@ function makeApiReply(
       ctx.logger.warn('主动回复失败', { conversation: message.conversation, error: result.error })
     }
     return result.ok
+  }
+}
+
+/** 把时间戳格式化成配置时区的短格式。时区写错时退回 ISO */
+function formatScheduleTime(epochMs: number, timezone: string): string {
+  try {
+    return new Intl.DateTimeFormat('zh-CN', {
+      timeZone: timezone,
+      dateStyle: 'short',
+      timeStyle: 'short',
+    }).format(new Date(epochMs))
+  } catch {
+    return new Date(epochMs).toISOString()
   }
 }
 
