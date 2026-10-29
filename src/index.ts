@@ -33,7 +33,7 @@ import type { LLMService } from './llm/contract.js'
 import { executeRun, replyFromSession, type RunDeps } from './agent/run.js'
 import { conversationKey, isTextMessage, toInboundMessage } from './agent/inbound.js'
 import { decideWake } from './agent/wake.js'
-import { effectiveModel, readOverrides } from './runtime-config.js'
+import { resolveConfig } from './effective-config.js'
 import { getPersonaBinding, setPersonaBinding } from './persona.js'
 import { hydrateImageAttachments } from './agent/media.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
@@ -150,9 +150,10 @@ export default definePlugin<AgentConfig>({
 
         const rows = await listSchedules(ctx.db, conversation, 20)
         if (rows.length === 0) return '本会话没有待触发的定时任务。'
+        const cfg = await resolveConfig(ctx)
 
         const lines = rows.map((row) => {
-          const when = formatScheduleTime(row.due_at, ctx.config.timezone)
+          const when = formatScheduleTime(row.due_at, cfg.timezone)
           const repeat = row.repeat_seconds
             ? `（每 ${Math.round(row.repeat_seconds / 60)} 分钟重复）`
             : '（一次性）'
@@ -168,12 +169,13 @@ export default definePlugin<AgentConfig>({
       async handler({ session, ctx, argText }) {
         const conversation = conversationKey(session)
         const wanted = argText.trim()
-        const available = (ctx.config.personas ?? []).map((p) => p.name.trim()).filter(Boolean)
+        const cfg = await resolveConfig(ctx)
+        const available = (cfg.personas ?? []).map((p) => p.name.trim()).filter(Boolean)
 
         // 不带参数：显示当前绑定与可选列表
         if (!wanted) {
           const bound = await getPersonaBinding(ctx.db, conversation).catch(() => undefined)
-          const active = bound ?? ctx.config.default_persona ?? '(未设置，用系统提示词)'
+          const active = bound ?? cfg.default_persona ?? '(未设置，用系统提示词)'
           return [
             `当前人格：${active}`,
             available.length ? `可选：${available.join('、')}` : '还没有配置任何人格（插件设置 → 人格）',
@@ -185,8 +187,8 @@ export default definePlugin<AgentConfig>({
         // off / 清除：解绑，回落默认人格
         if (wanted === 'off' || wanted === 'none' || wanted === '清除') {
           await setPersonaBinding(ctx.db, conversation, undefined)
-          return ctx.config.default_persona
-            ? `已清除本会话的人格绑定，回到默认人格「${ctx.config.default_persona}」。`
+          return cfg.default_persona
+            ? `已清除本会话的人格绑定，回到默认人格「${cfg.default_persona}」。`
             : '已清除本会话的人格绑定，改用系统提示词。'
         }
 
@@ -217,17 +219,17 @@ export default definePlugin<AgentConfig>({
         } catch (e) {
           error = e instanceof Error ? e.message : String(e)
         }
-        const overrides = await readOverrides(ctx.kv).catch(() => ({} as never))
-        const activeModel = effectiveModel(ctx.config, overrides)
+        const cfg = await resolveConfig(ctx)
+        const changed = cfg.model !== ctx.config.model ? `（页面已改；配置里是 ${ctx.config.model}）` : ''
         const lines = [
-          `模型别名：${activeModel}${overrides.model ? `（页面选中；配置里是 ${ctx.config.model}）` : ''}`,
+          `模型别名：${cfg.model}${changed}`,
           !llm
             ? 'LLM 接口插件未启用——请在面板的插件页启用或安装它'
             : models.length
               ? `可用别名：${models.join('、')}`
               : `别名列表读取失败${error ? `：${error}` : ''}`,
-          `工具调用：${ctx.config.enable_tools ? '开' : '关'}`,
-          `步数上限：${ctx.config.max_model_steps}`,
+          `工具调用：${cfg.enable_tools ? '开' : '关'}`,
+          `步数上限：${cfg.max_model_steps}`,
         ]
         return lines.join('\n')
       },
@@ -279,12 +281,13 @@ export default definePlugin<AgentConfig>({
       cron: '* * * * *',
       async handler({ ctx }) {
         const startedAt = Date.now()
+        const cfg = await resolveConfig(ctx)
 
-        const hasDueSchedule = ctx.config.enable_schedule
+        const hasDueSchedule = cfg.enable_schedule
           ? (await listDueSchedules(ctx.db, Date.now(), 1)).length > 0
           : false
 
-        if (hasDueSchedule) await fireDueSchedules(ctx, startedAt)
+        if (hasDueSchedule) await fireDueSchedules(ctx, startedAt, cfg)
 
         const now = Date.now()
         // 节流决策只做一次，然后**显式传下去**：
@@ -293,7 +296,7 @@ export default definePlugin<AgentConfig>({
         if (!shouldPrune(ctx, now)) return
         pruneThrottle.at = now
 
-        await maybePruneAudit(ctx, now)
+        await maybePruneAudit(ctx, now, cfg)
         await serviceConversationObjects(ctx, startedAt)
       },
     },
@@ -327,7 +330,8 @@ async function onChatMessage({
   session: Session
   ctx: PluginContext<AgentConfig>
 }): Promise<void> {
-  const decision = decideWake(session, ctx.config)
+  const config = await resolveConfig(ctx)
+  const decision = decideWake(session, config)
   if (!decision.wake) {
     // not-mentioned 是常态（群全量消息里绝大多数没 @ 机器人），不打日志免得刷屏
     if (decision.reason !== 'not-mentioned' && decision.reason !== 'command') {
@@ -349,7 +353,7 @@ async function handleMessage(
   text: string,
 ): Promise<void> {
   const logger = ctx.logger
-  const config = ctx.config
+  const config = await resolveConfig(ctx)
 
   // 依赖没满足时给用户一句能看懂的话，而不是让框架抛 "没有在 depends 中声明" 这类内部错误。
   // 正常情况下安装时就被拦下了（depends: { llm: '*' }），但提供者可能事后被停用或卸载
@@ -586,8 +590,9 @@ const pruneThrottle = { at: 0 }
 async function fireDueSchedules(
   ctx: PluginContext<AgentConfig>,
   startedAt: number,
+  config: AgentConfig,
 ): Promise<void> {
-  if (!ctx.config.enable_schedule) return
+  if (!config.enable_schedule) return
 
   const llm = tryLLM(ctx)
   if (!llm) return
@@ -627,7 +632,7 @@ async function fireDueSchedules(
     // 由 release() 链或 10 分钟一次的 sweep 兜底。
     if (claimed.acquired && claimed.runId) {
       await executeRun(
-        { ctx, logger: ctx.logger, config: ctx.config, llm, agent: stub, reply },
+        { ctx, logger: ctx.logger, config, llm, agent: stub, reply },
         claimed.runId,
         message,
       )
@@ -638,8 +643,12 @@ async function fireDueSchedules(
 }
 
 /** 清理 D1 里的工具审计。只在开了审计时才需要 */
-async function maybePruneAudit(ctx: PluginContext<AgentConfig>, now: number): Promise<void> {
-  if (!ctx.config.enable_audit) return
+async function maybePruneAudit(
+  ctx: PluginContext<AgentConfig>,
+  now: number,
+  config: AgentConfig,
+): Promise<void> {
+  if (!config.enable_audit) return
 
   const removed = await pruneToolAudit(ctx.db, now - AUDIT_RETENTION_MS)
   if (removed > 0) ctx.logger.info('清理过期审计', { removed })

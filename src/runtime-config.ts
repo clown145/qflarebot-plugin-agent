@@ -19,67 +19,64 @@ import type { AgentConfig } from './config/index.js'
 /** KV 里的键（框架会自动加插件前缀） */
 const PICKED_MODEL_KEY = 'model:selected'
 
-/** 这个提示词覆盖用的键（同理，见下） */
-const PROMPT_OVERRIDE_KEY = 'prompt:override'
-
-export interface RuntimeOverrides {
-  /** KV 里选中的模型别名；没有就是 undefined */
-  model?: string
-  /** 页面里临时改过的系统提示词 */
-  systemPrompt?: string
-}
-
-/** 读运行时覆盖。读失败按「没有覆盖」处理——不该让页面读失败拖垮对话 */
-export async function readOverrides(
-  kv: PluginContext<AgentConfig>['kv'],
-): Promise<RuntimeOverrides> {
-  const [model, systemPrompt] = await Promise.all([
-    kv.get(PICKED_MODEL_KEY).catch(() => null),
-    kv.get(PROMPT_OVERRIDE_KEY).catch(() => null),
-  ])
-  return {
-    ...(model?.trim() ? { model: model.trim() } : {}),
-    ...(systemPrompt !== null ? { systemPrompt } : {}),
-  }
-}
-
-/** 写选中的模型别名；传空串清除覆盖、回落到配置里的 `model` */
-export async function setSelectedModel(
-  kv: PluginContext<AgentConfig>['kv'],
-  alias: string | undefined,
-): Promise<void> {
-  const name = (alias ?? '').trim()
-  if (!name) {
-    await kv.delete(PICKED_MODEL_KEY)
-    return
-  }
-  await kv.put(PICKED_MODEL_KEY, name)
-}
-
-/** 写系统提示词覆盖；传空串清除覆盖、回落到配置 */
-export async function setSystemPromptOverride(
-  kv: PluginContext<AgentConfig>['kv'],
-  prompt: string | undefined,
-): Promise<void> {
-  const text = (prompt ?? '').trim()
-  if (!text) {
-    await kv.delete(PROMPT_OVERRIDE_KEY)
-    return
-  }
-  await kv.put(PROMPT_OVERRIDE_KEY, text)
-}
+/** 页面里改过的配置（部分对象，只含被改的字段） */
+const CONFIG_OVERRIDE_KEY = 'config:override'
 
 /**
- * 解析本轮实际用哪个别名。
+ * 页面覆盖：`Partial<AgentConfig>`，只含用户在插件页面里真正改过的字段。
  *
- * 优先级：页面选中（KV）> 配置里的 `model`。
- * 未知别名查不到时 `chat` 会自己报 `unknown_model`，错误信息里带别名，用户能看懂。
+ * 用部分对象而不是整份替换：升级后新增的配置项，即便用户改过别的字段，
+ * 也仍能从插件配置里拿到默认值。
  */
-export function effectiveModel(config: AgentConfig, overrides: RuntimeOverrides): string {
-  return overrides.model?.trim() || config.model
+export type ConfigOverride = Partial<AgentConfig>
+
+/** 读页面里的配置覆盖；没有就返回 null */
+export async function readConfigOverride(
+  kv: PluginContext<AgentConfig>['kv'],
+): Promise<ConfigOverride | null> {
+  const raw = await kv.get(CONFIG_OVERRIDE_KEY)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    return parsed as ConfigOverride
+  } catch {
+    // 坏数据按「没有覆盖」处理，不要让页面写坏一次就永久失效
+    return null
+  }
 }
 
-/** 解析本轮实际的系统提示词（人格优先，见 persona.ts；这里只管「没人格时的兜底」） */
-export function effectiveSystemPrompt(config: AgentConfig, overrides: RuntimeOverrides): string {
-  return overrides.systemPrompt ?? config.system_prompt
+/** 合并写入覆盖；`undefined` 的字段表示清除覆盖、回落到插件配置 */
+export async function patchConfigOverride(
+  kv: PluginContext<AgentConfig>['kv'],
+  patch: ConfigOverride,
+  /** 插件配置里的原值；传了就能在「改回原值」时顺手清掉覆盖，避免虚标的「已改」 */
+  baseline?: AgentConfig,
+): Promise<ConfigOverride> {
+  const current = (await readConfigOverride(kv)) ?? {}
+  const next: ConfigOverride = { ...current }
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) {
+      delete next[key as keyof AgentConfig]
+      continue
+    }
+    // 页面把值改回插件配置里的原值时，覆盖就没有意义了：
+    // 留着会让页面一直显示「已改」，而且配置升级后这个字段跟不上
+    if (baseline && JSON.stringify(value) === JSON.stringify(baseline[key as keyof AgentConfig])) {
+      delete next[key as keyof AgentConfig]
+      continue
+    }
+    next[key as keyof AgentConfig] = value as never
+  }
+  if (Object.keys(next).length === 0) {
+    await kv.delete(CONFIG_OVERRIDE_KEY)
+    return {}
+  }
+  await kv.put(CONFIG_OVERRIDE_KEY, JSON.stringify(next))
+  return next
+}
+
+/** 清空全部覆盖，回到插件配置 */
+export async function clearConfigOverride(kv: PluginContext<AgentConfig>['kv']): Promise<void> {
+  await kv.delete(CONFIG_OVERRIDE_KEY)
 }

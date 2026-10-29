@@ -25,16 +25,29 @@ describe('管理页', () => {
     expect(PAGE_HTML).toContain("'/api/test'")
   })
 
-  it('每块内容都有容器：模型选择、提示词、会话、运行状态、定时任务、审计、统计', () => {
+  /**
+   * 「所有能搬的操作都搬到 WebUI」——每个配置项都要在页面上有对应控件。
+   * 这条测试把它变成契约：以后新增配置项忘了加控件，这里就会失败。
+   */
+  it('所有配置项都有对应控件（不再需要去面板填表单）', () => {
     for (const id of [
-      // 模型下拉（照 AstrBot 的 ProviderModelMenu：触发器 + 列表 + 搜索）
+      // 模型
       'modelPicker', 'modelTrigger', 'modelCurrent', 'modelMenu', 'modelSearch', 'modelOptions',
+      // 人格（增删改 + 默认人格）
+      'personaList', 'personaCount', 'addPersona', 'savePersonaList', 'defaultPersona',
       // 提示词
       'promptBox', 'savePrompt', 'resetPrompt', 'promptState',
-      // 会话与人格
-      'convSearch', 'convRows', 'personaSummary',
-      // 运行状态与三张表
-      'tools', 'vfs', 'schedule', 'audit', 'limits', 'history', 'tz',
+      // 唤醒
+      'wakeMode', 'wakePrefix', 'friendPrefix', 'commandPrefixes',
+      // 能力开关
+      'enableTools', 'enableVfs', 'enableSchedule', 'enableAudit', 'showTyping',
+      // 限额
+      'maxSteps', 'maxToolCalls', 'historyLimit', 'timeoutMs', 'timezone',
+      // 会话
+      'convSearch', 'convRows',
+      // 恢复
+      'resetAll', 'overrideState',
+      // 三张表
       'scheduleRows', 'auditRows', 'stats',
     ]) {
       expect(PAGE_HTML).toContain(`id="${id}"`)
@@ -61,8 +74,10 @@ describe('管理页', () => {
     expect(PAGE_HTML).not.toContain('placeholder=\"模型别名')
   })
 
-  it('切换失败时保留原值并提示，不静默吞掉', () => {
-    expect(PAGE_HTML).toContain("notify('切换失败：'")
+  it('保存失败时提示并把界面刷回真实值，不静默吞掉', () => {
+    expect(PAGE_HTML).toContain("notify('保存失败：'")
+    // 失败后要重新拉一次状态，否则控件会和实际配置不一致
+    expect(PAGE_HTML).toContain('await load()')
   })
 
   it('用 bridge.toast 给反馈；独立打开时退化为页面内提示', () => {

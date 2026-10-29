@@ -24,7 +24,7 @@ import { createScheduleTools } from '../tools/schedule.js'
 import { createVfsTools } from '../tools/vfs/tools.js'
 import { bumpDailyStats, recordToolAudit } from '../store/d1.js'
 import { getPersonaBinding, resolvePersona } from '../persona.js'
-import { effectiveModel, effectiveSystemPrompt, readOverrides } from '../runtime-config.js'
+import { resolveConfig } from '../effective-config.js'
 
 /** release / retryLater 之后可能返回「队列里下一个已认领的 run」 */
 export interface NextRun {
@@ -94,10 +94,7 @@ async function runLoopOnce(input: {
   const { ctx, logger, config, llm, agent, message, runId } = input
 
   const history = await agent.history(config.history_limit)
-  // 页面里点选过的别名优先于配置里的 model（见 runtime-config.ts）
-  const overrides = await readOverrides(ctx.kv)
-  const model = effectiveModel(config, overrides)
-  const modelInfo = await safeResolveModel(llm, model, logger)
+  const modelInfo = await safeResolveModel(llm, config.model, logger)
 
   // 人格：会话绑定 > 配置默认人格 > system_prompt。读失败不该让整轮对话失败
   // （绑定表是 D1，抖动时退回 system_prompt 即可）
@@ -106,7 +103,7 @@ async function runLoopOnce(input: {
   if (persona.name) logger.debug('使用人格', { conversation: message.conversation, persona: persona.name })
 
   const messages = buildMessages(message, history, {
-    systemPrompt: persona.prompt ?? effectiveSystemPrompt(config, overrides),
+    systemPrompt: persona.prompt ?? config.system_prompt,
     timezone: config.timezone,
     historyLimit: config.history_limit,
     supportsVision: modelInfo?.capabilities.includes('image') ?? false,
@@ -122,7 +119,7 @@ async function runLoopOnce(input: {
     llm,
     registry,
     logger,
-    model,
+    model: config.model,
     messages,
     maxModelSteps: config.max_model_steps,
     maxToolCalls: config.max_tool_calls,
