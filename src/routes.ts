@@ -9,7 +9,15 @@ import type { Route } from '@qqbot/sdk'
 import type { AgentConfig } from './config/index.js'
 import type { LLMService } from './llm/contract.js'
 import { listAllSchedules, listDailyStats, listToolAudit } from './store/d1.js'
-import { listPersonaBindings, setPersonaBinding } from './persona.js'
+import { findPersona, listPersonaBindings, setPersonaBinding } from './persona.js'
+import type { RuntimeOverrides } from './runtime-config.js'
+import {
+  effectiveModel,
+  effectiveSystemPrompt,
+  readOverrides,
+  setSelectedModel,
+  setSystemPromptOverride,
+} from './runtime-config.js'
 import { PAGE_HTML } from './page.js'
 
 export function createPageRoutes(): Route<AgentConfig>[] {
@@ -40,6 +48,10 @@ export function createPageRoutes(): Route<AgentConfig>[] {
           modelStatus = { ok: false, error: error instanceof Error ? error.message : String(error) }
         }
 
+        // 页面上点选过的值（覆盖配置），以及最终生效值
+        const overrides = await readOverrides(ctx.kv).catch(() => ({} as RuntimeOverrides))
+        const activeModel = effectiveModel(ctx.config, overrides)
+
         // 几块数据互不依赖，并行取；任何一块失败都不该让整页挂掉
         const [stats, schedules, audits, bindings] = await Promise.all([
           listDailyStats(ctx.db, 14).catch(() => []),
@@ -50,7 +62,12 @@ export function createPageRoutes(): Route<AgentConfig>[] {
 
         return Response.json({
           config: {
-            model: ctx.config.model,
+            model: activeModel,
+            configuredModel: ctx.config.model,
+            modelOverridden: Boolean(overrides.model),
+            systemPrompt: effectiveSystemPrompt(ctx.config, overrides),
+            systemPromptConfigured: ctx.config.system_prompt,
+            promptOverridden: overrides.systemPrompt !== undefined,
             enableTools: ctx.config.enable_tools,
             enableSchedule: ctx.config.enable_schedule,
             enableVfs: ctx.config.enable_vfs,
@@ -90,6 +107,51 @@ export function createPageRoutes(): Route<AgentConfig>[] {
             createdAtLocal: formatLocal(row.created_at, ctx.config.timezone),
           })),
         })
+      },
+    },
+
+    {
+      method: 'POST',
+      path: '/api/settings',
+      auth: 'admin',
+      handler: async ({ ctx, request }) => {
+        // 页面里的「点一下即生效」：模型别名、系统提示词覆盖。
+        // 宿主面板只管插件配置表单，插件页面调不到 /admin/*，所以这里存 KV，
+        // 运行时按「KV 覆盖 > 配置」取值（见 runtime-config.ts）。
+        let body: { model?: unknown; systemPrompt?: unknown }
+        try {
+          body = (await request.json()) as { model?: unknown; systemPrompt?: unknown }
+        } catch {
+          return Response.json({ ok: false, error: '请求体不是合法 JSON' }, { status: 400 })
+        }
+
+        if (body.model !== undefined) {
+          const alias = typeof body.model === 'string' ? body.model.trim() : ''
+          if (alias) {
+            // 只接受真实存在的别名：手打错一个字母，运行时才炸 unknown_model 太难查
+            let known: string[] = []
+            try {
+              const llm = ctx.service<LLMService>('llm')
+              known = (await llm.listModels()).map((m) => m.alias)
+            } catch (error) {
+              return Response.json(
+                { ok: false, error: `读不到可用别名：${error instanceof Error ? error.message : String(error)}` },
+                { status: 503 },
+              )
+            }
+            if (!known.includes(alias)) {
+              return Response.json({ ok: false, error: `没有别名 ${alias}，可用：${known.join('、') || '（空）'}` }, { status: 400 })
+            }
+          }
+          await setSelectedModel(ctx.kv, alias || undefined)
+        }
+
+        if (body.systemPrompt !== undefined) {
+          const text = typeof body.systemPrompt === 'string' ? body.systemPrompt : ''
+          await setSystemPromptOverride(ctx.kv, text || undefined)
+        }
+
+        return Response.json({ ok: true })
       },
     },
 

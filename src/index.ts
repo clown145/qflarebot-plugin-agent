@@ -33,6 +33,7 @@ import type { LLMService } from './llm/contract.js'
 import { executeRun, replyFromSession, type RunDeps } from './agent/run.js'
 import { conversationKey, isTextMessage, toInboundMessage } from './agent/inbound.js'
 import { decideWake } from './agent/wake.js'
+import { effectiveModel, readOverrides } from './runtime-config.js'
 import { getPersonaBinding, setPersonaBinding } from './persona.js'
 import { hydrateImageAttachments } from './agent/media.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
@@ -216,8 +217,10 @@ export default definePlugin<AgentConfig>({
         } catch (e) {
           error = e instanceof Error ? e.message : String(e)
         }
+        const overrides = await readOverrides(ctx.kv).catch(() => ({} as never))
+        const activeModel = effectiveModel(ctx.config, overrides)
         const lines = [
-          `模型别名：${ctx.config.model}`,
+          `模型别名：${activeModel}${overrides.model ? `（页面选中；配置里是 ${ctx.config.model}）` : ''}`,
           !llm
             ? 'LLM 接口插件未启用——请在面板的插件页启用或安装它'
             : models.length
@@ -390,8 +393,12 @@ async function handleMessage(
 
   const claimed = await stub.submit(message)
   if (!claimed.acquired || !claimed.runId) {
-    // 这个会话已经有人在跑，消息进队列了。告诉用户一声，别让人干等
-    await reply('上一条还在处理，这条排队中，稍等一下。').catch(() => false)
+    // 这个会话已经有人在跑，run 进了队列，**静默排队**。
+    //
+    // 不要回一句「上一条还在处理」：用户等一会儿自然就收到答复，
+    // 中途插一条提示只会刷屏，而且同一会话连发几条时每次都要被敷衍一句。
+    // 队列会由当前 run 跑完后 `release()` 链式认领（见 runUntilQueueEmpty），
+    // 正常情况延迟只有几秒；执行者被掐断时由 cron 的 10 分钟清理轮兜底。
     return
   }
 

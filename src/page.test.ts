@@ -25,10 +25,49 @@ describe('管理页', () => {
     expect(PAGE_HTML).toContain("'/api/test'")
   })
 
-  it('四块内容都有容器：模型、能力、定时任务、工具调用', () => {
-    for (const id of ['model', 'models', 'ping', 'tools', 'vfs', 'schedule', 'audit', 'scheduleRows', 'auditRows', 'stats']) {
+  it('每块内容都有容器：模型选择、提示词、会话、运行状态、定时任务、审计、统计', () => {
+    for (const id of [
+      // 模型下拉（照 AstrBot 的 ProviderModelMenu：触发器 + 列表 + 搜索）
+      'modelPicker', 'modelTrigger', 'modelCurrent', 'modelMenu', 'modelSearch', 'modelOptions',
+      // 提示词
+      'promptBox', 'savePrompt', 'resetPrompt', 'promptState',
+      // 会话与人格
+      'convSearch', 'convRows', 'personaSummary',
+      // 运行状态与三张表
+      'tools', 'vfs', 'schedule', 'audit', 'limits', 'history', 'tz',
+      'scheduleRows', 'auditRows', 'stats',
+    ]) {
       expect(PAGE_HTML).toContain(`id="${id}"`)
     }
+  })
+
+  it('调用的接口都在 routes 里提供（含本轮新增的设置与会话端点）', () => {
+    for (const path of ['/api/overview', '/api/test', '/api/settings', '/api/persona']) {
+      expect(PAGE_HTML).toContain(`'${path}'`)
+    }
+  })
+
+  /**
+   * 本轮的核心诉求：「选可用模型别名居然要去配置里手填」。
+   * 页面必须把别名做成可点选项，而不是让用户输入。
+   */
+  it('模型别名是可选列表，不是文本输入框', () => {
+    expect(PAGE_HTML).toContain('modelStatus.models')
+    expect(PAGE_HTML).toContain('/api/settings')
+    // 下拉列表的搜索与勾选态
+    expect(PAGE_HTML).toContain('modelSearch')
+    expect(PAGE_HTML).toContain("class=\"check\"")
+    // 不允许再用「手填别名」的输入框
+    expect(PAGE_HTML).not.toContain('placeholder=\"模型别名')
+  })
+
+  it('切换失败时保留原值并提示，不静默吞掉', () => {
+    expect(PAGE_HTML).toContain("notify('切换失败：'")
+  })
+
+  it('用 bridge.toast 给反馈；独立打开时退化为页面内提示', () => {
+    expect(PAGE_HTML).toContain('bridge?.toast')
+    expect(PAGE_HTML).toContain('toast-wrap')
   })
 
   it('渲染 schedules 与 audits —— 上一版这两个数据取回来就丢了', () => {

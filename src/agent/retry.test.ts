@@ -67,7 +67,14 @@ function context(): PluginContext<AgentConfig> {
     botId: 'b1',
     config: defaultConfig,
     logger,
-    kv: {} as never,
+    // runtime-config 会读页面里选中的别名 / 提示词覆盖，给个最小 KV 替身
+    kv: {
+      async get() { return null },
+      async getJSON() { return null },
+      async put() {},
+      async delete() {},
+      async list() { return [] },
+    } as never,
     db: { run: async () => ({ changes: 0 }) } as never,
     r2: undefined,
     api: {} as never,
