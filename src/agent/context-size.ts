@@ -1,0 +1,269 @@
+/**
+ * 上下文压缩与消息序列修复。
+ *
+ * 两块能力都来自 AstrBot，但只搬了**能在 Worker 里成立**的部分：
+ *
+ * ## 1. `fixMessages` —— 保证工具调用与结果配对
+ *
+ * AstrBot 的 `ContextTruncator.fix_messages`
+ * （`astrbot/core/agent/context/truncator.py`）做两件事：
+ * - 每一条 `tool` 消息前面必须有一条带 `tool_calls` 的 `assistant`；
+ * - 每条带 `tool_calls` 的 `assistant` 后面必须跟齐对应的 `tool` 结果。
+ *
+ * 这是 OpenAI Chat Completions 规范的要求，而 **Gemini 校验得更死**：序列不合法直接 400。
+ * 当前这套代码自己拼序列，目前不会出错；但只要出现「压缩丢掉了 assistant 那一半」
+ * 或者「历史里只存了 tool 结果」，就会发出一条必然被拒的请求。
+ * 40 行纯函数换掉一整类协议错误，很划算。
+ *
+ * ## 2. `compactMessages` —— 按「轮」丢弃，而不是按消息条数
+ *
+ * AstrBot 的 `split_into_rounds`（`round_utils.py`）把消息分组：
+ * **一个 user 段 + 紧随其后的所有 assistant/tool 段 = 一轮**。
+ * 压缩时只丢**整轮**，所以 `tool_call` 永远不会和它的 `tool_result` 分家——
+ * 配对是**结构上保证**的，不靠事后修补。
+ *
+ * 为什么不用 token 精确计数：Worker 里没有 tokenizer（装一个就是几百 KB 的包体积，
+ * 而且每次调用都得算 CPU——免费版全机器人共享 10ms）。所以这里按字符估算：
+ * CJK 每字约 0.6 token、其他每字符约 0.3 token（与 AstrBot 的 `token_counter.py` 同源），
+ * 图片按 AstrBot 的经验值每张 765 token。
+ *
+ * **估算会被真实值覆盖**：`loop.ts` 拿得到 provider 返回的 `usage.inputTokens`，
+ * 那是精确值。估算只在「还没调过模型」的第一次装配时用得上。
+ *
+ * ## 3. 与 serverless-agent 的差异
+ *
+ * serverless-agent 是「消息数超 historyLimit → 把超出的交给独立 summary 模型摘要 → 存 D1」。
+ * 它需要一张表、一次额外 D1 写、一次额外模型调用。这里：
+ * - `truncate` 模式：**零模型调用、零存储写入、零 D1/KV 额度**，纯内存。
+ * - `summary` 模式：摘要存 **DO storage**（不碰 D1/KV），且默认关闭。
+ *
+ * 这样在免费版「D1 写 10 万行/日、KV 写 1 千次/日」的约束下，压缩本身不产生任何额度消耗。
+ */
+import type { ModelMessage } from '../types.js'
+
+/** 估算一段文本的 token 数。CJK 约 0.6/字，其他约 0.3/字符（AstrBot 的经验值） */
+export function estimateTextTokens(text: string): number {
+  let cjk = 0
+  let other = 0
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0
+    // CJK 统一表意文字、扩展 A、兼容表意、全角标点、日文假名、韩文
+    if (
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3400 && code <= 0x4dbf) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xff00 && code <= 0xffef) ||
+      (code >= 0x3040 && code <= 0x30ff) ||
+      (code >= 0xac00 && code <= 0xd7af)
+    ) {
+      cjk += 1
+    } else {
+      other += 1
+    }
+  }
+  return Math.ceil(cjk * 0.6 + other * 0.3)
+}
+
+/** 单条消息的 token 估算。图片按 AstrBot 的 765 经验值算 */
+export function estimateMessageTokens(message: ModelMessage): number {
+  if (message.role === 'tool') {
+    return estimateTextTokens(message.content ?? '')
+  }
+  if (message.role === 'assistant') {
+    const text = estimateTextTokens(message.content ?? '')
+    // 工具调用的 JSON 也要算：参数经常比正文还长
+    const calls = message.toolCalls?.length
+      ? estimateTextTokens(
+          message.toolCalls
+            .map((call) => `${call.name}${JSON.stringify(call.arguments)}`)
+            .join(''),
+        )
+      : 0
+    return text + calls
+  }
+  const content = message.content
+  if (typeof content === 'string') return estimateTextTokens(content)
+  // 多模态：文本逐段算，图片用固定经验值
+  let total = 0
+  for (const part of content) {
+    if (part.type === 'text') total += estimateTextTokens(part.text)
+    else total += 765
+  }
+  return total
+}
+
+export function estimateMessagesTokens(messages: ModelMessage[]): number {
+  let total = 0
+  for (const message of messages) total += estimateMessageTokens(message)
+  return total
+}
+
+/**
+ * 修复工具调用配对。
+ *
+ * 规则（与 AstrBot 的 `fix_messages` 一致）：
+ * 1. 孤立的 `tool` 消息（前面没有待配对的 assistant）→ **丢弃**。
+ * 2. 带 `toolCalls` 的 assistant 若后面一个 `tool` 结果都没有 → **丢弃整组**
+ *    （它要求了调用却没有结果，模型会以为调用失败了，比丢掉更糟）。
+ * 3. 配对成功的组，assistant 与它的全部 tool 结果**相邻**输出。
+ *
+ * 顺带保证第一条非 system 消息是 `user`：不少 provider（智谱、Gemini）强制这个形状。
+ */
+export function fixMessages(messages: ModelMessage[]): ModelMessage[] {
+  if (messages.length === 0) return messages
+
+  // 1) 先把开头的 system 段与其余分开（system 永远不动）
+  const systemPart: ModelMessage[] = []
+  let index = 0
+  while (index < messages.length && messages[index]?.role === 'system') {
+    const message = messages[index]
+    if (message) systemPart.push(message)
+    index += 1
+  }
+
+  const rest = messages.slice(index)
+  const fixed: ModelMessage[] = []
+  let pendingAssistant: ModelMessage | null = null
+  let pendingTools: ModelMessage[] = []
+
+  /** 只有真的配到工具结果，才把这一组写出去 */
+  const flushIfValid = (): void => {
+    if (pendingAssistant && pendingTools.length > 0) fixed.push(pendingAssistant, ...pendingTools)
+    pendingAssistant = null
+    pendingTools = []
+  }
+
+  for (const message of rest) {
+    if (message.role === 'tool') {
+      // 只有存在待配对的 assistant 时才收集，否则它就是孤儿，直接丢
+      if (pendingAssistant) pendingTools.push(message)
+      continue
+    }
+
+    // 遇到新的非 tool 消息：先结算上一组
+    flushIfValid()
+
+    if (message.role === 'assistant' && message.toolCalls?.length) {
+      // 开一组新的，等它的工具结果
+      pendingAssistant = message
+      continue
+    }
+
+    // 普通 assistant / user 直接输出
+    fixed.push(message)
+  }
+
+  // 收尾：最后一组也要结算
+  flushIfValid()
+
+  // 2) 保证 system 之后第一条是 user。智谱/Gemini 要求这个形状
+  if (fixed.length > 0 && fixed[0]?.role !== 'user') {
+    const firstUser = fixed.find((m) => m.role === 'user')
+    const ordered = firstUser ? [firstUser, ...fixed.filter((m) => m !== firstUser)] : fixed
+    return [...systemPart, ...ordered]
+  }
+
+  return [...systemPart, ...fixed]
+}
+
+/** 一轮 = 一个 user 段 + 紧随其后的所有非 user 段 */
+export interface Round {
+  messages: ModelMessage[]
+  tokens: number
+}
+
+/**
+ * 按 AstrBot 的 `split_into_rounds` 切分。
+ *
+ * 注意 system 段不参与：调用方已经把它分离出去了。
+ * 如果开头有 assistant（比如人格的 begin_dialogs），它会自成一轮——
+ * 这样丢轮时不会把它和后面的 user 拆开。
+ */
+export function splitIntoRounds(messages: ModelMessage[]): Round[] {
+  const rounds: Round[] = []
+  let current: ModelMessage[] = []
+
+  const push = (): void => {
+    if (current.length === 0) return
+    rounds.push({
+      messages: current,
+      tokens: estimateMessagesTokens(current),
+    })
+    current = []
+  }
+
+  for (const message of messages) {
+    if (message.role === 'user' && current.length > 0) push()
+    current.push(message)
+  }
+  push()
+
+  return rounds
+}
+
+export interface CompactResult {
+  messages: ModelMessage[]
+  /** 被丢掉的轮数。0 表示没压缩 */
+  droppedRounds: number
+  /** 压缩前估算 */
+  tokensBefore: number
+  /** 压缩后估算 */
+  tokensAfter: number
+}
+
+/**
+ * 按阈值丢轮（AstrBot 的 `truncate` 模式）。
+ *
+ * 关键行为：
+ * - **只丢整轮**，所以工具配对是结构保证的；
+ * - **至少保留最新一轮**：用户刚说的话不能丢，否则模型答非所问；
+ * - 丢完再跑一次 `fixMessages` 兜底（比如开头是 assistant 被人格撑起来的情况）。
+ *
+ * 不做「一次丢到阈值以下」的断崖式清理：AstrBot 每次只丢最老的一轮（渐进棘轮），
+ * 这样上下文是**缓慢变旧**而不是突然失去一大段。这里采用同样的策略：
+ * 每轮丢掉最老的一轮直到低于阈值，但**一次调用最多丢一半的轮**，
+ * 避免上下文抖动过大。
+ */
+export function compactMessages(
+  messages: ModelMessage[],
+  options: { maxTokens: number; systemTokens?: number },
+): CompactResult {
+  const tokensBefore = estimateMessagesTokens(messages)
+  const totalBefore = tokensBefore + (options.systemTokens ?? 0)
+
+  if (totalBefore <= options.maxTokens) {
+    return { messages, droppedRounds: 0, tokensBefore, tokensAfter: tokensBefore }
+  }
+
+  const rounds = splitIntoRounds(messages)
+  // 只有一轮时不能丢——否则等于把本轮问题删了
+  if (rounds.length <= 1) {
+    return { messages, droppedRounds: 0, tokensBefore, tokensAfter: tokensBefore }
+  }
+
+  let dropped = 0
+  let kept = rounds
+  const maxDrop = Math.max(1, Math.floor(rounds.length / 2))
+  let used = totalBefore
+
+  // 从最老的开始丢，直到低于阈值或达到丢弃上限，但始终保留最后 1 轮
+  while (kept.length > 1 && used > options.maxTokens && dropped < maxDrop) {
+    const removed = kept[0]
+    if (!removed) break
+    used -= removed.tokens
+    kept = kept.slice(1)
+    dropped += 1
+  }
+
+  if (dropped === 0) {
+    return { messages, droppedRounds: 0, tokensBefore, tokensAfter: tokensBefore }
+  }
+
+  const compacted = fixMessages(kept.flatMap((round) => round.messages))
+  return {
+    messages: compacted,
+    droppedRounds: dropped,
+    tokensBefore,
+    tokensAfter: estimateMessagesTokens(compacted),
+  }
+}

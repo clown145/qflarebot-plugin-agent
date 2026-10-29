@@ -161,3 +161,49 @@ describe('守卫：群聊未 @ 未带前缀的消息全都不唤醒', () => {
     }
   })
 })
+
+/**
+ * 回归：`/skill <id> <任务>` 必须能进模型。
+ *
+ * 这是一个**曾经真实存在的死路**：技能激活的长相是 `/skill …`，
+ * 而 `command_prefixes` 默认就是 `/`，于是它先被「指令前缀」判定拦下，
+ * `runLoopOnce` 里的 `parseSkillCommand` 永远收不到它 —— 技能功能整个不存在，
+ * 而且不报任何错。
+ *
+ * 这些用例锁住「技能激活优先于指令前缀」这个顺序。
+ */
+describe('技能激活必须先于指令前缀判定', () => {
+  it('群里带 /skill 前缀也能唤醒（否则技能永远触发不到）', () => {
+    const decision = decideWake(session({ content: '/skill report 写周报', atMe: false }), config())
+    expect(decision.wake).toBe(true)
+    expect(decision.wake && decision.reason).toBe('skill')
+  })
+
+  it('单聊里同样能唤醒', () => {
+    const decision = decideWake(session({ content: '/skill report 写周报', scene: 'c2c' }), config())
+    expect(decision.wake).toBe(true)
+    expect(decision.wake && decision.reason).toBe('skill')
+  })
+
+  it('正文原样保留 /skill 开头（解析层靠它匹配）', () => {
+    const decision = decideWake(session({ content: '/skill report 写周报' }), config())
+    expect(decision.wake && decision.text).toBe('/skill report 写周报')
+  })
+
+  it('光一个 /skill 不当作激活（交给 agent skill 命令去列目录）', () => {
+    const decision = decideWake(session({ content: '/skill' }), config())
+    expect(decision.wake).toBe(false)
+  })
+
+  it('/skillx 之类不是技能激活，仍按指令前缀处理', () => {
+    const decision = decideWake(session({ content: '/skillx foo' }), config())
+    expect(decision.wake).toBe(false)
+    expect(!decision.wake && decision.reason).toBe('command')
+  })
+
+  it('其他 /agent 指令仍然不进模型', () => {
+    for (const content of ['/agent status', '/agent reset', '/agent skill']) {
+      expect(decideWake(session({ content, atMe: true }), config()).wake).toBe(false)
+    }
+  })
+})

@@ -49,15 +49,54 @@ describe('管理页', () => {
       'resetAll', 'overrideState',
       // 三张表
       'scheduleRows', 'auditRows', 'stats',
+      // 工具栏（单工具开关）
+      'toolList', 'toolCount',
+      // 技能（列表 + 编辑器）
+      'skillList', 'skillCount', 'addSkill', 'skillEditor', 'skillId', 'skillBody', 'saveSkill', 'cancelSkill',
     ]) {
       expect(PAGE_HTML).toContain(`id="${id}"`)
     }
   })
 
   it('调用的接口都在 routes 里提供（含本轮新增的设置与会话端点）', () => {
-    for (const path of ['/api/overview', '/api/test', '/api/settings', '/api/persona']) {
+    for (const path of ['/api/overview', '/api/test', '/api/settings', '/api/persona', '/api/tools']) {
       expect(PAGE_HTML).toContain(`'${path}'`)
     }
+  })
+
+  /**
+   * 工具栏与技能是本轮新增的两块管理面。它们必须是**可操作的控件**，
+   * 不是只读展示——这两个功能的 API 早就有了，但页面上没控件，
+   * 使用门槛等于「手写 curl」。
+   */
+  it('工具栏：每个工具一个开关，且走事件委托（列表是渲染出来的）', () => {
+    expect(PAGE_HTML).toContain('renderTools(')
+    expect(PAGE_HTML).toContain('tool-toggle')
+    expect(PAGE_HTML).toContain("postJson('/api/tools'")
+    // 列表每次 load() 都重建，直接绑 id 会漏绑，所以必须委托到容器
+    expect(PAGE_HTML).toContain("$('toolList').addEventListener('change'")
+  })
+
+  it('工具关掉后整行压暗，让「哪些没开」一眼可见', () => {
+    expect(PAGE_HTML).toContain("' off'")
+    expect(PAGE_HTML).toContain('.tool-row.off')
+  })
+
+  it('技能：列表 + 新增/编辑/删除，且编辑器接的是原始 SKILL.md', () => {
+    expect(PAGE_HTML).toContain('renderSkills(')
+    expect(PAGE_HTML).toContain("postJson('/api/skills'")
+    // 编辑要拿原文，不能拿解析后的字段自己拼 frontmatter
+    expect(PAGE_HTML).toContain('data?.content')
+    expect(PAGE_HTML).not.toContain('data?.skill?.content')
+  })
+
+  it('技能列表只取目录，正文按需单独取（避免一次拖下所有 SKILL.md）', () => {
+    expect(PAGE_HTML).toContain("'/api/skills/'")
+    expect(PAGE_HTML).toContain('encodeURIComponent')
+  })
+
+  it('删除技能要二次确认（不可逆操作）', () => {
+    expect(PAGE_HTML).toContain('confirm(')
   })
 
   /**

@@ -6,6 +6,13 @@
  * maxLevel 取最大、scopes 求并。所以策略表只能放宽、不能收紧——
  * 这与原文一致（原文注释也这么说：`reduce` 里用 `Math.max`）。
  *
+ * **现状（须知）：本插件里这张表没有写入方**。全仓库只有 schema 的
+ * `CREATE TABLE` 与下面这条 `SELECT`，没有任何 INSERT/UPDATE——面板也没有入口。
+ * 想用「策略叠加」只能手工往 D1 写 `p_agent_policies`（`{policies}` 由框架展开成
+ * `p_agent_<表名>`），且本插件的 README/面板都不提供指引。
+ * 因此**当前的真实行为就是 `resolveDefaultPolicy` 的角色基线**（含单聊那一档），
+ * 叠加逻辑只是「手工写了就生效」的预留通路，别把它当成已有能力。
+ *
  * 需要「收紧」的场景（比如某个群禁用某工具）应该做成开关而不是策略级别。
  */
 import type { PluginDB } from '@qqbot/sdk'

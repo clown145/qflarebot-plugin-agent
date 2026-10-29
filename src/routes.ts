@@ -8,7 +8,22 @@
 import type { Route } from '@qqbot/sdk'
 import type { AgentConfig } from './config/index.js'
 import type { LLMService } from './llm/contract.js'
-import { listAllSchedules, listDailyStats, listToolAudit } from './store/d1.js'
+import {
+  getToolSettings,
+  listAllSchedules,
+  listDailyStats,
+  setToolSettings,
+  listToolAudit,
+} from './store/d1.js'
+import { normalizeToolSettings, toToolCatalog } from './tools/catalog.js'
+import { buildRegistry, hasR2 } from './agent/run.js'
+import {
+  deleteSkill,
+  getSkill,
+  getSkillMarkdown,
+  listSkills,
+  upsertSkill,
+} from './skills/store.js'
 import { listPersonaBindings, setPersonaBinding } from './persona.js'
 import { clearConfigOverride, patchConfigOverride, readConfigOverride, type ConfigOverride } from './runtime-config.js'
 import { resolveConfig } from './effective-config.js'
@@ -48,12 +63,23 @@ export function createPageRoutes(): Route<AgentConfig>[] {
         const overrideKeys = override ? Object.keys(override) : []
 
         // 几块数据互不依赖，并行取；任何一块失败都不该让整页挂掉
-        const [stats, schedules, audits, bindings] = await Promise.all([
+        const [stats, schedules, audits, bindings, toolSettings, skillList] = await Promise.all([
           listDailyStats(ctx.db, 14).catch(() => []),
           listAllSchedules(ctx.db, 50).catch(() => []),
           ctx.config.enable_audit ? listToolAudit(ctx.db, 30).catch(() => []) : Promise.resolve([]),
           listPersonaBindings(ctx.db, 50).catch(() => []),
+          getToolSettings(ctx.db).catch(() => ({ disabled: [] as string[] })),
+          listSkills(ctx.db).catch(() => []),
         ])
+
+        // 工具栏要**未过滤**的完整列表：关掉的工具也得出现，否则页面上
+        // 再也点不到「重新开启」。这里同步建一次 registry（buildRegistry 是纯函数、
+        // 不碰网络），r2 探测用 false 代替——页面只需要工具清单与权限级别，
+        // 而真实探测一次要多一个 R2 往返。
+        const catalogTools = toToolCatalog(
+          buildRegistry(ctx, config, false).list(),
+          toolSettings,
+        )
 
         return Response.json({
           config: {
@@ -95,6 +121,14 @@ export function createPageRoutes(): Route<AgentConfig>[] {
             createdAt: row.created_at,
             createdAtLocal: formatLocal(row.created_at, ctx.config.timezone),
           })),
+          // 工具栏：完整清单 + 哪些被关掉
+          tools: {
+            list: catalogTools,
+            disabled: toolSettings.disabled,
+          },
+          // 技能目录。页面只列 id/name/description；正文按需用 /api/skills/:id 取，
+          // 避免一次把所有 SKILL.md（可能各几十 KB）全拖到页面上。
+          skills: skillList,
         })
       },
     },
@@ -208,6 +242,134 @@ export function createPageRoutes(): Route<AgentConfig>[] {
         }
       },
     },
+
+    // ---------------------------------------------------------------- 工具栏
+    //
+    // 返回**未过滤**的完整工具列表：被关掉的工具也要出现，否则页面上就再也
+    // 点不到「重新开启」了。`enabled` 字段区分开关状态。
+    {
+      method: 'GET',
+      path: '/api/tools',
+      auth: 'admin',
+      handler: async ({ ctx }) => {
+        const config = await resolveConfig(ctx)
+        const settings = await getToolSettings(ctx.db).catch(() => ({ disabled: [] }))
+        const r2Ready = config.enable_tools && config.enable_vfs ? await hasR2(ctx) : false
+        const tools = buildRegistry(ctx, config, r2Ready).list()
+        return Response.json({
+          ok: true,
+          tools: toToolCatalog(tools, settings),
+          disabled: settings.disabled,
+        })
+      },
+    },
+
+    {
+      method: 'POST',
+      path: '/api/tools',
+      auth: 'admin',
+      handler: async ({ ctx, request }) => {
+        let body: unknown
+        try {
+          body = await request.json()
+        } catch {
+          return Response.json({ ok: false, error: '请求体不是合法 JSON' }, { status: 400 })
+        }
+        // normalizeToolSettings 吃任何形状（裸数组 / {disabled:[...]} / 垃圾），
+        // 页面传错不会 500——最差情况是「什么都没关」
+        const settings = normalizeToolSettings(body)
+        await setToolSettings(ctx.db, settings)
+        return Response.json({ ok: true, disabled: settings.disabled })
+      },
+    },
+
+    // ---------------------------------------------------------------- 技能
+    {
+      method: 'GET',
+      path: '/api/skills',
+      auth: 'admin',
+      handler: async ({ ctx }) => {
+        const skills = await listSkills(ctx.db).catch(() => [])
+        return Response.json({ ok: true, skills })
+      },
+    },
+
+    {
+      method: 'GET',
+      path: '/api/skills/:id',
+      auth: 'admin',
+      handler: async ({ ctx, params }) => {
+        // assertSkillId 遇到非法 id 会抛，所以这里要 catch：
+        // 一个乱填的 URL 不该打出 500
+        try {
+          const id = params['id'] ?? ''
+          const [skill, content] = await Promise.all([
+            getSkill(ctx.db, id),
+            getSkillMarkdown(ctx.db, id),
+          ])
+          // content 是**原始 SKILL.md**（含 frontmatter），给编辑框用；
+          // skill 是解析后的字段，给「只读展示」用。两者都返回，
+          // 页面就不必再猜要不要自己拼 frontmatter。
+          return skill
+            ? Response.json({ ok: true, skill, content })
+            : Response.json({ ok: false, error: '技能不存在' }, { status: 404 })
+        } catch (error) {
+          return Response.json(
+            { ok: false, error: error instanceof Error ? error.message : String(error) },
+            { status: 400 },
+          )
+        }
+      },
+    },
+
+    {
+      method: 'POST',
+      path: '/api/skills',
+      auth: 'admin',
+      handler: async ({ ctx, request }) => {
+        let body: { id?: unknown; content?: unknown }
+        try {
+          body = (await request.json()) as { id?: unknown; content?: unknown }
+        } catch {
+          return Response.json({ ok: false, error: '请求体不是合法 JSON' }, { status: 400 })
+        }
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        const content = typeof body.content === 'string' ? body.content : ''
+        if (!id || !content) {
+          return Response.json({ ok: false, error: '缺少 id 或 content' }, { status: 400 })
+        }
+        // 校验错误（id 非法 / 超 32KB / 缺 description）直接把消息回给页面，
+        // 运维当场知道写漏了什么，而不是等某次对话才发现技能「消失」
+        try {
+          const skill = await upsertSkill(ctx.db, { id, content })
+          return Response.json({ ok: true, skill })
+        } catch (error) {
+          return Response.json(
+            { ok: false, error: error instanceof Error ? error.message : String(error) },
+            { status: 400 },
+          )
+        }
+      },
+    },
+
+    {
+      method: 'DELETE',
+      path: '/api/skills/:id',
+      auth: 'admin',
+      handler: async ({ ctx, params }) => {
+        try {
+          const removed = await deleteSkill(ctx.db, params['id'] ?? '')
+          return removed
+            ? Response.json({ ok: true })
+            : Response.json({ ok: false, error: '技能不存在' }, { status: 404 })
+        } catch (error) {
+          return Response.json(
+            { ok: false, error: error instanceof Error ? error.message : String(error) },
+            { status: 400 },
+          )
+        }
+      },
+    },
   ]
 }
 
@@ -243,9 +405,32 @@ function validateConfigField(
     max_tool_calls: [1, 50],
     history_limit: [0, 100],
     request_timeout_ms: [1000, 25000],
+    max_context_tokens: [1000, 200000],
+    rate_limit_per_minute: [0, 100],
   }
-  const BOOLEANS = ['enable_tools', 'enable_vfs', 'enable_schedule', 'enable_audit', 'show_typing', 'friend_needs_wake_prefix']
-  const STRINGS = ['model', 'system_prompt', 'default_persona', 'wake_prefix', 'command_prefixes', 'timezone']
+  const BOOLEANS = [
+    'enable_tools',
+    'enable_vfs',
+    'enable_schedule',
+    'enable_skills',
+    'enable_audit',
+    'show_typing',
+    'friend_needs_wake_prefix',
+  ]
+  const STRINGS = [
+    'model',
+    'system_prompt',
+    'default_persona',
+    'wake_prefix',
+    'command_prefixes',
+    'timezone',
+    'search_api_key',
+    'content_filter_keywords',
+  ]
+  /** 枚举字段：只能取这几值 */
+  const ENUMS: Record<string, readonly string[]> = {
+    context_compression: ['off', 'truncate', 'summary'],
+  }
 
   if (!(key in config) && !['personas'].includes(key)) return `未知配置项：${key}`
 
@@ -259,6 +444,26 @@ function validateConfigField(
       if (persona['begin_dialogs'] !== undefined && typeof persona['begin_dialogs'] !== 'string') {
         return '人格的 begin_dialogs 必须是字符串'
       }
+      // tools：留空 = 不限。页面传空数组是合法的，表示「这套人格不能用任何工具」
+      if (persona['tools'] !== undefined) {
+        if (!Array.isArray(persona['tools'])) return '人格的 tools 必须是数组'
+        for (const tool of persona['tools']) {
+          if (typeof tool !== 'string' || !tool.trim()) return '人格的 tools 里必须是非空字符串'
+        }
+      }
+      // skills：与 tools 同构（留空 = 不限，[] = 一个都不给）
+      if (persona['skills'] !== undefined) {
+        if (!Array.isArray(persona['skills'])) return '人格的 skills 必须是数组'
+        for (const skill of persona['skills']) {
+          if (typeof skill !== 'string' || !skill.trim()) return '人格的 skills 里必须是非空字符串'
+        }
+      }
+      if (
+        persona['custom_error_message'] !== undefined &&
+        typeof persona['custom_error_message'] !== 'string'
+      ) {
+        return '人格的 custom_error_message 必须是字符串'
+      }
     }
     // 名字不能重复：会话按名字绑定，重名等于绑不准
     const names = (value as Array<{ name: string }>).map((p) => p.name.trim())
@@ -270,6 +475,13 @@ function validateConfigField(
     if (typeof value !== 'string' || !value.trim()) return 'model 不能为空'
     // 只接受真实存在的别名：手打错一个字母，运行时才炸 unknown_model 太难查
     return null
+  }
+
+  const allowed = ENUMS[key]
+  if (allowed) {
+    return typeof value === 'string' && allowed.includes(value)
+      ? null
+      : `${key} 只能是 ${allowed.join(' / ')}`
   }
 
   if (BOOLEANS.includes(key)) {

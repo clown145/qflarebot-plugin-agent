@@ -6,6 +6,7 @@
  */
 import type { PluginDB } from '@qqbot/sdk'
 import type { ReplyScene } from '../types.js'
+import { normalizeToolSettings, type ToolSettings } from '../tools/catalog.js'
 
 export interface ScheduleRow {
   id: string
@@ -241,4 +242,57 @@ export async function listToolAudit(db: PluginDB, limit = 30): Promise<ToolAudit
 export async function pruneToolAudit(db: PluginDB, olderThan: number): Promise<number> {
   const res = await db.run(`DELETE FROM {tool_audit} WHERE created_at < ?`, olderThan)
   return res.changes
+}
+
+/**
+ * 工具开关的唯一行 id。
+ *
+ * 开关是机器人全局的（不分会话），所以表里永远只有 `'default'` 这一行。
+ * 用固定 id 而不是自增，是为了让 UPSERT 一定命中同一行——多行就意味着一行一个状态，
+ * 读到哪行取决于查询顺序，那种 bug 极难复现。
+ */
+const TOOL_SETTINGS_ID = 'default'
+
+/**
+ * 读工具开关。
+ *
+ * **没有行就返回全开，且不建行**：读一次算 1 行查询（读额度是写的 50 倍），
+ * 而写一次要占写入额度；更关键的是「从没进过管理页」是绝大多数部署的常态，
+ * 为了读一个空设置去写库，等于让每个新装的机器人都白花一次写入。
+ *
+ * 解析交给 `normalizeToolSettings`：库里存的是 TEXT，这里不假定它是合法 JSON——
+ * 手工改库、老版本写坏的数据都不该让整轮对话失败（读设置就抛错会直接断掉 run）。
+ */
+export async function getToolSettings(db: PluginDB): Promise<ToolSettings> {
+  const row = await db.first<{ disabled_json: string }>(
+    `SELECT disabled_json FROM {tool_settings} WHERE id = ?`,
+    TOOL_SETTINGS_ID,
+  )
+  if (!row) return { disabled: [] }
+  return normalizeToolSettings(row.disabled_json)
+}
+
+/**
+ * 写工具开关（单行 UPSERT）。管理页点开关时调用。
+ *
+ * 写法照 `bumpDailyStats`：`INSERT … ON CONFLICT DO UPDATE`，改的是同一行。
+ * 这里**没有**用 `INSERT OR REPLACE`——后者是「删 + 插」两行写入，而 UPSERT
+ * 改同一行按 QFlareBot 文档只算 2 行（含主键），而且不会把行短暂删掉。
+ *
+ * `disabled_json` 列存的就是名字数组本身（列名即约定，别存成包装对象——
+ * 手工翻库时一眼能看懂）。先归一化再落库：接口层可能收到 `disabled: [1, null]`
+ * 这类脏值，原样存进去只会让下次读到一份同样的脏数据。
+ */
+export async function setToolSettings(db: PluginDB, settings: ToolSettings): Promise<void> {
+  const normalized = normalizeToolSettings(settings)
+  await db.run(
+    `INSERT INTO {tool_settings} (id, disabled_json, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       disabled_json = excluded.disabled_json,
+       updated_at = excluded.updated_at`,
+    TOOL_SETTINGS_ID,
+    JSON.stringify(normalized.disabled),
+    Date.now(),
+  )
 }

@@ -49,7 +49,25 @@ import type { AgentConfig } from '../config/index.js'
 /** 唤醒结果：不唤醒时给出原因，便于日志与排障 */
 export type WakeDecision =
   | { wake: false; reason: 'bot-self' | 'empty' | 'command' | 'not-mentioned' | 'not-woken' }
-  | { wake: true; reason: 'at' | 'prefix' | 'private'; text: string }
+  | { wake: true; reason: 'at' | 'prefix' | 'private' | 'skill'; text: string }
+
+/**
+ * 识别技能激活，并返回该交给模型的正文。
+ *
+ * 为什么需要一个「剥前缀」而不是直接复用 `/skill` 原文：`runLoopOnce` 里的
+ * `parseSkillCommand` 匹配的是 `^/skill ...`，所以这里**保留** `/skill` 开头，
+ * 只把首尾空白清掉。这样两条路径共用同一个正则，不会出现「唤醒层认了、
+ * 解析层不认」的错位。
+ *
+ * 返回 `undefined` = 不是技能激活。
+ */
+function stripSkillPrefix(raw: string): string | undefined {
+  const trimmed = raw.trim()
+  // 只认 `/skill ` 后面还有内容的形式。光一个 `/skill` 当作普通指令，
+  // 交给 `agent skill` 命令去列目录——那里能给出比「空任务」更有用的回复。
+  if (!/^\/skill\s+\S/.test(trimmed)) return undefined
+  return trimmed
+}
 
 /** 是否是机器自己发的消息 */
 function isBotSelf(session: Session): boolean {
@@ -85,6 +103,21 @@ export function decideWake(session: Session, config: AgentConfig): WakeDecision 
 
   const raw = session.content ?? ''
   if (!raw.trim() && !(session.attachments?.length ?? 0)) return { wake: false, reason: 'empty' }
+
+  // 技能激活是一条**特殊情况**：`/skill <id> <任务>` 必须进模型，
+  // 因为技能正文只有模型才能用上。
+  //
+  // 但它的开头又是 `/`，会先被下面的「指令前缀」判定拦下（`command_prefixes` 默认就是 `/`）。
+  // 所以这里必须先放行它，否则 `/skill` 永远走不到模型，技能功能等于不存在。
+  //
+  // 为什么单独判，而不是把 `/skill` 从指令前缀里删掉：用户可能把
+  // command_prefixes 改成别的（比如 `!`），那时 `/skill` 不是指令前缀了，
+  // 但激活语义仍然要生效。所以判的是「这条消息是一次技能激活」，
+  // 而不是「它碰巧以某个前缀开头」。
+  const skillText = stripSkillPrefix(raw)
+  if (skillText !== undefined) {
+    return { wake: true, reason: 'skill', text: skillText }
+  }
 
   // 带指令前缀的消息交给指令路径。即便没命中任何命令（`/unknowncmd`），
   // 也不该把带前缀的原文丢给模型——模型会答非所问。

@@ -40,8 +40,21 @@ export const LEASE_MS = 90_000
 /** 一次 run 最多尝试几次 */
 export const MAX_ATTEMPTS = 3
 
-/** 会话历史最多留多少条（超出时从旧的开始删，防止 DO storage 无限增长） */
-const MAX_HISTORY_ROWS = 60
+/**
+ * 会话历史最多留多少条（超出时从旧的开始删，防止 DO storage 无限增长）。
+ *
+ * **必须 >= `history_limit` 的配置上限**（`config/index.ts` 里是 100），否则
+ * 用户把「会话历史条数」调大就是静默失效——改之前是 60 条，配置调到 61–100 时
+ * 表里只剩 60 条，而且没有任何地方会报错。`history()` 只按 `limit` 取最近的 N 条，
+ * 被裁掉的那部分**永远补不回来**，等于用户改了设置却不生效。
+ *
+ * 也不能删掉这个上限：DO storage 没有 TTL，一个长期活跃的群会把历史攒到无限大。
+ * 所以取 120 = 配置上限 100 + 20 条余量：余量是为了让「配置刚上调、旧行还没被
+ * 下一次写入裁掉」的窗口期里仍有富余，不用每次调大限额都先写满一轮才够用。
+ *
+ * 改这两个值时要一起改：`config/index.ts` 的 `history_limit.maximum`。
+ */
+const MAX_HISTORY_ROWS = 120
 
 export interface HistoryRow {
   role: 'user' | 'assistant'
@@ -59,6 +72,43 @@ export interface AcquireResult {
   message?: InboundMessage
   /** 没抢到时：当前租约还有多久过期（毫秒），用来决定 cron 什么时候再来 */
   retryAfterMs?: number
+  /**
+   * 被频率限制拒绝。调用方应告知用户，而不是静默丢弃。
+   *
+   * 只在 `submit()` 里出现（`claim()` 内部使用时不产生这个字段）。
+   */
+  rateLimited?: { retryAfterMs: number }
+}
+
+/**
+ * 频率限制的固定窗口。
+ *
+ * 对标 AstrBot 的 `RateLimitStage`（`rate_limit_check/stage.py:43-89`）：
+ * 按会话、按时间窗口滚动计数，超限就拒绝。
+ *
+ * ## 为什么不放 KV / D1
+ *
+ * 这是**每条消息都要读写一次**的热路径。免费版 KV 写只有 1,000 次/日、
+ * D1 写 10 万行/日（全机器人共享），把热路径放上去会直接打满额度。
+ * DO storage 按 GB-秒计费，而这里本来每条消息就要唤醒 DO 一次，
+ * 计数只是顺带读写的一个小 key —— **零额外额度**。
+ *
+ * ## 为什么是「固定窗口」而不是滑动窗口
+ *
+ * 滑动窗口要存时间戳数组，读写量随次数增长；固定窗口只存一个计数 + 窗口起点。
+ * AstrBot 用的是 deque + 逐个清理过期时间戳，那在常驻进程里无所谓，
+ * 在这里是每条消息一次额外读。
+ */
+interface RateWindow {
+  /** 窗口起点（毫秒，已按窗口长度取整） */
+  windowStart: number
+  /** 本窗口内已消耗的次数 */
+  count: number
+}
+
+export interface RateLimitConfig {
+  /** 每分钟最多几次；0 = 不限 */
+  perMinute: number
 }
 
 export class Agent extends PluginDurableObject {
@@ -70,8 +120,16 @@ export class Agent extends PluginDurableObject {
    * 返回 `acquired: true` 表示调用方拿到了执行权，应当马上跑 loop；
    * `acquired: false` 表示这个会话已经有人在跑，run 进了队列，等 cron 兜底。
    */
-  async submit(message: InboundMessage): Promise<AcquireResult> {
+  async submit(message: InboundMessage, rateLimit?: RateLimitConfig): Promise<AcquireResult> {
     const now = Date.now()
+
+    // 频率限制在入队**之前**判定：被限的 run 不该进队列，
+    // 否则用户等一会儿会突然收到一批过期回复。
+    if (rateLimit && rateLimit.perMinute > 0) {
+      const limited = await this.consumeRateWindow(now, rateLimit.perMinute)
+      if (limited) return limited
+    }
+
     const runId = crypto.randomUUID()
 
     const run: RunRecord = {
@@ -98,6 +156,44 @@ export class Agent extends PluginDurableObject {
    */
   async poll(): Promise<AcquireResult> {
     return this.claim(Date.now())
+  }
+
+  /**
+   * 消耗一次频率窗口配额。
+   *
+   * 返回 `null` = 放行；返回非 null = 被限，直接作为 `submit()` 的结果返回。
+   *
+   * 窗口按「分钟」对齐（`floor(now / 60000)`），所以窗口边界是墙钟整分钟，
+   * 不是「用户第一次发消息起算的 60 秒」。这是固定窗口的固有特性：
+   * 最坏情况用户可以在窗口交界处短时间内连发 2×N 次。对「防刷屏」这个目的足够，
+   * 而滑动窗口要多存 N 个时间戳，不值得。
+   */
+  private async consumeRateWindow(
+    now: number,
+    perMinute: number,
+  ): Promise<AcquireResult | null> {
+    const WINDOW_MS = 60_000
+    const windowStart = Math.floor(now / WINDOW_MS) * WINDOW_MS
+    const stored = await this.ctx.storage.get<RateWindow>('rate')
+
+    // 换窗口了就重置。旧窗口的计数没有保留价值——
+    // 固定窗口不需要历史，这也是它比滑动窗口省的地方
+    const current: RateWindow =
+      stored && stored.windowStart === windowStart
+        ? stored
+        : { windowStart, count: 0 }
+
+    if (current.count >= perMinute) {
+      return {
+        acquired: false,
+        rateLimited: { retryAfterMs: windowStart + WINDOW_MS - now },
+      }
+    }
+
+    // 计数写回。注意这是**每次 submit 一次写**，但 DO storage 的写不进 D1/KV 额度，
+    // 且本来 claim() 就要写 lock/run/queue，这里只是多一个 key
+    await this.ctx.storage.put('rate', { windowStart, count: current.count + 1 } satisfies RateWindow)
+    return null
   }
 
   /**

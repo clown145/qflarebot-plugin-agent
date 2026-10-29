@@ -95,4 +95,31 @@ export const SCHEMA_STATEMENTS = [
      persona TEXT NOT NULL,
      updated_at INTEGER NOT NULL
    ) WITHOUT ROWID`,
+
+  // 工具开关：哪几个工具不给模型用。**整张表永远只有一行**（id 恒为 'default'），
+  // 因为开关是机器人全局的，不分会话。
+  //
+  // 按 QFlareBot 文档「D1 写入怎么算」，`WITHOUT ROWID` + 非整数主键的表插入/更新
+  // 一行只算 1 行写入，这里再省掉所有二级索引（这张表没有任何查询条件，只按主键读写）。
+  // 于是「点一下开关」的代价是 1 行，而点开关这件事一天可能都发生不了一次，
+  // 与消息数完全脱钩——真正的设计约束是别在每条消息的路径上读写它：
+  // 运行时每次 run 读一次（读 50 万行/天才等价于写的额度），写只发生在管理页。
+  `CREATE TABLE IF NOT EXISTS {tool_settings} (
+     id TEXT PRIMARY KEY,
+     disabled_json TEXT NOT NULL,
+     updated_at INTEGER NOT NULL
+   ) WITHOUT ROWID`,
+
+  // 技能：一张表，id → 一份 SKILL.md。**独立表而不是复用 vfs**：
+  // 目录每轮都要读（vfs 读一次至少 2 个往返），vfs 又是模型可写的（模型不该能改
+  // 自己的技能），而技能没有路径/版本的概念，用文件系统表达它只会把路径解析与
+  // R2 清理一起拖进来。写入量只跟「运维改技能」的次数有关，与消息数完全脱钩。
+  // 不建二级索引：唯一的高频查询是全表扫描的小表，ORDER BY id 正好走主键顺序。
+  `CREATE TABLE IF NOT EXISTS {skills} (
+     id TEXT PRIMARY KEY,
+     name TEXT NOT NULL,
+     description TEXT NOT NULL,
+     body TEXT NOT NULL,
+     updated_at INTEGER NOT NULL
+   ) WITHOUT ROWID`,
 ] as const

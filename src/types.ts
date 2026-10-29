@@ -89,6 +89,23 @@ export interface ModelResponse {
 /** run 的终态 */
 export type RunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 
+/**
+ * 历史里的工具调用记录。
+ *
+ * 为什么存成「扁平的一行」而不是还原成 assistant + tool 两条消息：
+ * DO storage 里历史是**按条数配额**的（MAX_HISTORY_ROWS），
+ * 一次工具调用若拆成两行会double 消耗配额。合成一行既省配额，
+ * 又足够让模型知道「上一轮我调过什么工具、拿到什么结果」。
+ */
+export interface HistoryToolTrace {
+  name: string
+  /** 入参 JSON（已截断，见 run.ts） */
+  args: string
+  /** 结果摘要（已截断） */
+  result: string
+  status: string
+}
+
 export interface RunRecord {
   id: string
   conversation: ConversationKey

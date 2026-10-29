@@ -74,10 +74,48 @@ describe('resolveDefaultPolicy（照搬原文的角色基线）', () => {
     expect(policy.scopes).not.toContain('http:request')
   })
 
-  it('角色未知（单聊）是 level 1，只读', () => {
-    const policy = resolveDefaultPolicy(context({ actorRole: undefined }))
+  it('群里角色未知仍是 level 1，只读（保守基线不变）', () => {
+    const policy = resolveDefaultPolicy(context({ actorRole: undefined, scene: 'group' }))
     expect(policy.maxLevel).toBe(1)
     expect(policy.scopes).toEqual(['workspace:read'])
+  })
+
+  // 这条以前断言「单聊也是 level 1」，那是单聊工具全废的根因：
+  // 单聊没有群角色 → actorRole 兜底成 unknown → 只给只读，
+  // 于是 schedule.create / http.request / vfs.write 在单聊里一律 permission_denied，
+  // 连 Bot 管理员都建不出「提醒我三小时后…」。现在单聊按 1:1 信道给可用基线。
+  it('单聊（c2c）没有群角色，但按 1:1 信道给 level 3 可用基线', () => {
+    const policy = resolveDefaultPolicy(context({ actorRole: undefined, scene: 'c2c' }))
+    expect(policy.maxLevel).toBe(3)
+    expect(policy.scopes).toEqual([
+      'workspace:read',
+      'workspace:write',
+      'schedule:read',
+      'schedule:write',
+      'http:request',
+    ])
+  })
+
+  it('频道私信（guild_dm）与单聊同一档', () => {
+    const policy = resolveDefaultPolicy(context({ actorRole: 'unknown', scene: 'guild_dm' }))
+    expect(policy.maxLevel).toBe(3)
+    expect(policy.scopes).toContain('schedule:write')
+  })
+
+  it('单聊基线能真的把「提醒我」建出来（级别与 scope 都够）', async () => {
+    const check = await checkToolPolicy(
+      context({ actorRole: undefined, scene: 'c2c' }),
+      { level: 3, scopes: ['schedule:write'] },
+    )
+    expect(check.allowed).toBe(true)
+  })
+
+  it('单聊基线仍不给 level 4 —— 单聊用户不是群主，不该拿到群管理那档', async () => {
+    const check = await checkToolPolicy(
+      context({ actorRole: undefined, scene: 'c2c' }),
+      { level: 4, scopes: [] },
+    )
+    expect(check.allowed).toBe(false)
   })
 
   it('定时任务按 level 3 + owner scope 处理，否则「提醒我」会被自己拦下', () => {

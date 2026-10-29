@@ -21,7 +21,8 @@
     },
     {
       "name": "agent reset",
-      "description": "清空当前会话的记忆"
+      "description": "清空当前会话的记忆",
+      "permission": "group_admin"
     },
     {
       "name": "agent schedule",
@@ -30,12 +31,18 @@
     },
     {
       "name": "agent persona",
+      "permission": "group_admin",
       "description": "查看或切换本会话的人格",
       "usage": "/agent persona [名字]"
     },
     {
       "name": "agent status",
       "description": "查看 Agent 状态"
+    },
+    {
+      "name": "agent skill",
+      "description": "查看可用技能，或激活一个技能",
+      "usage": "/agent skill [<id> [任务]]"
     }
   ],
   "regex": [],
@@ -87,6 +94,36 @@
     {
       "method": "POST",
       "path": "/api/test",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/api/tools",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tools",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/api/skills",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/api/skills/:id",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/api/skills",
+      "auth": "admin"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/skills/:id",
       "auth": "admin"
     }
   ],
@@ -161,6 +198,12 @@
         "description": "模型可以自己创建提醒。需要机器人开启每分钟 cron",
         "default": false
       },
+      "enable_skills": {
+        "type": "boolean",
+        "title": "启用技能",
+        "description": "模型可以在对话里用 `/skill <id> <任务>` 激活技能。目录每轮只占几行，技能正文只在激活时载入",
+        "default": false
+      },
       "enable_audit": {
         "type": "boolean",
         "title": "记录工具调用",
@@ -197,6 +240,31 @@
               "title": "开场对话",
               "description": "每轮插在历史最前面，用来锚定风格。每行一句，以 `user:` / `assistant:` 开头，例如：\nuser: 你好\nassistant: 你好呀～",
               "default": ""
+            },
+            "tools": {
+              "type": "array",
+              "title": "可用工具",
+              "description": "留空 = 不限（用全局工具集）；填了就是白名单，只有这些工具能被这套人格使用。不能突破权限层",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "skills": {
+              "type": "array",
+              "title": "可见技能",
+              "description": "留空 = 不限（全部技能都可见）；填了就是白名单；空列表表示一个都看不到",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "custom_error_message": {
+              "type": "string",
+              "format": "textarea",
+              "title": "出错时的回复",
+              "description": "留空用通用错误文案。人格化回复能让出错时也不出戏",
+              "default": ""
             }
           }
         },
@@ -230,6 +298,45 @@
         "type": "string",
         "title": "时区",
         "default": "Asia/Shanghai"
+      },
+      "context_compression": {
+        "type": "string",
+        "enum": [
+          "off",
+          "truncate",
+          "summary"
+        ],
+        "title": "上下文压缩",
+        "description": "长会话怎么处理旧记录。`truncate` = 丢掉最老的整轮（零额外模型调用）；`summary` = 让模型摘要旧轮（每次多一次调用）；`off` = 只按历史条数截断",
+        "default": "truncate"
+      },
+      "max_context_tokens": {
+        "type": "integer",
+        "title": "压缩触发的 token 阈值",
+        "description": "估算值超过这个数就开始压缩。这是估算，真实用量由模型返回后覆盖。建议 8000–20000",
+        "minimum": 1000,
+        "maximum": 200000,
+        "default": 12000
+      },
+      "rate_limit_per_minute": {
+        "type": "integer",
+        "title": "每会话每分钟最多几次对话",
+        "description": "防止单人刷屏烧 token。0 = 不限制。被限时用户会收到一句提示",
+        "minimum": 0,
+        "maximum": 100,
+        "default": 10
+      },
+      "content_filter_keywords": {
+        "type": "string",
+        "title": "内容安全关键词",
+        "description": "命中即拒绝、不发模型（逗号分隔）。留空 = 关闭。零外部依赖，只做纯文本匹配",
+        "default": ""
+      },
+      "search_api_key": {
+        "type": "string",
+        "title": "联网搜索 API Key（Tavily）",
+        "description": "留空时搜索工具仍然存在，但会告诉用户「还没配置搜索」。填了之后模型才能真的联网查资料",
+        "default": ""
       }
     }
   },
@@ -248,9 +355,15 @@
     "enable_tools": true,
     "enable_vfs": false,
     "enable_schedule": false,
+    "enable_skills": false,
     "enable_audit": false,
     "show_typing": true,
-    "timezone": "Asia/Shanghai"
+    "timezone": "Asia/Shanghai",
+    "context_compression": "truncate",
+    "max_context_tokens": 12000,
+    "rate_limit_per_minute": 10,
+    "search_api_key": "",
+    "content_filter_keywords": ""
   },
   "ui": {
     "path": "/ui/",

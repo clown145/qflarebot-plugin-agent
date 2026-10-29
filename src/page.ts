@@ -181,6 +181,49 @@ export const PAGE_HTML = `<!doctype html>
     border-radius: var(--qb-radius-sm); font-size: var(--qb-text-xs);
     color: var(--qb-warning); border: 1px solid var(--qb-warning);
   }
+
+  /* 工具栏：一行一个工具，右侧开关。关掉的整行压暗，
+     让「哪些没开」一眼可见，而不是要逐行读开关状态 */
+  .tool-row {
+    display: flex; align-items: flex-start; gap: var(--qb-space-3);
+    padding: var(--qb-space-2) 0; border-bottom: 1px solid var(--qb-border);
+  }
+  .tool-row:last-child { border-bottom: 0; }
+  .tool-row .tool-main { flex: 1; min-width: 0; }
+  .tool-row .tool-name {
+    font-family: var(--qb-font-mono, ui-monospace, monospace);
+    font-size: var(--qb-text-sm); font-weight: 500;
+  }
+  .tool-row .tool-meta {
+    color: var(--qb-fg-muted); font-size: var(--qb-text-xs);
+    margin-top: 2px; line-height: var(--qb-leading);
+  }
+  .tool-row .tool-tags { display: flex; gap: var(--qb-space-1); flex-wrap: wrap; margin-top: var(--qb-space-1); }
+  .tool-row.off { opacity: .55; }
+  .tool-row.off .tool-name { text-decoration: line-through; }
+  .tag {
+    display: inline-block; padding: 0 var(--qb-space-1);
+    border-radius: var(--qb-radius-sm); font-size: var(--qb-text-xs);
+    border: 1px solid var(--qb-border); color: var(--qb-fg-muted);
+  }
+  .tag.warn { color: var(--qb-warning); border-color: var(--qb-warning); }
+  .tag.danger { color: var(--qb-danger); border-color: var(--qb-danger); }
+
+  /* 技能：卡片式列表，比表格更适合「一段描述 + 操作」 */
+  .skill-list { display: flex; flex-direction: column; gap: var(--qb-space-2); }
+  .skill-item {
+    border: 1px solid var(--qb-border); border-radius: var(--qb-radius-sm);
+    padding: var(--qb-space-3); background: var(--qb-surface-muted);
+  }
+  .skill-head { display: flex; align-items: center; gap: var(--qb-space-2); margin-bottom: var(--qb-space-1); }
+  .skill-id {
+    font-family: var(--qb-font-mono, ui-monospace, monospace);
+    font-size: var(--qb-text-sm); font-weight: 500;
+  }
+  .skill-name { color: var(--qb-fg-muted); font-size: var(--qb-text-xs); }
+  .skill-desc { color: var(--qb-fg-muted); font-size: var(--qb-text-xs); line-height: var(--qb-leading); }
+  .skill-head .spacer { flex: 1; }
+  .skill-editor textarea { min-height: 10rem; font-family: var(--qb-font-mono, ui-monospace, monospace); font-size: var(--qb-text-xs); }
 </style>
 </head>
 <body>
@@ -263,6 +306,45 @@ export const PAGE_HTML = `<!doctype html>
   <div class="row"><span class="k">动态定时任务</span><input type="checkbox" id="enableSchedule" /></div>
   <div class="row"><span class="k">记录工具调用（审计）</span><input type="checkbox" id="enableAudit" /></div>
   <div class="row"><span class="k">单聊显示「正在输入」</span><input type="checkbox" id="showTyping" /></div>
+</div>
+
+<div class="card">
+  <h2>工具 <span class="muted small" id="toolCount"></span></h2>
+  <p class="hint">
+    关掉的工具<strong>根本不注册</strong>——模型看不到，也就不会去调用后被权限拒绝。
+    这比让模型反复撞权限墙更省 token。
+    <span class="muted">改完立即生效，下一轮对话就按新的来。</span>
+  </p>
+  <div id="toolList"><div class="loading">加载中…</div></div>
+</div>
+
+<div class="card">
+  <h2>技能 <span class="muted small" id="skillCount"></span></h2>
+  <p class="hint">
+    每轮只给模型一份目录（<code>- id: 描述</code>，最多 40 条，成本固定且很小）；
+    用户发 <code>/skill &lt;id&gt; &lt;任务&gt;</code> 激活后，才载入该技能的完整正文。
+    必须在「能力开关」里打开<strong>启用技能</strong>才会生效。
+  </p>
+  <div id="skillList" class="skill-list"><div class="loading">加载中…</div></div>
+  <div class="actions">
+    <button class="small" id="addSkill">新增技能</button>
+    <span class="muted small">正文上限 32KB；<code>description</code> 必填，它会进模型目录</span>
+  </div>
+  <div class="skill-editor" id="skillEditor" hidden>
+    <div class="field">
+      <label class="field-label">技能 id <span class="muted">（字母数字 . _ -，1–64 字符）</span></label>
+      <input id="skillId" class="search" placeholder="report" />
+    </div>
+    <div class="field">
+      <label class="field-label">SKILL.md 全文 <span class="muted">（含 frontmatter）</span></label>
+      <textarea id="skillBody" placeholder="---&#10;name: 写周报&#10;description: 把本周提交整理成周报&#10;---&#10;&#10;# 步骤&#10;1. …"></textarea>
+    </div>
+    <div class="actions">
+      <button class="small" id="saveSkill">保存技能</button>
+      <button class="ghost small" id="cancelSkill">取消</button>
+      <span class="muted small" id="skillEditorState"></span>
+    </div>
+  </div>
 </div>
 
 <div class="card">
@@ -404,7 +486,7 @@ const postJson = (path, body) =>
   })
 
 /** 生效配置与覆盖信息；load() 时刷新 */
-let state = { config: {}, modelStatus: {}, personas: {}, bindings: [] }
+let state = { config: {}, modelStatus: {}, personas: {}, bindings: [], tools: { list: [], disabled: [] }, skills: [] }
 
 /**
  * 写配置覆盖。null 表示清除该字段覆盖、回落到插件配置。
@@ -500,15 +582,33 @@ function renderPersonas() {
       const name = esc(p.name ?? '')
       const prompt = esc(p.prompt ?? '')
       const begin = esc(p.begin_dialogs ?? '')
+      // 工具白名单在存储里是数组，这里用逗号串编辑（更省事）
+      const tools = esc((p.tools ?? []).join(','))
+      const skills = esc((p.skills ?? []).join(','))
+      const customError = esc(p.custom_error_message ?? '')
       return '<div class="persona-item" data-index="' + i + '">' +
         '<div class="persona-head">' +
           '<input class="p-name" value="' + name + '" placeholder="名字（会话按它绑定，如 cat）" />' +
+          // 排序就是数组顺序（等价于 AstrBot 的 sort_order，但不用另存一个字段）。
+          // 第一项不能上移、最后一项不能下移，所以到边界就禁用，避免点了没反应
+          '<button class="ghost small p-up" data-index="' + i + '"' +
+            (i === 0 ? ' disabled' : '') + ' title="上移">↑</button>' +
+          '<button class="ghost small p-down" data-index="' + i + '"' +
+            (i === draftPersonas.length - 1 ? ' disabled' : '') + ' title="下移">↓</button>' +
           '<button class="ghost small p-del" data-index="' + i + '">删除</button>' +
         '</div>' +
         '<label class="lbl">人格提示词</label>' +
         '<textarea class="p-prompt" placeholder="这套人格的系统提示词">' + prompt + '</textarea>' +
         '<label class="lbl">开场对话 <span class="muted">（每行一句，user: / assistant: 开头）</span></label>' +
         '<textarea class="p-begin" placeholder="user: 你好&#10;assistant: 你好呀～">' + begin + '</textarea>' +
+        // 工具白名单：留空 = 不限。逗号分割比多选列表省事，
+        // 且这套人格的工具往往就两三个，手打比点选快
+        '<label class="lbl">可用工具 <span class="muted">（留空 = 不限；逗号分隔，如 time.now,web.fetch_page）</span></label>' +
+        '<input class="p-tools" value="' + tools + '" placeholder="留空表示这套人格可以用全部工具" />' +
+        '<label class="lbl">可见技能 <span class="muted">（留空 = 不限；逗号分隔技能 id）</span></label>' +
+        '<input class="p-skills" value="' + skills + '" placeholder="留空表示这套人格能看到全部技能" />' +
+        '<label class="lbl">出错时的回复 <span class="muted">（留空用通用文案）</span></label>' +
+        '<textarea class="p-error" placeholder="比如：我这会儿有点晕，稍后再问我一次吧">' + customError + '</textarea>' +
         '</div>'
     }).join('')
 
@@ -517,6 +617,43 @@ function renderPersonas() {
       item.querySelector('.p-name').addEventListener('input', (e) => { draftPersonas[i].name = e.target.value })
       item.querySelector('.p-prompt').addEventListener('input', (e) => { draftPersonas[i].prompt = e.target.value })
       item.querySelector('.p-begin').addEventListener('input', (e) => { draftPersonas[i].begin_dialogs = e.target.value })
+      item.querySelector('.p-tools').addEventListener('input', (e) => {
+        // 逗号/中文逗号/空格都当分隔符；空串要落成**空数组**而不是 undefined，
+        // 因为这两者含义相反（见 persona.ts 里 allowedTools 的说明）
+        draftPersonas[i].tools = e.target.value
+          .split(/[,，\s]+/)
+          .map((t) => t.trim())
+          .filter(Boolean)
+      })
+      item.querySelector('.p-skills').addEventListener('input', (e) => {
+        draftPersonas[i].skills = e.target.value
+          .split(/[,，\s]+/)
+          .map((t) => t.trim())
+          .filter(Boolean)
+      })
+      item.querySelector('.p-error').addEventListener('input', (e) => {
+        draftPersonas[i].custom_error_message = e.target.value
+      })
+    }
+    // 上移/下移：换位后整体重渲染。人格数量很少（个位数），
+    // 重渲染比原地操作 DOM 简单可靠得多
+    for (const btn of box.querySelectorAll('.p-up')) {
+      btn.addEventListener('click', () => {
+        const i = Number(btn.dataset.index)
+        if (i <= 0) return
+        ;[draftPersonas[i - 1], draftPersonas[i]] = [draftPersonas[i], draftPersonas[i - 1]]
+        pendingPersona = draftPersonas.map((p) => ({ ...p }))
+        renderPersonas()
+      })
+    }
+    for (const btn of box.querySelectorAll('.p-down')) {
+      btn.addEventListener('click', () => {
+        const i = Number(btn.dataset.index)
+        if (i < 0 || i >= draftPersonas.length - 1) return
+        ;[draftPersonas[i], draftPersonas[i + 1]] = [draftPersonas[i + 1], draftPersonas[i]]
+        pendingPersona = draftPersonas.map((p) => ({ ...p }))
+        renderPersonas()
+      })
     }
     for (const btn of box.querySelectorAll('.p-del')) {
       btn.addEventListener('click', () => {
@@ -733,6 +870,162 @@ function renderStats(rows) {
     '</tr>').join('')
 }
 
+/* ---------------------------------------------------------------- 工具栏 */
+
+/** 权限级别 → 人话。数字本身对运维没有意义，必须翻译 */
+const LEVEL_LABEL = {
+  0: '禁用',
+  1: '只读',
+  2: '写工作区',
+  3: '有副作用',
+  4: '群管理',
+  5: '需确认',
+}
+
+/** 副作用等级 → 标签样式。dangerous 最醒目 */
+const SIDE_EFFECT_TAG = {
+  none: null,
+  workspace_write: { text: '写工作区', cls: '' },
+  external_write: { text: '外部写', cls: 'warn' },
+  dangerous: { text: '危险', cls: 'danger' },
+}
+
+function renderTools(toolState) {
+  const list = toolState?.list ?? []
+  const disabled = new Set(toolState?.disabled ?? [])
+  $('toolCount').textContent = list.length
+    ? '(' + (list.length - disabled.size) + '/' + list.length + ' 已启用)'
+    : ''
+
+  if (!list.length) {
+    $('toolList').innerHTML =
+      '<div class="empty">没有可用工具。可能「工具调用」这个总开关被关掉了。</div>'
+    return
+  }
+
+  $('toolList').innerHTML = list.map((tool) => {
+    const off = disabled.has(tool.name)
+    const level = LEVEL_LABEL[tool.permission?.level] ?? String(tool.permission?.level ?? '')
+    const effect = SIDE_EFFECT_TAG[tool.sideEffect]
+    const scopes = (tool.permission?.scopes ?? []).map((scope) =>
+      '<span class="tag">' + esc(scope) + '</span>').join('')
+    const effectTag = effect
+      ? '<span class="tag ' + effect.cls + '">' + esc(effect.text) + '</span>'
+      : ''
+
+    return '<div class="tool-row' + (off ? ' off' : '') + '" data-tool="' + esc(tool.name) + '">' +
+      '<div class="tool-main">' +
+        '<div class="tool-name">' + esc(tool.name) + '</div>' +
+        '<div class="tool-meta">' + esc(tool.description || '') + '</div>' +
+        '<div class="tool-tags">' +
+          '<span class="tag">级别 ' + esc(level) + '</span>' +
+          effectTag + scopes +
+        '</div>' +
+      '</div>' +
+      '<input type="checkbox" class="tool-toggle" data-tool="' + esc(tool.name) + '"' +
+        (off ? '' : ' checked') +
+        ' title="' + (off ? '已关闭，点开启用' : '已启用，点掉关闭') + '" />' +
+    '</div>'
+  }).join('')
+}
+
+/** 勾掉/勾上之后立刻整批提交（工具开关是一组状态，逐个提交反而容易不一致） */
+async function saveToolToggle(name, enabled) {
+  const disabled = new Set(state.tools?.disabled ?? [])
+  if (enabled) disabled.delete(name)
+  else disabled.add(name)
+  try {
+    await postJson('/api/tools', { disabled: [...disabled] })
+    notify(enabled ? ('已启用 ' + name) : ('已关闭 ' + name), 'success')
+    await load()
+  } catch (e) {
+    notify('保存失败：' + e.message, 'error')
+    await load() // 失败要刷回真实值，否则勾选状态和实际不符
+  }
+}
+
+/* ---------------------------------------------------------------- 技能 */
+
+function renderSkills(skills) {
+  $('skillCount').textContent = skills?.length ? '(' + skills.length + ')' : ''
+
+  if (!skills?.length) {
+    $('skillList').innerHTML =
+      '<div class="empty">还没有技能。点「新增技能」写一份 SKILL.md —— ' +
+      '它能把你反复交代的做事流程固定下来，不用每轮都塞进系统提示词。</div>'
+    return
+  }
+
+  $('skillList').innerHTML = skills.map((skill) =>
+    '<div class="skill-item" data-skill="' + esc(skill.id) + '">' +
+      '<div class="skill-head">' +
+        '<span class="skill-id">' + esc(skill.id) + '</span>' +
+        '<span class="skill-name">' + esc(skill.name || '') + '</span>' +
+        '<span class="spacer"></span>' +
+        '<button class="ghost small skill-edit" data-skill="' + esc(skill.id) + '">编辑</button>' +
+        '<button class="ghost small skill-del" data-skill="' + esc(skill.id) + '">删除</button>' +
+      '</div>' +
+      '<div class="skill-desc">' + esc(skill.description || '') + '</div>' +
+    '</div>').join('')
+}
+
+/** 打开编辑器。id 传空 = 新增 */
+async function openSkillEditor(id) {
+  $('skillEditor').hidden = false
+  $('skillEditorState').textContent = ''
+  if (!id) {
+    $('skillId').value = ''
+    $('skillId').readOnly = false
+    // 这里是模板字符串里的转义：必须写双反斜杠，才能让浏览器收到字面的反斜杠加 n。
+    // 只写一个反斜杠会在构建时被求值成真换行，浏览器那边就成了非法字符串字面量。
+    $('skillBody').value = '---\\nname: \\ndescription: \\n---\\n\\n'
+    $('skillBody').focus()
+    return
+  }
+  // 列表里只有 id/name/description，正文要单独取——避免一次把所有 SKILL.md 拖下来
+  try {
+    const data = await get('/api/skills/' + encodeURIComponent(id))
+    $('skillId').value = id
+    // id 是主键，改了等于新建一条，容易误操作，所以编辑时锁住
+    $('skillId').readOnly = true
+    // 用服务端的**原始 SKILL.md**（含 frontmatter）。不要自己用
+    // name/description/instructions 拼——那样前端要重复一遍 Markdown 格式约定，
+    // 两边一旦不同步，就会出现「编辑一次就把 frontmatter 改坏」。
+    $('skillBody').value = data?.content ?? ''
+    $('skillBody').focus()
+  } catch (e) {
+    notify('读取技能失败：' + e.message, 'error')
+  }
+}
+
+async function saveSkillEditor() {
+  const id = $('skillId').value.trim()
+  const content = $('skillBody').value
+  if (!id) return notify('请填写技能 id', 'error')
+  if (!content.trim()) return notify('内容不能为空', 'error')
+  try {
+    await postJson('/api/skills', { id, content })
+    notify('技能已保存', 'success')
+    $('skillEditor').hidden = true
+    await load()
+  } catch (e) {
+    // 校验错误（id 非法 / 超 32KB / 缺 description）由服务端给出可读消息，
+    // 直接显示在编辑器里，比 toast 更容易边改边看
+    $('skillEditorState').innerHTML = '<span class="bad">' + esc(e.message) + '</span>'
+  }
+}
+
+async function deleteSkillById(id) {
+  if (!confirm('确定删除技能「' + id + '」？')) return
+  try {
+    await request('/api/skills/' + encodeURIComponent(id), { method: 'DELETE' })
+    notify('已删除 ' + id, 'success')
+    await load()
+  } catch (e) {
+    notify('删除失败：' + e.message, 'error')
+  }
+}
+
 async function load() {
   try {
     const data = await get('/api/overview')
@@ -741,6 +1034,8 @@ async function load() {
     renderPersonas()
     renderScalarFields()
     renderConversations()
+    renderTools(data.tools ?? { list: [], disabled: [] })
+    renderSkills(data.skills ?? [])
     renderSchedules(data.schedules ?? [])
     renderAudits(data.audits ?? [], data.config?.enable_audit)
     renderStats(data.stats ?? [])
@@ -832,6 +1127,28 @@ $('addPersona').addEventListener('click', () => {
 $('savePersonaList')?.addEventListener('click', savePersonas)
 $('convSearch').addEventListener('input', renderConversations)
 $('resetAll').addEventListener('click', resetAll)
+
+/* 工具栏：checkbox 用事件委托——列表是渲染出来的，绑不上固定 id。
+   而且每次 load() 都会重建 DOM，委托能避免重复绑定。 */
+$('toolList').addEventListener('change', (e) => {
+  const input = e.target
+  if (!input || !input.classList || !input.classList.contains('tool-toggle')) return
+  void saveToolToggle(input.dataset.tool, input.checked)
+})
+
+/* 技能：编辑 / 删除 也是委托 */
+$('skillList').addEventListener('click', (e) => {
+  const target = e.target
+  if (!target || !target.dataset) return
+  if (target.classList?.contains('skill-edit')) void openSkillEditor(target.dataset.skill)
+  if (target.classList?.contains('skill-del')) void deleteSkillById(target.dataset.skill)
+})
+$('addSkill').addEventListener('click', () => { void openSkillEditor() })
+$('saveSkill').addEventListener('click', () => { void saveSkillEditor() })
+$('cancelSkill').addEventListener('click', () => {
+  $('skillEditor').hidden = true
+  $('skillEditorState').textContent = ''
+})
 
 /** 静默保存（不弹成功提示，失败才提示） */
 async function saveScalarsSilently() {

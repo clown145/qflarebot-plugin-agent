@@ -33,8 +33,9 @@
  */
 import type { Logger } from '@qqbot/sdk'
 import { callLLM, LLMCallError } from '../llm/client.js'
+import { compactMessages, estimateMessagesTokens } from './context-size.js'
 import type { LLMService } from '../llm/contract.js'
-import type { ModelMessage } from '../types.js'
+import type { HistoryToolTrace, ModelMessage } from '../types.js'
 import { executeAgentToolCall } from './tool-executor.js'
 import type { ToolRegistry, ToolExecuteInput } from '../tools/registry.js'
 import { toModelTools } from '../tools/registry.js'
@@ -52,6 +53,17 @@ export interface LoopOptions {
   toolContext: Omit<ToolExecuteInput, 'input' | 'toolCallId'>
   /** 每步回调，用于可观测 */
   onStep?: (step: number) => Promise<void>
+  /**
+   * 上下文压缩配置。**每个模型步之前**都会检查一次（对标 AstrBot
+   * 的 `tool_loop_agent_runner.py` —— 它也是在每次 provider 调用前压，而不是每 run 一次）。
+   *
+   * 为什么必须在循环**内部**压：一轮 run 里工具可以来回收很多次，
+   * 工具结果不断堆进 messages，只在开头压一次等于没压。
+   */
+  compaction?: {
+    mode: 'off' | 'truncate'
+    maxTokens: number
+  }
 }
 
 export interface LoopResult {
@@ -62,6 +74,20 @@ export interface LoopResult {
   steps: number
   toolCalls: number
   usage: { inputTokens: number; outputTokens: number }
+  /** 本次 run 里压缩丢掉的轮数（0 = 没压）。排障用 */
+  compactedRounds: number
+  /** 最后一次模型调用后的上下文 token 估算，用于观察长会话是否逼近上限 */
+  contextTokens: number
+  /**
+   * 本次 run 调用过的工具摘要。
+   *
+   * 用途是**写进会话历史**，让模型下一轮知道「我上次调过什么、拿到什么」。
+   * 以前历史里只存纯文本，模型看不到自己的工具调用 → 容易重复调同一个工具。
+   *
+   * 只存截断后的摘要，不存完整结果：历史按条数占 DO storage 配额，
+   * 完整结果（可能几十 KB）会把配额吃光。
+   */
+  toolTraces: HistoryToolTrace[]
 }
 
 /** 步数或工具数用尽。照搬原文的 LoopLimitError 语义 */
@@ -108,10 +134,41 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   let repliedByTool = false
   let inputTokens = 0
   let outputTokens = 0
+  let compactedRounds = 0
+  let contextTokens = 0
+  const toolTraces: HistoryToolTrace[] = []
 
   for (let index = 0; index < maxModelSteps; index += 1) {
     steps = index + 1
     await options.onStep?.(steps)
+
+    // 每步之前压一次。工具结果会不断堆进 messages，只在装配时压一次等于没压。
+    //
+    // system 消息单独拎出来算 token：它每轮都在，但不能被丢。
+    const compaction = options.compaction
+    if (compaction && compaction.mode !== 'off') {
+      const systemMessages = messages.filter((m) => m.role === 'system')
+      const systemTokens = estimateMessagesTokens(systemMessages)
+      const nonSystem = messages.filter((m) => m.role !== 'system')
+      const compacted = compactMessages(nonSystem, {
+        maxTokens: compaction.maxTokens,
+        systemTokens,
+      })
+      if (compacted.droppedRounds > 0) {
+        compactedRounds += compacted.droppedRounds
+        // 就地替换：保持 system 在前
+        messages.length = 0
+        messages.push(...systemMessages, ...compacted.messages)
+        logger.info('上下文已压缩', {
+          droppedRounds: compacted.droppedRounds,
+          tokensBefore: compacted.tokensBefore,
+          tokensAfter: compacted.tokensAfter,
+        })
+      }
+      contextTokens = compacted.tokensAfter + systemTokens
+    } else {
+      contextTokens = estimateMessagesTokens(messages.filter((m) => m.role !== 'system'))
+    }
 
     const response = await callLLM(llm, {
       model,
@@ -138,6 +195,9 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         steps,
         toolCalls: toolCallLimit.usedToolCalls,
         usage: { inputTokens, outputTokens },
+        compactedRounds,
+        contextTokens,
+        toolTraces,
       }
     }
 
@@ -165,6 +225,9 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
 
       repliedByTool = repliedByTool || execution.sentMessage
 
+      // 记一条摘要进历史（截断，避免把 DO storage 配额吃光）
+      toolTraces.push(toToolTrace(toolCall.name, toolCall.arguments, execution.result))
+
       // 工具结果回填给模型
       messages.push(execution.resultMessage)
     }
@@ -173,6 +236,42 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   throw new LoopLimitError(
     `一次对话最多推理 ${maxModelSteps} 步，已经用完。可以让我少做几步，或者把任务拆开。`,
   )
+}
+
+/**
+ * 把一次工具调用压成一条可存历史的摘要。
+ *
+ * 为什么截断到 200 字符：历史在 DO storage 里按条数占配额，
+ * 一次 `web.fetch_page` 就可能返回几万字符。存全文会让 DO storage 迅速膨胀，
+ * 而模型真正需要知道的是「调过什么、大概拿到什么」。
+ */
+function toToolTrace(
+  name: string,
+  args: Record<string, unknown>,
+  result: import('../tools/types.js').ToolResult,
+): HistoryToolTrace {
+  const clip = (text: string): string => (text.length > 200 ? `${text.slice(0, 200)}…` : text)
+  let resultText: string
+  if (result.status === 'success') {
+    resultText = clip(safeJson(result.output))
+  } else {
+    resultText = `失败：${clip(result.error?.message ?? result.status)}`
+  }
+
+  return {
+    name,
+    args: clip(safeJson(args)),
+    result: resultText,
+    status: result.status,
+  }
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
+  }
 }
 
 /** 把 LLM 错误翻译成给用户看的文案。区分「能重试」和「重试也没用」 */

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildMessages, toHistoryRows } from './context.js'
+import { buildMessages, serializeToolTraces } from './context.js'
 import type { HistoryRow } from '../do/agent-object.js'
 import type { InboundMessage } from '../types.js'
 
@@ -70,22 +70,42 @@ describe('buildMessages', () => {
     expect(messages[1]).toEqual({ role: 'user', content: '第6条' })
   })
 
-  it('历史里 assistant 的工具调用要一起回放，否则模型看不到自己的调用记录', () => {
+  it('历史里的工具调用回放成正文说明（不伪造协议级 tool_calls）', () => {
     const history: HistoryRow[] = [
       { role: 'user', content: '查天气', toolCallsJson: null, createdAt: 1 },
       {
         role: 'assistant',
         content: '我查一下',
-        toolCallsJson: JSON.stringify([{ id: 'c1', name: 'http.request', arguments: { url: 'x' } }]),
+        toolCallsJson: JSON.stringify([
+          { name: 'http.request', args: '{"url":"x"}', result: '{"ok":true}', status: 'success' },
+        ]),
         createdAt: 2,
       },
     ]
     const messages = buildMessages(message(), history, baseOptions)
     const assistant = messages.find((m) => m.role === 'assistant')
     expect(assistant).toBeDefined()
-    expect(assistant && 'toolCalls' in assistant ? assistant.toolCalls : undefined).toEqual([
-      { id: 'c1', name: 'http.request', arguments: { url: 'x' } },
-    ])
+    // 不再还原成协议级 toolCalls：历史里存的是截断过的摘要，还原成协议消息
+    // 会让模型误以为拿到完整结果。改为在正文里说明上一轮调过什么。
+    const content = assistant && typeof assistant.content === 'string' ? assistant.content : ''
+    expect(content).toContain('我查一下')
+    expect(content).toContain('http.request')
+    expect(content).toContain('上一轮调用过的工具')
+  })
+
+  it('历史里的老格式 ModelToolCall 也能读出（向后兼容）', () => {
+    const history: HistoryRow[] = [
+      {
+        role: 'assistant',
+        content: '旧数据',
+        toolCallsJson: JSON.stringify([{ id: 'c1', name: 'http.request', arguments: { url: 'x' } }]),
+        createdAt: 1,
+      },
+    ]
+    const messages = buildMessages(message(), history, baseOptions)
+    const assistant = messages.find((m) => m.role === 'assistant')
+    const content = assistant && typeof assistant.content === 'string' ? assistant.content : ''
+    expect(content).toContain('http.request')
   })
 
   it('历史里坏掉的 toolCallsJson 不会让整个对话失败', () => {
@@ -94,7 +114,8 @@ describe('buildMessages', () => {
     ]
     const messages = buildMessages(message(), history, baseOptions)
     const assistant = messages.find((m) => m.role === 'assistant')
-    expect(assistant && 'toolCalls' in assistant ? assistant.toolCalls : undefined).toBeUndefined()
+    // 读不懂就当没有工具调用，正文原样保留
+    expect(assistant).toEqual({ role: 'assistant', content: '坏的' })
   })
 
   it('模型不支持图片时，图片退回成正文里的地址说明', () => {
@@ -127,24 +148,16 @@ describe('buildMessages', () => {
   })
 })
 
-describe('toHistoryRows', () => {
-  it('生成 user + assistant 两行，时间戳递增保证顺序', () => {
-    const rows = toHistoryRows('问题', '回答', [])
-    expect(rows).toHaveLength(2)
-    expect(rows[0]?.role).toBe('user')
-    expect(rows[1]?.role).toBe('assistant')
-    expect(rows[1]!.createdAt).toBeGreaterThan(rows[0]!.createdAt)
-  })
-
-  it('有工具调用时序列化进 toolCallsJson', () => {
-    const rows = toHistoryRows('问题', '回答', [
-      { id: 'c1', name: 'time.now', arguments: {} },
+describe('serializeToolTraces', () => {
+  it('有工具调用时序列化成 JSON', () => {
+    const json = serializeToolTraces([
+      { name: 'time.now', args: '{}', result: '{"now":"..."}', status: 'success' },
     ])
-    expect(rows[1]?.toolCallsJson).toContain('time.now')
+    expect(json).toContain('time.now')
   })
 
-  it('没有工具调用时 toolCallsJson 是 null，不是 "[]"', () => {
-    const rows = toHistoryRows('问题', '回答', [])
-    expect(rows[1]?.toolCallsJson).toBeNull()
+  it('没有工具调用时返回 null，不是 "[]"', () => {
+    // 存 "[]" 会让历史回放误以为「有工具调用但结果为空」
+    expect(serializeToolTraces([])).toBeNull()
   })
 })

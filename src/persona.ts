@@ -51,7 +51,7 @@ export function parseBeginDialogs(text: string | undefined): BeginDialogTurn[] {
   for (const raw of text.split('\n')) {
     const line = raw.trim()
     if (!line) continue
-    const match = /^(user|assistant|系统|assistant|助手)\s*[:：]\s*(.*)$/i.exec(line)
+    const match = /^(user|assistant|系统|助手)\s*[:：]\s*(.*)$/i.exec(line)
     if (match) {
       const role = match[1]!.toLowerCase()
       const isUser = role === 'user' || role === '系统'
@@ -59,29 +59,105 @@ export function parseBeginDialogs(text: string | undefined): BeginDialogTurn[] {
       if (content) turns.push({ role: isUser ? 'user' : 'assistant', content })
       continue
     }
+    // 没写前缀的行归给 user：写配置时省一堆「user: 」
     turns.push({ role: 'user', content: line })
   }
-  return turns
+  return finalizeBeginDialogs(turns)
+}
+
+/**
+ * 收尾校正。对标 AstrBot 的 `begin_dialogs` 约定：
+ *
+ * 1. **必须是偶数条**（一 user 一 assistant 成对）。AstrBot 遇到奇数条
+ *    会记 error 并**整段丢弃**（`persona_mgr.py:396-403`）。
+ *    这里不整段丢——那对用户太狠，写歪一行就全没了。
+ *    改成**丢掉最后一条落单的**，前面的成对部分照常生效。
+ * 2. **必须以 user 开头**。以 assistant 开头等于模型先说话，
+ *    历史回放时和本轮 user 消息的顺序会变得很怪；AstrBot 靠「第一条固定
+ *    是 user」保证这点（`user_turn = True` 起手）。这里直接丢掉开头的
+ *    assistant，直到遇到 user。
+ *
+ * 这两种情况都是「配置写歪了」，所以只做最小修正、不抛错：
+ * 人格开场白是锦上添花，写坏了不该让整轮对话失败。
+ */
+function finalizeBeginDialogs(turns: BeginDialogTurn[]): BeginDialogTurn[] {
+  let start = 0
+  while (start < turns.length && turns[start]!.role !== 'user') start += 1
+  const trimmed = turns.slice(start)
+  // 落单的最后一条丢掉（奇数时）
+  if (trimmed.length % 2 !== 0) trimmed.pop()
+  return trimmed
+}
+
+export interface ResolvedPersona {
+  /** 生效的人格名；没有可用人格时为 undefined */
+  name: string | undefined
+  /** 拼进系统提示词的人格段落；没有则 undefined */
+  prompt: string | undefined
+  beginDialogs: BeginDialogTurn[]
+  /**
+   * 这套人格允许的工具白名单。`undefined` = 不限。
+   *
+   * 空数组是有意义的：它表示「这套人格什么工具都不能用」，
+   * 与 `undefined`（不限）**含义相反**，所以这里不能用 `?? []` 糊过去
+   * （AstrBot 的注释也特意点了这一条：`None` 是全部，空列表是都没有）。
+   */
+  allowedTools: string[] | undefined
+  /**
+   * 这套人格可见的技能白名单。`undefined` = 不限。
+   *
+   * 与 `allowedTools` 同构，也**同样严格区分 `undefined` 与 `[]`**：
+   * 前者是全部可见，后者是一个都看不到（AstrBot 的 `Persona.skills` 也是这个语义）。
+   */
+  allowedSkills: string[] | undefined
+  /** 出错时的自定义回复；undefined 用通用文案 */
+  customErrorMessage: string | undefined
 }
 
 /**
  * 决定这个会话该用哪套人格 / 提示词。
  *
- * 返回 `prompt` 与 `beginDialogs`；没有可用人格时 `prompt` 为 undefined，
- * 调用方继续用 `system_prompt`（内置默认人格）。
+ * ## 人格提示词是「追加」还是「替换」—— 这里刻意跟 AstrBot 一致
+ *
+ * AstrBot 的做法是（`astr_main_agent.py`）：
+ *
+ * ```python
+ * req.system_prompt += f"\n# Persona Instructions\n\n{prompt}\n"
+ * ```
+ *
+ * 也就是**追加到基础系统提示词后面**，而不是替换它。这个差别很关键：
+ * 基础提示词里有一堆运行时约定（当前时间、当前会话、工具使用规范、
+ * 回复格式「纯文本不要 Markdown」），替换掉就全丢了 ——
+ * 模型会开始输出 Markdown、不知道现在几点、也不知道有工具。
+ *
+ * 早期这里用的是 `persona.prompt ?? config.system_prompt`（替换），
+ * 结果配了人格就丢掉了全部运行时信息。现在改为追加：
+ * 基础提示词 + 人格段落。
+ *
+ * 没有可用人格时返回 `prompt: undefined`，调用方就只用基础提示词。
  */
-export function resolvePersona(
-  config: AgentConfig,
-  bound: string | undefined,
-): { name: string | undefined; prompt: string | undefined; beginDialogs: BeginDialogTurn[] } {
+export function resolvePersona(config: AgentConfig, bound: string | undefined): ResolvedPersona {
   // 会话绑定优先；**绑的那套被删掉时回落到默认人格**（而不是直接放弃）。
   // 这样用户在设置里删掉一套人格，不会让已经绑过它的会话突然失去人格。
   const persona = findPersona(config, bound) ?? findPersona(config, config.default_persona)
-  if (!persona) return { name: undefined, prompt: undefined, beginDialogs: [] }
+  if (!persona) {
+    return {
+      name: undefined,
+      prompt: undefined,
+      beginDialogs: [],
+      allowedTools: undefined,
+      allowedSkills: undefined,
+      customErrorMessage: undefined,
+    }
+  }
   return {
     name: persona.name,
     prompt: persona.prompt?.trim() || undefined,
     beginDialogs: parseBeginDialogs(persona.begin_dialogs),
+    // 没有这个字段 = 不限（老配置的语义）
+    allowedTools: persona.tools ? [...persona.tools] : undefined,
+    allowedSkills: persona.skills ? [...persona.skills] : undefined,
+    customErrorMessage: persona.custom_error_message?.trim() || undefined,
   }
 }
 

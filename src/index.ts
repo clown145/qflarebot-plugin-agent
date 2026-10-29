@@ -36,6 +36,7 @@ import { decideWake } from './agent/wake.js'
 import { resolveConfig } from './effective-config.js'
 import { getPersonaBinding, setPersonaBinding } from './persona.js'
 import { hydrateImageAttachments } from './agent/media.js'
+import { BLOCKED_REPLY, checkContent, parseKeywords } from './agent/safety.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
 import {
   advanceSchedule,
@@ -45,6 +46,7 @@ import {
   pruneToolAudit,
 } from './store/d1.js'
 import { createPageRoutes } from './routes.js'
+import { getSkill, listSkills } from './skills/store.js'
 
 export { Agent }
 
@@ -126,6 +128,9 @@ export default definePlugin<AgentConfig>({
 
     'agent reset': {
       description: '清空当前会话的记忆',
+      // **破坏性操作，必须有门槛**：不声明就是 `member`，群里任何人
+      // 都能把整个群的记忆清掉。清空是单会话范围内不可逆的。
+      permission: 'group_admin',
       async handler({ session, ctx }) {
         const stub = agentStub(ctx, conversationKey(session))
         await stub.reset()
@@ -164,6 +169,10 @@ export default definePlugin<AgentConfig>({
     },
 
     'agent persona': {
+      // 人格是**整群共享**的（绑定在 conversation 上），改它会影响群里所有人，
+      // 所以和 reset 一样限群管理员。查询（不带参数）其实人人无害，
+      // 但一条命令只有一个门槛，用「能改」的那档更安全。
+      permission: 'group_admin',
       description: '查看或切换本会话的人格',
       usage: '/agent persona [名字]',
       async handler({ session, ctx, argText }) {
@@ -232,6 +241,57 @@ export default definePlugin<AgentConfig>({
           `步数上限：${cfg.max_model_steps}`,
         ]
         return lines.join('\n')
+      },
+    },
+
+    /**
+     * 技能：列目录 / 查看 / 激活。
+     *
+     * **激活的实际作用点不在这里**：真正的注入发生在 `runLoopOnce` 里，
+     * 它读原始消息文本、匹配 `/skill <id> <任务>`，然后把技能正文塞进系统提示词。
+     * 这条命令负责「列」和「看」，以及在不带任务时给出用法提示——
+     * 因为走命令路径时那句话不会再进模型，光靠 runLoopOnce 是触发不到的。
+     */
+    'agent skill': {
+      description: '查看可用技能，或激活一个技能',
+      usage: '/agent skill [<id> [任务]]',
+      async handler({ ctx, argText }) {
+        if (!(await resolveConfig(ctx)).enable_skills) {
+          return '技能功能没开。请先在插件配置里打开「启用技能」。'
+        }
+        const arg = argText.trim()
+
+        // 不带参数：列目录（与注入给模型的目录同源）
+        if (!arg) {
+          const skills = await listSkills(ctx.db).catch(() => [])
+          if (skills.length === 0) return '还没有配置任何技能。可以在插件页面里添加。'
+          return [
+            '可用技能：',
+            ...skills.map((skill) => `- ${skill.id}: ${skill.description}`),
+            '',
+            '激活：/skill <id> <任务>',
+          ].join('\n')
+        }
+
+        // 带 id 但没有任务：只展示这份技能的说明，不激活
+        const [id, ...rest] = arg.split(/\s+/)
+        const task = rest.join(' ').trim()
+        try {
+          const skill = await getSkill(ctx.db, id ?? '')
+          if (!skill) return `没有找到技能「${id}」。`
+          if (!task) {
+            return [
+              `技能：${skill.metadata.name}（${skill.id}）`,
+              skill.metadata.description,
+              '',
+              '用它：/skill ' + skill.id + ' <你的任务>',
+            ].join('\n')
+          }
+          // 带任务：提示用户改用聊天路径（那里才会真正注入正文）
+          return `请直接发：/@我 /skill ${skill.id} ${task}`
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error)
+        }
       },
     },
   },
@@ -344,16 +404,35 @@ async function onChatMessage({
   ctx.logger.debug('唤醒 Agent', { reason: decision.reason, scene: session.scene })
 
   // 唤醒前缀已经剥掉（例如「/你好」→「你好」），不能再让 handleMessage 去猜
-  await handleMessage(session, ctx, decision.text)
+  await handleMessage(session, ctx, decision.text, config)
 }
 
 async function handleMessage(
   session: Session,
   ctx: PluginContext<AgentConfig>,
   text: string,
+  resolvedConfig?: AgentConfig,
 ): Promise<void> {
   const logger = ctx.logger
-  const config = await resolveConfig(ctx)
+  const config = resolvedConfig ?? (await resolveConfig(ctx))
+
+  // 内容安全（入站）。放在最前面：命中的消息不该花掉一次 LLM 调用，
+  // 也不该进队列占住会话。对标 AstrBot 的 ContentSafetyCheckStage。
+  //
+  // 这是**零成本**护栏：纯文本匹配，没有额外请求、没有额外存储。
+  const keywords = parseKeywords(config.content_filter_keywords)
+  if (keywords.length > 0) {
+    const check = checkContent(text, keywords)
+    if (check.blocked) {
+      logger.warn('入站内容命中安全关键词，已拒绝', {
+        conversation: conversationKey(session),
+        // 日志里记命中的词便于运维排查，但不回给用户（否则等于交出规则）
+        matched: check.matched,
+      })
+      await session.reply(BLOCKED_REPLY).catch(() => false)
+      return
+    }
+  }
 
   // 依赖没满足时给用户一句能看懂的话，而不是让框架抛 "没有在 depends 中声明" 这类内部错误。
   // 正常情况下安装时就被拦下了（depends: { llm: '*' }），但提供者可能事后被停用或卸载
@@ -395,7 +474,25 @@ async function handleMessage(
     void session.typing(10).catch(() => false)
   }
 
-  const claimed = await stub.submit(message)
+  const claimed = await stub.submit(message, {
+    perMinute: config.rate_limit_per_minute,
+  })
+
+  // 被频率限制：明确告知用户，而不是静默丢弃。
+  //
+  // AstrBot 的默认策略是 `stall`（await sleep 等窗口过去），那在 Worker 里会吃光
+  // 30 秒事件预算然后**用户什么都收不到** —— 比拒绝回复更糟。所以这里只用
+  // 「回一句然后放弃」这一种策略。
+  if (claimed.rateLimited) {
+    const seconds = Math.max(1, Math.ceil(claimed.rateLimited.retryAfterMs / 1000))
+    logger.info('触发频率限制，已拒绝', {
+      conversation: message.conversation,
+      retryAfterMs: claimed.rateLimited.retryAfterMs,
+    })
+    await reply(`说得有点快，等 ${seconds} 秒再继续吧。`).catch(() => false)
+    return
+  }
+
   if (!claimed.acquired || !claimed.runId) {
     // 这个会话已经有人在跑，run 进了队列，**静默排队**。
     //
@@ -522,6 +619,11 @@ async function serviceConversationObjects(
   let llm: LLMService | null = null
   let llmChecked = false
 
+  // 生效配置读一次就够一轮（管理页覆盖是全局的，不是按会话）。
+  // 用 resolveConfig 而不是 ctx.config，原因见下面 executeRun 处的注释。
+  // 懒加载：如果一个滞留 run 都没有，这次 cron 就不该多读一次 KV。
+  let resumeConfig: AgentConfig | null = null
+
   for (const conversation of known) {
     // 超预算就放弃剩下的会话，下一轮 cron 接着来——宁可晚 10 分钟恢复，
     // 也不能把同一个 invocation 里别的插件的定时任务拖到超时
@@ -548,8 +650,13 @@ async function serviceConversationObjects(
 
       const message = picked.claimed.message
       const reply = makeApiReply(ctx, message)
+      // **必须用 resolveConfig 而不是 ctx.config**：管理页改的模型/限额/人格
+      // 存在 KV 覆盖层里（见 effective-config.ts），`ctx.config` 只是面板配置的
+      // 权威默认值。用 ctx.config 会让「被 cron 捡回来的 run」退回旧模型——用户在
+      // 页面把模型从 chat 切到别的，正常消息走新模型，恢复的那条却走旧的。
+      resumeConfig ??= await resolveConfig(ctx)
       await executeRun(
-        { ctx, logger: ctx.logger, config: ctx.config, llm, agent: stub, reply },
+        { ctx, logger: ctx.logger, config: resumeConfig, llm, agent: stub, reply },
         picked.claimed.runId,
         message,
       )
@@ -657,7 +764,16 @@ async function maybePruneAudit(
 // ---------------------------------------------------------------- 工具函数
 
 type AgentStub = {
-  submit(message: InboundMessage): Promise<{ acquired: boolean; runId?: string; message?: InboundMessage; retryAfterMs?: number }>
+  submit(
+    message: InboundMessage,
+    rateLimit?: { perMinute: number },
+  ): Promise<{
+    acquired: boolean
+    runId?: string
+    message?: InboundMessage
+    retryAfterMs?: number
+    rateLimited?: { retryAfterMs: number }
+  }>
   history(limit: number): Promise<HistoryRow[]>
   release(runId: string, result: { ok: boolean; error?: string; history?: HistoryRow[] }): Promise<void>
   retryLater(runId: string, reason: string): Promise<void>

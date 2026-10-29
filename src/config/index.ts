@@ -20,6 +20,45 @@ export interface PersonaConfig {
    * 形如 `user: …` / `assistant: …` 的纯文本行，见 persona.ts 的解析。
    */
   begin_dialogs: string
+
+  /**
+   * 这套人格允许用的工具（AstrBot Persona.tools 的对应物）。
+   *
+   * **留空 = 不限**（用全局工具集）；写了就是白名单，只有名单里的能用。
+   * 为什么需要它：同一台机器人上，「客服人格」不该能发 HTTP 请求，
+   * 而「运维人格」需要。以前只能全局开关工具，没法按人格区分。
+   *
+   * 注意这不替代权限层：白名单只是**收窄**，具体某个工具能不能真跑
+   * 仍然由权限级别 + scope 决定（两道关卡叠加）。
+   *
+   * **可选**：老配置里没有这个字段，缺省视为「不限」。
+   */
+  tools?: string[]
+
+  /**
+   * 这套人格可见的技能（AstrBot Persona.skills 的对应物）。
+   *
+   * **留空 = 不限**（用全局技能目录）；写了就是白名单；`[]` = 一个都不给。
+   *
+   * 与 `tools` 同构，也对齐 AstrBot 的语义（`po.py:169-170`）：
+   * `None` 是全部，空列表是都没有。
+   *
+   * 为什么要按人格限制技能：技能目录每轮都进上下文，一台机器人挂十几套技能时
+   * 「客服人格」不该看到「运维手册」—— 既省 token，也避免模型激活错技能。
+   *
+   * **只影响可见性**：被挡掉的技能进不了目录，用户即使手动 `/skill <id>` 也激活不了。
+   */
+  skills?: string[]
+
+  /**
+   * 出错时给用户的回复（AstrBot Persona.custom_error_message）。
+   *
+   * 留空则用默认的通用错误文案。人格化的错误提示能让「这个角色」一致 ——
+   * 一个毒舌角色突然冒出「处理失败：HTTP 500」会很出戏。
+   *
+   * **可选**：老配置里没有，缺省用通用文案。
+   */
+  custom_error_message?: string
 }
 
 export interface AgentConfig {
@@ -80,6 +119,14 @@ export interface AgentConfig {
   /** 动态定时任务（LLM 可自己建提醒） */
   enable_schedule: boolean
 
+  /**
+   * 技能（Skills）。打开后每轮会给模型一份技能目录（≤40 行），
+   * 用户显式 `/skill <id> <任务>` 时才注入该技能的完整正文。
+   *
+   * 默认关：没配任何技能时这份目录是空的，开着只是多一次 D1 查询。
+   */
+  enable_skills: boolean
+
   /** 是否把工具调用记进 D1（排障用，吃额度，默认关） */
   enable_audit: boolean
 
@@ -88,6 +135,45 @@ export interface AgentConfig {
 
   /** 时区，用于 time 工具与提示词 */
   timezone: string
+
+  /**
+   * 上下文压缩模式（对标 AstrBot 的 `context_compression`）。
+   *
+   * - `off`：不压缩，只按 `history_limit` 截断。
+   * - `truncate`：丢掉最老的整轮。**零额外模型调用、零额外存储写入**，纯内存计算。
+   * - `summary`：把丢掉的旧轮交给模型摘要，摘要存 DO。每压一次多一次模型调用。
+   *
+   * 默认 `truncate`：它能挡住长会话的成本爆炸，且不花任何额度。
+   */
+  context_compression: 'off' | 'truncate' | 'summary'
+
+  /**
+   * 触发压缩的 token 估算阈值（对标 AstrBot 的 `max_context_tokens` 与 0.82 水位）。
+   *
+   * 不需要精确：这是个**估算**，真实 usage 由 provider 返回、会覆盖估算值
+   * （见 context-size.ts 的注释）。设小会压得勤，设大会更贵。
+   */
+  max_context_tokens: number
+
+  /** 每个会话每分钟最多触发几次 run（0 = 不限）。防单人刷屏烧 token */
+  rate_limit_per_minute: number
+
+  /**
+   * Tavily 搜索 API Key。留空时 `search.web` 仍然注册，但会返回
+   * 「未配置搜索」的可读错误——模型不会反复重试，用户也能看懂要配什么。
+   *
+   * 为什么不做成明文外的别的形式：插件没有 secret 存储，面板配置是唯一入口。
+   * 这个 key 只用于搜索，泄露影响面有限；真要更严可以改成只读别的插件提供的服务。
+   */
+  search_api_key: string
+
+  /**
+   * 纯文本关键词内容安全（逗号分隔）。
+   *
+   * 命中即拒绝，不发模型。这是最便宜的护栏：零外部依赖、零额外请求。
+   * 空字符串 = 关闭。对标 AstrBot 的 `content_safety_check` 的 keywords 策略。
+   */
+  content_filter_keywords: string
 }
 
 export const DEFAULT_SYSTEM_PROMPT = [
@@ -111,9 +197,15 @@ export const defaultConfig: AgentConfig = {
   enable_tools: true,
   enable_vfs: false,
   enable_schedule: false,
+  enable_skills: false,
   enable_audit: false,
   show_typing: true,
   timezone: 'Asia/Shanghai',
+  context_compression: 'truncate',
+  max_context_tokens: 12000,
+  rate_limit_per_minute: 10,
+  search_api_key: '',
+  content_filter_keywords: '',
 }
 
 /** 面板渲染用的 JSON Schema。与 defaultConfig 一一对应 */
@@ -181,6 +273,13 @@ export const configSchema = {
       description: '模型可以自己创建提醒。需要机器人开启每分钟 cron',
       default: defaultConfig.enable_schedule,
     },
+    enable_skills: {
+      type: 'boolean',
+      title: '启用技能',
+      description:
+        '模型可以在对话里用 `/skill <id> <任务>` 激活技能。目录每轮只占几行，技能正文只在激活时载入',
+      default: defaultConfig.enable_skills,
+    },
     enable_audit: {
       type: 'boolean',
       title: '记录工具调用',
@@ -220,6 +319,28 @@ export const configSchema = {
               '每轮插在历史最前面，用来锚定风格。每行一句，以 `user:` / `assistant:` 开头，例如：\nuser: 你好\nassistant: 你好呀～',
             default: '',
           },
+          tools: {
+            type: 'array',
+            title: '可用工具',
+            description:
+              '留空 = 不限（用全局工具集）；填了就是白名单，只有这些工具能被这套人格使用。不能突破权限层',
+            items: { type: 'string' },
+            default: [],
+          },
+          skills: {
+            type: 'array',
+            title: '可见技能',
+            description: '留空 = 不限（全部技能都可见）；填了就是白名单；空列表表示一个都看不到',
+            items: { type: 'string' },
+            default: [],
+          },
+          custom_error_message: {
+            type: 'string',
+            format: 'textarea',
+            title: '出错时的回复',
+            description: '留空用通用错误文案。人格化回复能让出错时也不出戏',
+            default: '',
+          },
         },
       },
       default: [],
@@ -253,6 +374,45 @@ export const configSchema = {
       type: 'string',
       title: '时区',
       default: defaultConfig.timezone,
+    },
+    context_compression: {
+      type: 'string',
+      enum: ['off', 'truncate', 'summary'],
+      title: '上下文压缩',
+      description:
+        '长会话怎么处理旧记录。`truncate` = 丢掉最老的整轮（零额外模型调用）；`summary` = 让模型摘要旧轮（每次多一次调用）；`off` = 只按历史条数截断',
+      default: defaultConfig.context_compression,
+    },
+    max_context_tokens: {
+      type: 'integer',
+      title: '压缩触发的 token 阈值',
+      description:
+        '估算值超过这个数就开始压缩。这是估算，真实用量由模型返回后覆盖。建议 8000–20000',
+      minimum: 1000,
+      maximum: 200000,
+      default: defaultConfig.max_context_tokens,
+    },
+    rate_limit_per_minute: {
+      type: 'integer',
+      title: '每会话每分钟最多几次对话',
+      description: '防止单人刷屏烧 token。0 = 不限制。被限时用户会收到一句提示',
+      minimum: 0,
+      maximum: 100,
+      default: defaultConfig.rate_limit_per_minute,
+    },
+    content_filter_keywords: {
+      type: 'string',
+      title: '内容安全关键词',
+      description:
+        '命中即拒绝、不发模型（逗号分隔）。留空 = 关闭。零外部依赖，只做纯文本匹配',
+      default: defaultConfig.content_filter_keywords,
+    },
+    search_api_key: {
+      type: 'string',
+      title: '联网搜索 API Key（Tavily）',
+      description:
+        '留空时搜索工具仍然存在，但会告诉用户「还没配置搜索」。填了之后模型才能真的联网查资料',
+      default: defaultConfig.search_api_key,
     },
   },
 } as const

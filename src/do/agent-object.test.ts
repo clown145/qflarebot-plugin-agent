@@ -256,12 +256,14 @@ describe('Agent.history', () => {
     expect(recent[2]?.content).toBe('第9条')
   })
 
-  it('超过 60 条时裁掉最旧的（DO storage 没有 TTL）', async () => {
+  // 上限从 60 提到 120：60 会让 `history_limit` 配到 61–100 时静默失效
+  // （配置说 100 条，DO 只留 60 条，且没有任何地方报错）。上限必须 >= 100。
+  it('超过 120 条时裁掉最旧的（DO storage 没有 TTL）', async () => {
     const { obj } = makeObject()
     const { runId } = await obj.submit(message())
     await obj.release(runId!, {
       ok: true,
-      history: Array.from({ length: 70 }, (_, i) => ({
+      history: Array.from({ length: 130 }, (_, i) => ({
         role: 'user' as const,
         content: `第${i}条`,
         toolCallsJson: null,
@@ -270,9 +272,9 @@ describe('Agent.history', () => {
     })
 
     const all = await obj.history(1000)
-    expect(all).toHaveLength(60)
-    // 保留的是最新的 60 条
-    expect(all.at(-1)?.content).toBe('第69条')
+    expect(all).toHaveLength(120)
+    // 保留的是最新的 120 条
+    expect(all.at(-1)?.content).toBe('第129条')
   })
 })
 
