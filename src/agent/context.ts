@@ -13,6 +13,7 @@
 import type { HistoryRow } from '../do/agent-object.js'
 import type { InboundMessage, ModelContent, ModelContentPart, ModelMessage, ModelToolCall } from '../types.js'
 import { DEFAULT_SYSTEM_PROMPT } from '../config/index.js'
+import type { BeginDialogTurn } from '../persona.js'
 
 export interface ContextOptions {
   systemPrompt?: string
@@ -21,6 +22,13 @@ export interface ContextOptions {
   historyLimit: number
   /** 模型是否支持图片输入 */
   supportsVision: boolean
+  /**
+   * 人格的开场对话（AstrBot 的 begin_dialogs）。
+   *
+   * 插在**历史之前**（与 AstrBot 的 `req.contexts[:0] = begin_dialogs` 一致），
+   * 每轮都会带上：它的作用不是记忆，而是给模型看「这个角色平时怎么说话」。
+   */
+  beginDialogs?: BeginDialogTurn[]
 }
 
 export function buildMessages(
@@ -31,6 +39,11 @@ export function buildMessages(
   const messages: ModelMessage[] = [
     { role: 'system', content: buildSystemPrompt(options.systemPrompt, options.timezone, message) },
   ]
+
+  // 开场对话：插在历史最前，每轮都带（锚定说话风格，不属于会话记忆）
+  for (const turn of options.beginDialogs ?? []) {
+    messages.push({ role: turn.role, content: turn.content })
+  }
 
   // 历史：只取最近 N 条。条数越多越贵，history_limit 默认 20
   const recent = options.historyLimit > 0 ? history.slice(-options.historyLimit) : []

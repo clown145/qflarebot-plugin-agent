@@ -12,6 +12,39 @@ QFlareBot 的 Agent 插件：带工具调用的多轮对话、会话记忆、联
 - **工具调用**：模型可以联网查资料、发 HTTP 请求、看时间、读写工作区文件、建定时任务。每类工具都有独立的权限级别。
 - **群聊/单聊都能用**：群里 @机器人 直接说话，不用打命令。
 
+## 什么时候会回复（唤醒）
+
+对标 AstrBot 的 waking check：**群里 @机器人 说人话就会回复，不需要打指令**。
+没命中任何指令的消息走 Agent，命中指令的走指令——两者天然互斥（命令默认 `block`）。
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `wake_mode` | `at` | 群聊触发方式：`at`（仅 @）/ `at_or_prefix`（@、前缀、或引用机器人）/ `all`（群里所有消息，需群主在 QQ 里给机器人开「接收全部消息」） |
+| `wake_prefix` | `/` | `at_or_prefix` 模式下以此开头的消息也算唤醒 |
+| `friend_needs_wake_prefix` | 关 | 单聊默认任何消息都触发；打开后单聊也要带前缀 |
+| `command_prefixes` | `/` | 以此开头的消息交给指令，不会当聊天发给模型 |
+
+> `all` 模式依赖 QQ 平台能力：群主必须给机器人开启「接收全部消息」，否则平台不推送非 @ 消息，
+> 插件收不到也就谈不上唤醒。这是平台限制，不是配置问题。
+
+## 人格（persona）
+
+多套人格并存，按会话绑定（对标 AstrBot 的 persona）：
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `personas` | 空 | 每套含 `name`（绑定标识）、`prompt`（系统提示词）、`begin_dialogs`（开场对话） |
+| `default_persona` | 空 | 会话没绑定时用哪套；留空则用 `system_prompt` |
+
+优先级：**会话绑定 > `default_persona` > `system_prompt`**。绑定的那套被删掉时会回落，
+不会让会话突然失去人格。
+
+`begin_dialogs` 是 AstrBot 的同名字段：每轮插在历史最前面、用来锚定说话风格（不属于会话记忆），
+每行一句，`user:` / `assistant:` 开头。
+
+会话级别用 `/agent persona <名字>` 切换，或在插件管理页「会话与人格」里改（宿主面板只管插件配置，
+管不到「哪个会话用了哪套人格」，所以那部分在插件自己的页面里）。
+
 ## 它不做什么
 
 - 不含模型接入。供应商、API Key、模型别名都在「LLM 接口」插件里配。
@@ -132,6 +165,8 @@ D1 里的 `{policies}` 表可以按 user / role / conversation / platform 叠加
 | --- | --- |
 | `/agent <问题>` | 问 Agent。群里 @机器人 直接说话也行 |
 | `/agent reset` | 清空当前会话记忆 |
+| `/agent persona` | 查看本会话的人格与可选列表 |
+| `/agent persona <名字>` | 切换本会话的人格；`/agent persona off` 清除绑定 |
 | `/agent status` | 查看模型别名、可用模型、开关状态 |
 | `/agent schedule` | 查看本会话的定时任务 |
 | `/agent schedule cancel <id>` | 取消本会话的一个定时任务 |

@@ -86,4 +86,13 @@ export const SCHEMA_STATEMENTS = [
      input_tokens INTEGER NOT NULL DEFAULT 0,
      output_tokens INTEGER NOT NULL DEFAULT 0
    ) WITHOUT ROWID`,
+
+  // 会话级设置：目前只有「绑定了哪套人格」。
+  // 放 D1 而不是 DO：管理页要跨会话列出「哪些会话绑了哪套人格」，
+  // 而 DO 里的历史只有该会话自己能读。写入量极小（只在切换人格时写一行）。
+  `CREATE TABLE IF NOT EXISTS {conversations} (
+     conversation TEXT PRIMARY KEY,
+     persona TEXT NOT NULL,
+     updated_at INTEGER NOT NULL
+   ) WITHOUT ROWID`,
 ] as const

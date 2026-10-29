@@ -32,6 +32,8 @@ import type { InboundMessage } from './types.js'
 import type { LLMService } from './llm/contract.js'
 import { executeRun, replyFromSession, type RunDeps } from './agent/run.js'
 import { conversationKey, isTextMessage, toInboundMessage } from './agent/inbound.js'
+import { decideWake } from './agent/wake.js'
+import { getPersonaBinding, setPersonaBinding } from './persona.js'
 import { hydrateImageAttachments } from './agent/media.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
 import {
@@ -92,11 +94,21 @@ export default definePlugin<AgentConfig>({
 
   hooks: {
     async onInstall(ctx) {
-      // 建表。QFlareBot 没有 migration runner，表结构统一在这里一次性建好；
-      // IF NOT EXISTS 保证重装时幂等
-      for (const statement of SCHEMA_STATEMENTS) {
-        await ctx.db.exec(statement)
-      }
+      await ensureSchema(ctx)
+    },
+    /**
+     * 升级路径的建表兜底。
+     *
+     * `onInstall` 只在**首次安装**时跑（框架用 KV 里一个 marker 记住「装过了」），
+     * 所以插件升级后新增的表不会自动创建——用到时才炸 `no such table`。
+     * 本插件就踩过：v0.1.0 升上来新增了 `{conversations}`，`/agent persona` 直接报
+     * `D1_ERROR: no such table: p_agent_conversations`。
+     *
+     * 全部语句都是 `IF NOT EXISTS`，所以这里每次冷启动跑一遍是安全的；
+     * 但 D1 的 exec 也算一次查询，所以用一个进程内标记只跑一次（isolate 回收后重跑，无害）。
+     */
+    async onBoot(ctx) {
+      await ensureSchema(ctx)
     },
   },
 
@@ -149,6 +161,45 @@ export default definePlugin<AgentConfig>({
       },
     },
 
+    'agent persona': {
+      description: '查看或切换本会话的人格',
+      usage: '/agent persona [名字]',
+      async handler({ session, ctx, argText }) {
+        const conversation = conversationKey(session)
+        const wanted = argText.trim()
+        const available = (ctx.config.personas ?? []).map((p) => p.name.trim()).filter(Boolean)
+
+        // 不带参数：显示当前绑定与可选列表
+        if (!wanted) {
+          const bound = await getPersonaBinding(ctx.db, conversation).catch(() => undefined)
+          const active = bound ?? ctx.config.default_persona ?? '(未设置，用系统提示词)'
+          return [
+            `当前人格：${active}`,
+            available.length ? `可选：${available.join('、')}` : '还没有配置任何人格（插件设置 → 人格）',
+            '',
+            '切换用 /agent persona <名字>，清除用 /agent persona off',
+          ].join('\n')
+        }
+
+        // off / 清除：解绑，回落默认人格
+        if (wanted === 'off' || wanted === 'none' || wanted === '清除') {
+          await setPersonaBinding(ctx.db, conversation, undefined)
+          return ctx.config.default_persona
+            ? `已清除本会话的人格绑定，回到默认人格「${ctx.config.default_persona}」。`
+            : '已清除本会话的人格绑定，改用系统提示词。'
+        }
+
+        if (!available.includes(wanted)) {
+          return available.length
+            ? `没有名为「${wanted}」的人格。可选：${available.join('、')}`
+            : '还没有配置任何人格，请先在插件设置里添加。'
+        }
+
+        await setPersonaBinding(ctx.db, conversation, wanted)
+        return `本会话的人格已切换为「${wanted}」。`
+      },
+    },
+
     'agent status': {
       description: '查看 Agent 状态',
       async handler({ ctx }) {
@@ -180,18 +231,22 @@ export default definePlugin<AgentConfig>({
     },
   },
 
-  // 群里 @机器人 或单聊时，直接说话就进 agent（不用打 /agent）
+  /**
+   * 聊天入口：**没命中指令的消息就该走 Agent**（对标 AstrBot 的 waking check）。
+   *
+   * 这里订阅三种消息事件，由 `decideWake` 统一判定：
+   * - `qq.group.at_message`：群里 @ 了机器人（平台只在 @ 时才推）
+   * - `qq.group.message`：群全量消息（**需要群主在 QQ 里给机器人开启「接收全部消息」**，
+   *   否则收不到；开了之后 `wake_mode: 'all'` 才有意义）
+   * - `qq.c2c.message`：私聊
+   *
+   * 命令（`/agent …`）默认 `block: true`，命中并返回后不会再走到这些事件——
+   * 所以「命中指令」和「聊天」天然互斥，不会同一句话既执行指令又调模型。
+   */
   events: {
-    'qq.group.at_message': async ({ session, ctx }) => {
-      if (!isTextMessage(session)) return
-      await handleMessage(session, ctx, session.content ?? '')
-      return undefined
-    },
-    'qq.c2c.message': async ({ session, ctx }) => {
-      if (!isTextMessage(session)) return
-      await handleMessage(session, ctx, session.content ?? '')
-      return undefined
-    },
+    'qq.group.at_message': onChatMessage,
+    'qq.group.message': onChatMessage,
+    'qq.c2c.message': onChatMessage,
   },
 
   cron: {
@@ -244,7 +299,46 @@ export default definePlugin<AgentConfig>({
   routes: createPageRoutes(),
 })
 
+/** 建表。全部是 IF NOT EXISTS，重复执行安全（onInstall 与 onBoot 共用） */
+let schemaReady = false
+async function ensureSchema(ctx: PluginContext<AgentConfig>): Promise<void> {
+  if (schemaReady) return
+  for (const statement of SCHEMA_STATEMENTS) {
+    await ctx.db.exec(statement)
+  }
+  schemaReady = true
+}
+
 // ---------------------------------------------------------------- 消息处理
+
+/**
+ * 聊天消息入口：判定该不该唤醒，唤醒则进 Agent。
+ *
+ * 与 AstrBot 的对应关系见 `src/agent/wake.ts` 的注释。这里只做三件事：
+ * 判定 → 剥前缀 → 交给 handleMessage。
+ */
+async function onChatMessage({
+  session,
+  ctx,
+}: {
+  session: Session
+  ctx: PluginContext<AgentConfig>
+}): Promise<void> {
+  const decision = decideWake(session, ctx.config)
+  if (!decision.wake) {
+    // not-mentioned 是常态（群全量消息里绝大多数没 @ 机器人），不打日志免得刷屏
+    if (decision.reason !== 'not-mentioned' && decision.reason !== 'command') {
+      ctx.logger.debug('消息不唤醒 Agent', { reason: decision.reason, scene: session.scene })
+    }
+    return
+  }
+  if (!isTextMessage(session) && decision.text.trim().length === 0) return
+
+  ctx.logger.debug('唤醒 Agent', { reason: decision.reason, scene: session.scene })
+
+  // 唤醒前缀已经剥掉（例如「/你好」→「你好」），不能再让 handleMessage 去猜
+  await handleMessage(session, ctx, decision.text)
+}
 
 async function handleMessage(
   session: Session,

@@ -23,6 +23,7 @@ import { createWebTool } from '../tools/web.js'
 import { createScheduleTools } from '../tools/schedule.js'
 import { createVfsTools } from '../tools/vfs/tools.js'
 import { bumpDailyStats, recordToolAudit } from '../store/d1.js'
+import { getPersonaBinding, resolvePersona } from '../persona.js'
 
 /** release / retryLater 之后可能返回「队列里下一个已认领的 run」 */
 export interface NextRun {
@@ -93,11 +94,19 @@ async function runLoopOnce(input: {
 
   const history = await agent.history(config.history_limit)
   const modelInfo = await safeResolveModel(llm, config.model, logger)
+
+  // 人格：会话绑定 > 配置默认人格 > system_prompt。读失败不该让整轮对话失败
+  // （绑定表是 D1，抖动时退回 system_prompt 即可）
+  const bound = await getPersonaBinding(ctx.db, message.conversation).catch(() => undefined)
+  const persona = resolvePersona(config, bound)
+  if (persona.name) logger.debug('使用人格', { conversation: message.conversation, persona: persona.name })
+
   const messages = buildMessages(message, history, {
-    systemPrompt: config.system_prompt,
+    systemPrompt: persona.prompt ?? config.system_prompt,
     timezone: config.timezone,
     historyLimit: config.history_limit,
     supportsVision: modelInfo?.capabilities.includes('image') ?? false,
+    ...(persona.beginDialogs.length ? { beginDialogs: persona.beginDialogs } : {}),
   })
 
   // R2 探测放在这里（而不是 buildRegistry 里）是因为它是异步的，而 buildRegistry

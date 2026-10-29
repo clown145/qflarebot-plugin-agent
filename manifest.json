@@ -29,6 +29,11 @@
       "usage": "/agent schedule [cancel <id>]"
     },
     {
+      "name": "agent persona",
+      "description": "查看或切换本会话的人格",
+      "usage": "/agent persona [名字]"
+    },
+    {
       "name": "agent status",
       "description": "查看 Agent 状态"
     }
@@ -38,6 +43,11 @@
     {
       "event": [
         "qq.group.at_message"
+      ]
+    },
+    {
+      "event": [
+        "qq.group.message"
       ]
     },
     {
@@ -62,6 +72,11 @@
     {
       "method": "GET",
       "path": "/api/overview",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/api/persona",
       "auth": "admin"
     },
     {
@@ -153,6 +168,78 @@
         "description": "仅单聊有效",
         "default": true
       },
+      "personas": {
+        "type": "array",
+        "title": "人格",
+        "description": "每个会话绑一套。留空时用下面的「系统提示词」。会话里用 `/agent persona <名字>` 切换",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "title": "名字",
+              "description": "会话按它绑定，建议短且唯一（如 `cat`、`assistant`）"
+            },
+            "prompt": {
+              "type": "string",
+              "format": "textarea",
+              "title": "人格提示词",
+              "description": "这套人格的系统提示词"
+            },
+            "begin_dialogs": {
+              "type": "string",
+              "format": "textarea",
+              "title": "开场对话",
+              "description": "每轮插在历史最前面，用来锚定风格。每行一句，以 `user:` / `assistant:` 开头，例如：\nuser: 你好\nassistant: 你好呀～",
+              "default": ""
+            }
+          }
+        },
+        "default": []
+      },
+      "default_persona": {
+        "type": "string",
+        "title": "默认人格",
+        "description": "会话没有显式绑人格时用哪一套；留空则用「系统提示词」",
+        "default": ""
+      },
+      "wake_mode": {
+        "oneOf": [
+          {
+            "const": "at",
+            "title": "仅 @ 机器人"
+          },
+          {
+            "const": "at_or_prefix",
+            "title": "@ / 前缀 / 回复机器人"
+          },
+          {
+            "const": "all",
+            "title": "群里所有消息（需开启接收全部消息）"
+          }
+        ],
+        "title": "群聊触发方式",
+        "description": "群聊里什么消息会触发 Agent。`all` 需要群主在 QQ 里给机器人开启「接收全部消息」，否则只能收到 @ 消息",
+        "default": "at"
+      },
+      "wake_prefix": {
+        "type": "string",
+        "title": "唤醒前缀",
+        "description": "「@ / 前缀 / 回复机器人」模式下，以此开头的消息也会触发。默认 `/`",
+        "default": "/"
+      },
+      "friend_needs_wake_prefix": {
+        "type": "boolean",
+        "title": "单聊需要前缀才触发",
+        "description": "关掉时私聊任何消息都会触发 Agent；打开后私聊也要带唤醒前缀",
+        "default": false
+      },
+      "command_prefixes": {
+        "type": "string",
+        "title": "机器人自身的指令前缀",
+        "description": "以此开头的消息交给指令处理，不再触发 Agent。多个用逗号分隔，默认 `/`",
+        "default": "/"
+      },
       "timezone": {
         "type": "string",
         "title": "时区",
@@ -163,6 +250,12 @@
   "defaultConfig": {
     "model": "chat",
     "system_prompt": "你是一个运行在 QQ 上的助手。回答要简洁，能一句话说清就不要展开。\n你不确定的事情要直说，不要编造。\n你能调用工具时优先用工具拿事实，不要凭记忆猜。",
+    "personas": [],
+    "default_persona": "",
+    "wake_mode": "at",
+    "wake_prefix": "/",
+    "friend_needs_wake_prefix": false,
+    "command_prefixes": "/",
     "max_model_steps": 8,
     "max_tool_calls": 12,
     "history_limit": 20,

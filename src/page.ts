@@ -45,6 +45,7 @@ export const PAGE_HTML = `<!doctype html>
 
 <div class="card">
   <h2>模型</h2>
+  <p class="muted" style="margin:0 0 12px">模型别名、系统提示词、人格、唤醒方式等<strong>配置</strong>都在面板「插件 → Agent → 插件配置」里改（保存即生效，不触发构建）。这里只做状态检查。</p>
   <div class="row"><span class="k">模型别名</span><span id="model">-</span></div>
   <div class="row"><span class="k">可用别名</span><span id="models">-</span></div>
   <div class="row"><span class="k">连通性</span><span id="ping" class="muted">未测试</span></div>
@@ -53,7 +54,7 @@ export const PAGE_HTML = `<!doctype html>
 </div>
 
 <div class="card">
-  <h2>能力</h2>
+  <h2>运行状态</h2>
   <div class="row"><span class="k">工具调用</span><span id="tools">-</span></div>
   <div class="row"><span class="k">虚拟工作区</span><span id="vfs">-</span></div>
   <div class="row"><span class="k">动态定时任务</span><span id="schedule">-</span></div>
@@ -61,6 +62,25 @@ export const PAGE_HTML = `<!doctype html>
   <div class="row"><span class="k">步数上限 / 工具上限</span><span id="limits">-</span></div>
   <div class="row"><span class="k">历史条数</span><span id="history">-</span></div>
   <div class="row"><span class="k">时区</span><span id="tz">-</span></div>
+</div>
+
+<div class="card">
+  <h2>会话与人格</h2>
+  <p class="muted" style="margin:0 0 12px">每个会话可以绑一套人格（会话里让机器人「/agent persona 名字」也能切）。这里是宿主面板没有的：面板只管插件配置，管不到「哪个会话用了哪套」。</p>
+  <div class="row"><span class="k">已配置人格</span><span id="personaList">-</span></div>
+  <div class="row"><span class="k">默认人格</span><span id="personaDefault">-</span></div>
+  <table style="margin-top:12px">
+    <thead><tr><th>会话</th><th>人格</th><th>更新时间</th><th></th></tr></thead>
+    <tbody id="bindingRows"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+  </table>
+  <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+    <input id="convInput" placeholder="会话 id，如 group:XXXXXX" style="flex:1;min-width:180px;padding:8px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--fg);font-size:13px">
+    <select id="personaSelect" style="padding:8px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--fg);font-size:13px">
+      <option value="">（清除绑定）</option>
+    </select>
+    <button id="bindBtn">绑定</button>
+  </div>
+  <div id="bindResult" style="margin-top:10px;font-size:13px"></div>
 </div>
 
 <div class="card">
@@ -133,6 +153,67 @@ function formatRepeat(seconds) {
   return '每 ' + seconds + ' 秒'
 }
 
+/** 会话与人格：把这台机器人配了哪些人格、哪些会话绑了哪套列出来 */
+function renderPersonas(data) {
+  const configured = data.personas?.configured ?? []
+  const fallback = data.personas?.default
+  $('personaList').textContent = configured.length ? configured.join('、') : '（未配置，用系统提示词）'
+  $('personaDefault').textContent = fallback || '（用系统提示词）'
+
+  // 下拉选项：清空 + 每套人格
+  const select = $('personaSelect')
+  select.innerHTML = '<option value="">（清除绑定）</option>' +
+    configured.map((name) => '<option value="' + esc(name) + '">' + esc(name) + '</option>').join('')
+  select.disabled = configured.length === 0
+
+  const rows = data.bindings ?? []
+  if (!rows.length) {
+    $('bindingRows').innerHTML = '<tr><td colspan="4" class="empty">还没有会话绑定人格——在会话里发「/agent persona 名字」即可</td></tr>'
+    return
+  }
+  $('bindingRows').innerHTML = rows.map((row) =>
+    '<tr>' +
+      '<td class="mono">' + esc(shortConversation(row.conversation)) + '</td>' +
+      '<td>' + esc(row.persona) + '</td>' +
+      '<td class="muted">' + esc(row.updatedAtLocal) + '</td>' +
+      '<td><button data-conv="' + esc(row.conversation) + '" class="clear">清除</button></td>' +
+    '</tr>'
+  ).join('')
+
+  // 逐行「清除」按钮
+  for (const btn of $('bindingRows').querySelectorAll('button.clear')) {
+    btn.addEventListener('click', async () => {
+      await bind(btn.dataset.conv, '')
+    })
+  }
+}
+
+/** 绑定 / 清除某个会话的人格 */
+async function bind(conversation, persona) {
+  try {
+    const res = await request('/api/persona', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ conversation, persona }),
+    })
+    if (!res.ok) throw new Error(res.error || '保存失败')
+    $('bindResult').innerHTML = '<span class="ok">' +
+      esc(conversation) + (persona ? ' → ' + esc(persona) : '：绑定已清除') + '</span>'
+    await $('bindBtn').addEventListener('click', () => {
+  const conversation = $('convInput').value.trim()
+  if (!conversation) {
+    $('bindResult').innerHTML = '<span class="bad">请先填会话 id</span>'
+    return
+  }
+  bind(conversation, $('personaSelect').value)
+})
+
+load()
+  } catch (e) {
+    $('bindResult').innerHTML = '<span class="bad">' + esc(e.message) + '</span>'
+  }
+}
+
 function renderSchedules(rows) {
   $('scheduleCount').textContent = rows.length ? '（' + rows.length + ' 个）' : ''
   if (!rows.length) {
@@ -199,6 +280,7 @@ async function load() {
       $('models').innerHTML = '<span class="bad">读取失败：' + esc(data.modelStatus.error) + '</span>'
     }
 
+    renderPersonas(data)
     renderSchedules(data.schedules ?? [])
     renderAudits(data.audits ?? [], c.enableAudit)
     renderStats(data.stats ?? [])
