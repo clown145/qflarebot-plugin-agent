@@ -102,18 +102,21 @@ async function runLoopOnce(input: {
   const persona = resolvePersona(config, bound)
   if (persona.name) logger.debug('使用人格', { conversation: message.conversation, persona: persona.name })
 
+  // R2 探测放在这里（而不是 buildRegistry 里）是因为它是异步的，而 buildRegistry
+  // 被设计成同步、好测。探测结果在 isolate 内缓存，正常对话不会多出往返。
+  const r2Ready = config.enable_tools && config.enable_vfs ? await hasR2(ctx) : false
+  const registry = buildRegistry(ctx, config, r2Ready)
+
+  // 先建工具集再拼提示词：有工具时要在系统提示词里追加「工具使用规范」，
+  // 需要知道这一轮到底开放了哪些（对标 AstrBot 的 TOOL_CALL_PROMPT）
   const messages = buildMessages(message, history, {
     systemPrompt: persona.prompt ?? config.system_prompt,
     timezone: config.timezone,
     historyLimit: config.history_limit,
     supportsVision: modelInfo?.capabilities.includes('image') ?? false,
+    toolNames: registry.list().map((tool) => tool.definition.name),
     ...(persona.beginDialogs.length ? { beginDialogs: persona.beginDialogs } : {}),
   })
-
-  // R2 探测放在这里（而不是 buildRegistry 里）是因为它是异步的，而 buildRegistry
-  // 被设计成同步、好测。探测结果在 isolate 内缓存，正常对话不会多出往返。
-  const r2Ready = config.enable_tools && config.enable_vfs ? await hasR2(ctx) : false
-  const registry = buildRegistry(ctx, config, r2Ready)
 
   return runAgentLoop({
     llm,

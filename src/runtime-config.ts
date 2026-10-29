@@ -1,33 +1,26 @@
 /**
- * 运行时覆盖的「当前模型别名」。
+ * 页面里的配置覆盖：存哪、怎么读。
  *
- * ## 为什么要有这一层（而不是只改插件配置）
+ * 插件页面拿的是限定本插件的桥接令牌，调不了 `/admin/*`（实测 401），写不回面板里的
+ * 插件配置。所以页面上的改动写进本插件自己的 KV，运行时用 `resolveConfig()`
+ * （见 `effective-config.ts`）合并到 `ctx.config` 上得到生效配置。
  *
- * 模型别名本来在插件配置里（`config.model`，面板表单里手填）。但**别名是可以枚举的**：
- * `llm` 服务有 `listModels()`，能列出所有可用别名。让用户在配置里手打 `chat`、
- * 打错了还要等对话失败才发现，是没道理的设计——这恰恰是「面板装插件图省事」要避免的。
+ * ## 存储位置
  *
- * 所以插件页面提供一个「点一下即切换」的模型选择器，选中的值存 KV（宿主面板只管插件
- * 配置，插件页面调不了 `/admin/*`，改不了那份配置）。运行时按
- * **KV 覆盖 > config.model** 取别名，所以点完立即生效、不用去配置里再填一遍。
+ * 键名 `config:override`，宿主自动加插件前缀，落在 `p:agent:config:override`。
+ * 升级/更新插件**不会**清 KV（宿主的清数据只在卸载并勾选「连数据一起清」时按前缀删，
+ * 见 `packages/runtime/src/purge.ts`），所以这些设置在升级后应当保留。
  *
- * 配置里的 `model` 仍然是权威的回退值：KV 里没有覆盖时一律用它。
+ * 但键名本身仍是跨版本契约：**改动键名等于丢掉用户已设好的配置**。
+ * 之前就因为重构时换过键名（`model:selected` / `prompt:override` → `config:override`），
+ * 让用户以为「一更新就丢」。所以现在键名固定，不再折腾。
  */
 import type { PluginContext } from '@qqbot/sdk'
 import type { AgentConfig } from './config/index.js'
 
-/** KV 里的键（框架会自动加插件前缀） */
-const PICKED_MODEL_KEY = 'model:selected'
-
-/** 页面里改过的配置（部分对象，只含被改的字段） */
+/** 页面覆盖的唯一存储键（跨版本契约，勿改） */
 const CONFIG_OVERRIDE_KEY = 'config:override'
 
-/**
- * 页面覆盖：`Partial<AgentConfig>`，只含用户在插件页面里真正改过的字段。
- *
- * 用部分对象而不是整份替换：升级后新增的配置项，即便用户改过别的字段，
- * 也仍能从插件配置里拿到默认值。
- */
 export type ConfigOverride = Partial<AgentConfig>
 
 /** 读页面里的配置覆盖；没有就返回 null */

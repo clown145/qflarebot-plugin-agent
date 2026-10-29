@@ -41,15 +41,11 @@ export interface AgentConfig {
   default_persona: string
 
   /**
-   * 群聊里什么消息会触发 Agent（AstrBot 的 waking check）。
+   * 唤醒前缀（对标 AstrBot 的 `wake_prefix`，默认 `/`）。
    *
-   * - `at`：只有 @机器人才触发（默认，最省额度、不打扰）
-   * - `at_or_prefix`：@机器人，或以 `wake_prefix` 开头，或回复机器人消息
-   * - `all`：群里所有消息（需要群主在 QQ 里开启「接收全部消息」）
+   * 群聊里以此开头的消息会唤醒 Agent，并剥掉前缀再交给模型。
+   * 与 `command_prefixes` 是**两件事**：那个是「交给指令、不进模型」的排除列表。
    */
-  wake_mode: 'at' | 'at_or_prefix' | 'all'
-
-  /** 唤醒前缀（`wake_mode` 为 `at_or_prefix` 时生效），默认 `/` */
   wake_prefix: string
 
   /** 单聊没有 @ 的概念：关掉时私聊任何消息都触发，打开后需要前缀（对应 AstrBot 的 friend_message_needs_wake_prefix） */
@@ -105,7 +101,6 @@ export const defaultConfig: AgentConfig = {
   system_prompt: DEFAULT_SYSTEM_PROMPT,
   personas: [],
   default_persona: '',
-  wake_mode: 'at',
   wake_prefix: '/',
   friend_needs_wake_prefix: false,
   command_prefixes: '/',
@@ -234,17 +229,6 @@ export const configSchema = {
       title: '默认人格',
       description: '会话没有显式绑人格时用哪一套；留空则用「系统提示词」',
       default: '',
-    },
-    wake_mode: {
-      oneOf: [
-        { const: 'at', title: '仅 @ 机器人' },
-        { const: 'at_or_prefix', title: '@ / 前缀 / 回复机器人' },
-        { const: 'all', title: '群里所有消息（需开启接收全部消息）' },
-      ],
-      title: '群聊触发方式',
-      description:
-        '群聊里什么消息会触发 Agent。`all` 需要群主在 QQ 里给机器人开启「接收全部消息」，否则只能收到 @ 消息',
-      default: defaultConfig.wake_mode,
     },
     wake_prefix: {
       type: 'string',

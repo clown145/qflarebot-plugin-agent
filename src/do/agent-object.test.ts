@@ -382,3 +382,64 @@ describe('Agent.sweep', () => {
     expect(result.pruned).toBe(0)
   })
 })
+
+/**
+ * `/agent reset` 的语义：**打断正在跑的 run + 清队列 + 清历史**。
+ *
+ * AstrBot 的 `/reset` 先 `stop_all(umo)` 再清历史。不打断的话，正在跑的 run
+ * 跑完照样 release() 把这一轮写回历史，用户看到「已清空」之后聊一句、
+ * 上下文却还在；队列里的旧消息也会在清空后继续执行。
+ */
+describe('Agent.reset', () => {
+  it('清空历史', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.release(runId!, { ok: true, history: [historyRow('user', '你好'), historyRow('assistant', '在')] })
+    expect((await obj.history(10)).length).toBe(2)
+
+    await obj.reset()
+    expect(await obj.history(10)).toEqual([])
+    expect(storage.map.size).toBeGreaterThan(0) // 存储本身还在，只是历史没了
+  })
+
+  it('打断正在跑的 run：被取消的 run 不再写回历史', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+
+    // 模拟「reset 时这个 run 还在跑」：把它标成 cancelled
+    await obj.reset()
+    const run = await storage.get<Record<string, unknown>>(`run:${runId}`)
+    expect(run?.['status']).toBe('cancelled')
+
+    // 跑完后照常 release（真实执行者是异步的，它并不知道被取消了）
+    await obj.release(runId!, { ok: true, history: [historyRow('user', '旧问题'), historyRow('assistant', '旧回答')] })
+
+    // 关键：历史不该被写回去
+    expect(await obj.history(10)).toEqual([])
+  })
+
+  it('清空待跑队列：清空后不再执行排着的消息', async () => {
+    const { obj, storage } = makeObject()
+    // 第一个抢到执行权，第二个进队列
+    const first = await obj.submit(message({ text: '第一条' }))
+    const second = await obj.submit(message({ text: '第二条' }))
+    expect(first.acquired).toBe(true)
+    expect(second.acquired).toBe(false)
+
+    await obj.reset()
+
+    // 队列空了，pending 的 run 也不见了（不会在清空之后突然冒出一条回复）
+    const queued = await storage.list({ prefix: 'queue:' })
+    expect(queued.size).toBe(0)
+    const runs = await storage.list<Record<string, unknown>>({ prefix: 'run:' })
+    for (const [, run] of runs) {
+      expect(['cancelled', 'running']).toContain(run['status'])
+    }
+  })
+
+  it('没有正在跑的 run 时也能安全清空', async () => {
+    const { obj } = makeObject()
+    await obj.reset()
+    expect(await obj.history(10)).toEqual([])
+  })
+})

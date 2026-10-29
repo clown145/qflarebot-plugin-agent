@@ -38,7 +38,7 @@ describe('管理页', () => {
       // 提示词
       'promptBox', 'savePrompt', 'resetPrompt', 'promptState',
       // 唤醒
-      'wakeMode', 'wakePrefix', 'friendPrefix', 'commandPrefixes',
+      'wakePrefix', 'friendPrefix', 'commandPrefixes',
       // 能力开关
       'enableTools', 'enableVfs', 'enableSchedule', 'enableAudit', 'showTyping',
       // 限额

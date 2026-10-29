@@ -266,12 +266,6 @@ function validateConfigField(
     return null
   }
 
-  if (key === 'wake_mode') {
-    return ['at', 'at_or_prefix', 'all'].includes(String(value))
-      ? null
-      : 'wake_mode 只能是 at / at_or_prefix / all'
-  }
-
   if (key === 'model') {
     if (typeof value !== 'string' || !value.trim()) return 'model 不能为空'
     // 只接受真实存在的别名：手打错一个字母，运行时才炸 unknown_model 太难查

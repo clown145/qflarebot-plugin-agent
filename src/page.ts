@@ -238,15 +238,10 @@ export const PAGE_HTML = `<!doctype html>
 
 <div class="card">
   <h2>群聊唤醒</h2>
-  <p class="hint">群里什么消息会让机器人开口。默认只在 @ 时回复，最省额度、不打扰。</p>
-  <div class="field">
-    <label class="field-label">触发方式</label>
-    <select id="wakeMode" class="select-inline" style="width:100%">
-      <option value="at">仅 @ 机器人</option>
-      <option value="at_or_prefix">@ / 前缀 / 引用机器人</option>
-      <option value="all">群里所有消息（需开启接收全部消息）</option>
-    </select>
-  </div>
+  <p class="hint">
+    群里<strong>只有两种情况</strong>会让机器人开口：<strong>@ 它</strong>，或以「唤醒前缀」开头。
+    其余消息一律不理——这是刻意的，否则群里正常聊天都会被插嘴。
+  </p>
   <div class="field">
     <label class="field-label">唤醒前缀 <span class="muted">（非 @ 时可触发）</span></label>
     <input id="wakePrefix" class="search" placeholder="/" />
@@ -602,7 +597,6 @@ function renderScalarFields() {
     : '来自插件配置'
 
   // 唤醒
-  $('wakeMode').value = c.wake_mode ?? 'at'
   $('wakePrefix').value = c.wake_prefix ?? '/'
   $('friendPrefix').checked = Boolean(c.friend_needs_wake_prefix)
   $('commandPrefixes').value = c.command_prefixes ?? '/'
@@ -776,7 +770,6 @@ async function resetPrompt() {
 
 async function saveScalars() {
   const patch = {
-    wake_mode: $('wakeMode').value,
     wake_prefix: $('wakePrefix').value,
     friend_needs_wake_prefix: $('friendPrefix').checked,
     command_prefixes: $('commandPrefixes').value,
@@ -818,7 +811,7 @@ document.addEventListener('keydown', (e) => {
 $('savePrompt').addEventListener('click', savePrompt)
 $('resetPrompt').addEventListener('click', resetPrompt)
 // 能力开关与唤醒方式：改了就存（省得再点一次按钮）
-for (const id of ['wakeMode', 'friendPrefix', 'enableTools', 'enableVfs', 'enableSchedule', 'enableAudit', 'showTyping']) {
+for (const id of ['friendPrefix', 'enableTools', 'enableVfs', 'enableSchedule', 'enableAudit', 'showTyping']) {
   $(id).addEventListener('change', () => {
     void saveScalarsSilently()
   })

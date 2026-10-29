@@ -17,6 +17,8 @@ import type { BeginDialogTurn } from '../persona.js'
 
 export interface ContextOptions {
   systemPrompt?: string
+  /** 本轮给模型开放了哪些工具（只用于拼「工具使用规范」，见 TOOL_USE_GUIDE） */
+  toolNames?: string[]
   timezone: string
   /** 历史条数上限 */
   historyLimit: number
@@ -37,7 +39,10 @@ export function buildMessages(
   options: ContextOptions,
 ): ModelMessage[] {
   const messages: ModelMessage[] = [
-    { role: 'system', content: buildSystemPrompt(options.systemPrompt, options.timezone, message) },
+    {
+      role: 'system',
+      content: buildSystemPrompt(options.systemPrompt, options.timezone, message, options.toolNames),
+    },
   ]
 
   // 开场对话：插在历史最前，每轮都带（锚定说话风格，不属于会话记忆）
@@ -55,10 +60,26 @@ export function buildMessages(
   return messages
 }
 
+/**
+ * 工具使用规范。有工具时追加在系统提示词末尾（对标 AstrBot 的 TOOL_CALL_PROMPT）。
+ *
+ * 工具本身的清单走 schema 下发（`tools` 参数），这里只讲「怎么用」——
+ * 这几条都是从实际故障里总结出来的：返回空回复、每次调用前都啰嗦一句、
+ * 凭空编造参数。
+ */
+const TOOL_USE_GUIDE = [
+  '## 工具使用',
+  '- 用工具拿到的事实优先于你的记忆；不确定就去查，不要猜。',
+  '- 严格按工具的参数定义传参，不要编造不存在的参数。',
+  '- 开始一类新任务时简单说明你在做什么；不必每次调用工具前都解释。',
+  '- 工具返回后要基于结果给出最终答复，不要返回空回复。',
+].join('\n')
+
 function buildSystemPrompt(
   configured: string | undefined,
   timezone: string,
   message: InboundMessage,
+  toolNames: string[] = [],
 ): string {
   const base = configured?.trim() || DEFAULT_SYSTEM_PROMPT
   const now = new Date()
@@ -82,6 +103,7 @@ function buildSystemPrompt(
     `- 现在时间：${localTime}（时区 ${timezone}）`,
     `- 当前会话：${message.scene === 'c2c' ? '单聊' : '群聊'}`,
     message.userName ? `- 正在和你说话的人：${message.userName}` : '',
+    ...(toolNames.length ? ['', TOOL_USE_GUIDE] : []),
     '',
     '回复要求：纯文本，不要用 Markdown 语法（QQ 不渲染），不要输出思考过程。',
   ]

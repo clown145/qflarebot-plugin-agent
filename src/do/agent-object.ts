@@ -191,7 +191,10 @@ export class Agent extends PluginDurableObject {
       } satisfies RunRecord)
     }
 
-    if (result.history?.length) {
+    // 被 `/agent reset` 取消的 run 不写历史：用户明确清了记忆，这一轮是旧上下文的产物。
+    // 队列里被取消的 run 同样不再执行（claim 只认 pending）。
+    const cancelled = run?.status === 'cancelled'
+    if (!cancelled && result.history?.length) {
       await this.appendHistory(result.history)
     }
 
@@ -242,8 +245,50 @@ export class Agent extends PluginDurableObject {
     return rows.slice(-limit)
   }
 
-  /** 清空会话历史（`/agent reset`） */
+  /**
+   * 清空会话（`/agent reset`）。
+   *
+   * 三件事一起做，缺一个就不是「清空」：
+   *
+   * 1. **打断正在跑的 run**：AstrBot 的 `/reset` 会先 `stop_all(umo)` 再清历史。
+   *    不打断的话，那个 run 跑完照样 `release()` 把这一轮写回历史，记忆又长回来——
+   *    用户看到「已清空」之后聊一句，上下文却还在。
+   * 2. **清空待跑队列**：队列里的都是「清空前」发出的消息，清空之后不该再执行
+   *    （否则用户清完记忆，几秒后又收到一条回复，内容还是按旧上下文生成的）。
+   * 3. 最后才删历史。
+   */
   async reset(): Promise<void> {
+    // 1) 打断：把正在跑的那个 run 标成已取消，`release()` 见到 cancelled 就跳过写历史
+    const lock = await this.ctx.storage.get<{ runId: string }>('lock')
+    if (lock) {
+      const run = await this.ctx.storage.get<RunRecord>(`run:${lock.runId}`)
+      if (run && run.status === 'running') {
+        await this.ctx.storage.put(`run:${lock.runId}`, {
+          ...run,
+          status: 'cancelled',
+          lockedUntil: undefined,
+          updatedAt: Date.now(),
+        } satisfies RunRecord)
+      }
+      await this.ctx.storage.delete('lock')
+    }
+
+    // 2) 清队列
+    const queued = await this.ctx.storage.list<string>({ prefix: 'queue:' })
+    if (queued.size) {
+      await this.ctx.storage.delete([...queued.keys()])
+    }
+    // 队列里对应的 run 记录也标成取消，避免留下 pending 的孤儿
+    const runs = await this.ctx.storage.list<RunRecord>({ prefix: 'run:' })
+    const cancelled: Record<string, RunRecord> = {}
+    for (const [key, run] of runs) {
+      if (run.status === 'pending') {
+        cancelled[key] = { ...run, status: 'cancelled', updatedAt: Date.now() }
+      }
+    }
+    if (Object.keys(cancelled).length) await this.ctx.storage.put(cancelled)
+
+    // 3) 删历史
     const all = await this.ctx.storage.list({ prefix: 'msg:' })
     if (all.size) await this.ctx.storage.delete([...all.keys()])
   }

@@ -208,25 +208,6 @@
         "description": "会话没有显式绑人格时用哪一套；留空则用「系统提示词」",
         "default": ""
       },
-      "wake_mode": {
-        "oneOf": [
-          {
-            "const": "at",
-            "title": "仅 @ 机器人"
-          },
-          {
-            "const": "at_or_prefix",
-            "title": "@ / 前缀 / 回复机器人"
-          },
-          {
-            "const": "all",
-            "title": "群里所有消息（需开启接收全部消息）"
-          }
-        ],
-        "title": "群聊触发方式",
-        "description": "群聊里什么消息会触发 Agent。`all` 需要群主在 QQ 里给机器人开启「接收全部消息」，否则只能收到 @ 消息",
-        "default": "at"
-      },
       "wake_prefix": {
         "type": "string",
         "title": "唤醒前缀",
@@ -257,7 +238,6 @@
     "system_prompt": "你是一个运行在 QQ 上的助手。回答要简洁，能一句话说清就不要展开。\n你不确定的事情要直说，不要编造。\n你能调用工具时优先用工具拿事实，不要凭记忆猜。",
     "personas": [],
     "default_persona": "",
-    "wake_mode": "at",
     "wake_prefix": "/",
     "friend_needs_wake_prefix": false,
     "command_prefixes": "/",

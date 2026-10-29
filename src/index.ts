@@ -242,7 +242,7 @@ export default definePlugin<AgentConfig>({
    * 这里订阅三种消息事件，由 `decideWake` 统一判定：
    * - `qq.group.at_message`：群里 @ 了机器人（平台只在 @ 时才推）
    * - `qq.group.message`：群全量消息（**需要群主在 QQ 里给机器人开启「接收全部消息」**，
-   *   否则收不到；开了之后 `wake_mode: 'all'` 才有意义）
+   *   否则收不到；开了之后群里非 @ 消息才会到达插件（由 decideWake 再判一次））
    * - `qq.c2c.message`：私聊
    *
    * 命令（`/agent …`）默认 `block: true`，命中并返回后不会再走到这些事件——

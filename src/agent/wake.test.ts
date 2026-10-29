@@ -4,46 +4,24 @@ import { decideWake } from './wake.js'
 import { defaultConfig, type AgentConfig } from '../config/index.js'
 
 /**
- * 唤醒判定（对标 AstrBot 的 WakingCheckStage）。
+ * 唤醒判定。**这一组必须能复现真实踩过的刷屏 bug**：
  *
- * 这一组覆盖本次最核心的行为改动：「没命中指令的消息就该触发 Agent」。
+ * 选了「@/前缀/引用机器人」之后，群里所有消息都被 AI 回复。根因两个：
+ * (a) `command_prefixes` 被拼进了唤醒前缀列表，两者默认都是 `/`，
+ *     于是任何以 `/` 开头的消息既被排除又被唤醒；
+ * (b) 「有引用就唤醒」退化成「别人互相引用也唤醒」。
+ * 现在两者都去掉：群聊只认「@机器人」与「唤醒前缀」。
  */
 
 function session(overrides: Partial<Session> = {}): Session {
   return {
-    botId: 'BOT',
-    botName: '机器人',
-    botAvatar: '',
-    platform: 'qq',
-    event: 'qq.group.at_message',
-    rawType: 'GROUP_AT_MESSAGE_CREATE',
-    id: 'e1',
-    timestamp: '',
-    raw: {},
-    scene: 'group',
-    targetId: 'G1',
-    userId: 'U1',
-    userName: '小明',
-    avatarUrl: '',
-    memberRole: 'member',
-    isBotAdmin: false,
-    messageId: 'm1',
-    refIndex: undefined,
-    quote: undefined,
-    canReply: true,
-    content: '你好',
-    displayContent: '你好',
-    mentions: [],
-    atMe: true,
-    attachments: [],
-    interaction: undefined,
-    reply: async () => ({ ok: true, status: 200, raw: null }),
-    send: async () => ({ ok: true, status: 200, raw: null }),
-    typing: async () => ({ ok: true, status: 200, raw: null }),
-    stream: () => {
-      throw new Error('not used')
-    },
-    recall: async () => true,
+    botId: 'BOT', botName: '机器人', botAvatar: '', platform: 'qq',
+    event: 'qq.group.message', rawType: 'GROUP_MESSAGE_CREATE', id: 'e1', timestamp: '',
+    raw: {}, scene: 'group', targetId: 'G1', userId: 'U1', userName: '小明',
+    avatarUrl: '', memberRole: 'member', isBotAdmin: false, messageId: 'm1',
+    refIndex: undefined, quote: undefined, canReply: true,
+    content: '你好', displayContent: '你好', mentions: [], atMe: false,
+    attachments: [], interaction: undefined,
     ...overrides,
   } as unknown as Session
 }
@@ -52,107 +30,134 @@ function config(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return { ...defaultConfig, ...overrides }
 }
 
-describe('decideWake：群聊', () => {
-  it('@ 了机器人就唤醒（默认 at 模式）', () => {
-    const decision = decideWake(session({ atMe: true, content: '你好' }), config())
-    expect(decision).toMatchObject({ wake: true, reason: 'at', text: '你好' })
+describe('群聊：只认 @机器人 与 唤醒前缀', () => {
+  it('@ 了机器人 → 唤醒', () => {
+    expect(decideWake(session({ atMe: true, content: '你好' }), config())).toMatchObject({
+      wake: true, reason: 'at', text: '你好',
+    })
   })
 
-  it('没 @ 就不唤醒（at 模式）——群全量消息里绝大多数是这种', () => {
-    const decision = decideWake(session({ atMe: false, event: 'qq.group.message' }), config())
-    expect(decision).toMatchObject({ wake: false, reason: 'not-mentioned' })
+  it('没 @ / 没前缀的普通群消息 → 不唤醒（刷屏 bug 的核心）', () => {
+    expect(decideWake(session({ atMe: false, content: '今天吃啥' }), config())).toMatchObject({
+      wake: false, reason: 'not-mentioned',
+    })
   })
 
-  it('all 模式下群里所有消息都唤醒', () => {
-    const decision = decideWake(
-      session({ atMe: false, event: 'qq.group.message' }),
-      config({ wake_mode: 'all' }),
-    )
-    expect(decision).toMatchObject({ wake: true, reason: 'all' })
+  it('以唤醒前缀开头 → 唤醒并剥掉前缀', () => {
+    expect(
+      decideWake(session({ atMe: false, content: '!你好' }), config({ wake_prefix: '!', command_prefixes: '#' })),
+    ).toMatchObject({ wake: true, reason: 'prefix', text: '你好' })
   })
 
-  it('at_or_prefix：以前缀开头的消息唤醒，并剥掉前缀', () => {
-    const decision = decideWake(
-      session({ atMe: false, event: 'qq.group.message', content: '/你好' }),
-      config({ wake_mode: 'at_or_prefix', wake_prefix: '/' }),
-    )
-    // 先被 command_prefixes 拦下（默认也是 /）——这正是「带前缀交给指令」的语义
-    expect(decision).toMatchObject({ wake: false, reason: 'command' })
+  /**
+   * 回归：`command_prefixes` 与 `wake_prefix` 默认都是 `/`。
+   * 上一版把两者拼进同一个列表 → 任何 `/xxx` 既被判成「指令」又被判成「唤醒」。
+   * 现在 `command_prefixes` 只用于排除。
+   */
+  it('指令前缀的消息交给指令路径，不当作聊天（哪怕它同时是唤醒前缀）', () => {
+    const cfg = config({ wake_prefix: '/', command_prefixes: '/' })
+    expect(decideWake(session({ content: '/agent status', atMe: false }), cfg)).toMatchObject({
+      wake: false, reason: 'command',
+    })
+    expect(decideWake(session({ content: '/agent status', atMe: true }), cfg)).toMatchObject({
+      wake: false, reason: 'command',
+    })
   })
 
-  it('at_or_prefix：自定义唤醒前缀与指令前缀不冲突时正常唤醒', () => {
-    const decision = decideWake(
-      session({ atMe: false, event: 'qq.group.message', content: '#你好' }),
-      config({ wake_mode: 'at_or_prefix', wake_prefix: '#', command_prefixes: '/' }),
-    )
-    expect(decision).toMatchObject({ wake: true, reason: 'prefix', text: '你好' })
+  /**
+   * 回归：「引用消息就唤醒」已删除。
+   * AstrBot 的语义是「引用了机器人自己的消息」，而 QFlareBot 的 `session.quote`
+   * 不带被引用消息的发送者，精确判断做不到。退化成「有引用就唤醒」会让机器人
+   * 在两个人互相引用聊天时插嘴。
+   */
+  it('引用别人的消息不唤醒（无法判断引用的是谁，宁可不理）', () => {
+    const quoted = session({
+      atMe: false, content: '我同意',
+      quote: { messageId: 'q1', content: '别人说的话', attachments: [], refIndex: 'REFIDX_1' },
+    })
+    expect(decideWake(quoted, config())).toMatchObject({ wake: false, reason: 'not-mentioned' })
   })
 
-  it('at_or_prefix：引用消息也算明确意图', () => {
-    const decision = decideWake(
-      session({
-        atMe: false,
-        event: 'qq.group.message',
-        quote: { messageId: 'q1', content: '原文', attachments: [], refIndex: 'REFIDX_1' },
-      }),
-      config({ wake_mode: 'at_or_prefix' }),
-    )
-    expect(decision).toMatchObject({ wake: true, reason: 'reply' })
-  })
-})
-
-describe('decideWake：单聊', () => {
-  it('默认私聊任何消息都唤醒', () => {
-    const decision = decideWake(
-      session({ scene: 'c2c', event: 'qq.c2c.message', atMe: true }),
-      config(),
-    )
-    expect(decision).toMatchObject({ wake: true, reason: 'private', text: '你好' })
+  it('引用消息 + @机器人 → 仍然唤醒（@ 才是决定性的）', () => {
+    const quoted = session({
+      atMe: true, content: '我同意',
+      quote: { messageId: 'q1', content: 'x', attachments: [], refIndex: 'REFIDX_1' },
+    })
+    expect(decideWake(quoted, config())).toMatchObject({ wake: true, reason: 'at' })
   })
 
-  it('开了 friend_needs_wake_prefix 后，不带前缀就不唤醒', () => {
-    const decision = decideWake(
-      session({ scene: 'c2c', event: 'qq.c2c.message' }),
-      config({ friend_needs_wake_prefix: true }),
-    )
-    expect(decision).toMatchObject({ wake: false, reason: 'not-woken' })
-  })
-
-  it('开了 friend_needs_wake_prefix 后，带前缀唤醒并剥前缀', () => {
-    const decision = decideWake(
-      session({ scene: 'c2c', event: 'qq.c2c.message', content: '#你好' }),
-      config({ friend_needs_wake_prefix: true, wake_prefix: '#', command_prefixes: '/' }),
-    )
-    expect(decision).toMatchObject({ wake: true, reason: 'prefix', text: '你好' })
+  it('没有 @ 也没有前缀时，附件消息也不唤醒', () => {
+    expect(
+      decideWake(session({ atMe: false, content: '', attachments: [{ url: 'https://x/a.png' }] }), config()),
+    ).toMatchObject({ wake: false, reason: 'not-mentioned' })
   })
 })
 
-describe('decideWake：不该唤醒的情况', () => {
-  it('机器人自己发的消息不唤醒（避免自问自答）', () => {
-    const decision = decideWake(session({ userId: 'BOT' }), config())
-    expect(decision).toMatchObject({ wake: false, reason: 'bot-self' })
+describe('群聊：唤醒前缀可自定义', () => {
+  it('多字符前缀', () => {
+    expect(decideWake(session({ content: 'bot 你好' }), config({ wake_prefix: 'bot' }))).toMatchObject({
+      wake: true, reason: 'prefix', text: '你好',
+    })
   })
 
-  it('空消息（正文与附件都没有）不唤醒', () => {
-    const decision = decideWake(session({ content: '   ', attachments: [] }), config())
-    expect(decision).toMatchObject({ wake: false, reason: 'empty' })
+  it('前缀为空时不把任何消息当前缀唤醒', () => {
+    expect(
+      decideWake(session({ content: '/你好', atMe: false }), config({ wake_prefix: '', command_prefixes: '#' })),
+    ).toMatchObject({ wake: false, reason: 'not-mentioned' })
+  })
+})
+
+describe('单聊', () => {
+  it('默认任何消息都唤醒', () => {
+    expect(decideWake(session({ scene: 'c2c', event: 'qq.c2c.message', content: '在吗' }), config())).toMatchObject({
+      wake: true, reason: 'private', text: '在吗',
+    })
   })
 
-  it('指令前缀的消息交给指令路径，不当作聊天', () => {
-    const decision = decideWake(session({ content: '/agent status' }), config())
-    expect(decision).toMatchObject({ wake: false, reason: 'command' })
+  it('开了 friend_needs_wake_prefix 后，不带前缀不唤醒', () => {
+    expect(
+      decideWake(session({ scene: 'c2c', event: 'qq.c2c.message', content: '在吗' }), config({ friend_needs_wake_prefix: true })),
+    ).toMatchObject({ wake: false, reason: 'not-woken' })
   })
 
-  it('没命中指令但带前缀的未知命令，也不该发给模型', () => {
-    const decision = decideWake(session({ content: '/unknowncmd 随便说点什么' }), config())
-    expect(decision).toMatchObject({ wake: false, reason: 'command' })
+  it('开了之后带前缀则唤醒并剥前缀', () => {
+    expect(
+      decideWake(
+        session({ scene: 'c2c', event: 'qq.c2c.message', content: '!在吗' }),
+        config({ friend_needs_wake_prefix: true, wake_prefix: '!', command_prefixes: '#' }),
+      ),
+    ).toMatchObject({ wake: true, reason: 'prefix', text: '在吗' })
+  })
+})
+
+describe('不该唤醒的情况', () => {
+  it('机器人自己发的消息', () => {
+    expect(decideWake(session({ userId: 'BOT' }), config())).toMatchObject({ wake: false, reason: 'bot-self' })
   })
 
-  it('只有图片没有正文时照样唤醒', () => {
-    const decision = decideWake(
-      session({ content: '', attachments: [{ url: 'https://x/a.png', contentType: 'image/png' }] }),
-      config(),
-    )
-    expect(decision).toMatchObject({ wake: true, reason: 'at' })
+  it('空消息', () => {
+    expect(decideWake(session({ content: '   ', attachments: [] }), config())).toMatchObject({
+      wake: false, reason: 'empty',
+    })
+  })
+})
+
+/**
+ * 守卫：**群聊里未 @、未带前缀的消息一条都不该唤醒**。
+ * 上一次就是这一类消息全部进了 AI。用真实 Session 形状扫一批典型内容。
+ */
+describe('守卫：群聊未 @ 未带前缀的消息全都不唤醒', () => {
+  const contents = ['你好', '今天吃啥', '哈哈哈哈', '?', '在吗在吗', '这个怎么弄', '111', '/agent status', '/unknown', '我同意']
+
+  it.each(contents)('内容 %s 不唤醒', (content) => {
+    expect(decideWake(session({ content, atMe: false }), config()).wake).toBe(false)
+  })
+
+  it('同一批内容，只要 @ 了机器人就唤醒（带指令前缀的除外）', () => {
+    for (const content of contents) {
+      const decision = decideWake(session({ content, atMe: true }), config())
+      if (content.startsWith('/')) expect(decision.wake).toBe(false)
+      else expect(decision.wake).toBe(true)
+    }
   })
 })
