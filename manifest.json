@@ -76,6 +76,11 @@
     },
     {
       "method": "POST",
+      "path": "/api/settings",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
       "path": "/api/persona",
       "auth": "admin"
     },
