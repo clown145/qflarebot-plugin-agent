@@ -21,36 +21,156 @@ export const PAGE_HTML = `<!doctype html>
      现在全部改用真实 token（与内置 t2i 插件页面同一套）。 */
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: var(--qb-space-5);
+    margin: 0;
+    /* 兜底：内容再宽也不许整页横向滚动（窄屏下会被裁掉右侧） */
+    overflow-x: hidden;
     background: var(--qb-bg); color: var(--qb-fg);
     font: var(--qb-text-sm) / var(--qb-leading) var(--qb-font-sans);
   }
-  h1 { font-size: var(--qb-text-lg); margin: 0 0 var(--qb-space-1); }
+  /* 长工具名/长 URL 要能断行，否则会把容器撑破 */
+  .tool-name, .skill-id, td { overflow-wrap: anywhere; }
+  h1 { font-size: var(--qb-text-lg); margin: 0; }
   .sub {
     color: var(--qb-fg-muted); font-size: var(--qb-text-xs);
-    margin-bottom: var(--qb-space-4); line-height: var(--qb-leading);
+    margin: var(--qb-space-1) 0 0; line-height: var(--qb-leading);
+  }
+
+  /* ============================================================
+     外壳：侧边栏 + 主区（对标 serverless-agent 的 admin-web）
+     ------------------------------------------------------------
+     上一版是「13 张卡片一路堆下去」，要滚很久才能找到东西，
+     而且「配置」和「统计表」混在一起。现在按内容性质分成 6 个面板，
+     侧边栏切换——一屏只做一件事。
+     ============================================================ */
+  .app-shell {
+    display: grid;
+    grid-template-columns: 216px minmax(0, 1fr);
+    min-height: 100vh;
+  }
+  .sidebar {
+    position: sticky; top: 0; height: 100vh; overflow: auto;
+    border-right: 1px solid var(--qb-border);
+    /* 侧边栏用 bg 而不是 surface：surface 是卡片色，整条侧边栏用卡片色会和
+       主区的卡片糊在一起，看不出"这是一条独立的导航" */
+    background: var(--qb-bg);
+    padding: var(--qb-space-4) var(--qb-space-3);
+  }
+  .brand { padding: 0 var(--qb-space-2) var(--qb-space-4); }
+  .brand-name { font-size: var(--qb-text-base); font-weight: 700; }
+  .brand-sub {
+    color: var(--qb-fg-muted); font-size: var(--qb-text-xs);
+    margin-top: 2px;
+  }
+  .nav-list { display: grid; gap: 2px; }
+  .nav-item {
+    display: flex; align-items: center; gap: var(--qb-space-2);
+    width: 100%; min-height: 36px;
+    border: 0; border-radius: var(--qb-radius-sm);
+    background: transparent; color: var(--qb-fg-muted);
+    padding: 0 var(--qb-space-2);
+    font: inherit; text-align: left; cursor: pointer;
+  }
+  /* 用宿主专为导航提供的 token：--qb-nav-hover / --qb-nav-active。
+     它们已经处理好了浅色/深色两套对比度（浅色是白底、深色是半透明白），
+     自己拿 --qb-surface-muted 顶替会在深色主题下几乎看不见。 */
+  .nav-item:hover { background: var(--qb-nav-hover); color: var(--qb-fg); }
+  .nav-item.active {
+    background: var(--qb-nav-active);
+    box-shadow: var(--qb-nav-active-shadow);
+    color: var(--qb-fg); font-weight: 600;
+  }
+  .nav-item .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor; opacity: .45; flex: 0 0 auto;
+  }
+  .nav-item.active .dot { opacity: 1; }
+
+  .workspace { min-width: 0; display: grid; grid-template-rows: auto 1fr; }
+  .topbar {
+    position: sticky; top: 0; z-index: 4;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: var(--qb-space-3); min-height: 60px;
+    border-bottom: 1px solid var(--qb-border);
+    background: var(--qb-surface);
+    padding: var(--qb-space-2) var(--qb-space-5);
+  }
+  .topbar h1 { font-size: var(--qb-text-base); }
+  .topbar-kicker {
+    display: block; color: var(--qb-fg-muted);
+    font-size: var(--qb-text-xs); margin-bottom: 1px;
+  }
+  .main { padding: var(--qb-space-5); min-width: 0; }
+
+  /* 面板：一次只显示一个 */
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .panel > .card:first-child { margin-top: 0; }
+
+  /* 窄屏：侧边栏收到顶部变成横排 */
+  @media (max-width: 860px) {
+    /* minmax(0, 1fr) 而不是 1fr：1fr 的最小值是 auto，内容（比如一条长工具名）
+       会把列撑破，导致整页横向滚动、右侧内容被裁掉。 */
+    .app-shell { grid-template-columns: minmax(0, 1fr); }
+    .workspace { min-width: 0; }
+    .sidebar {
+      position: static; height: auto; min-width: 0;
+      border-right: 0; border-bottom: 1px solid var(--qb-border);
+      /* height:auto 之后原来的 height:100vh 已经失效，但 topbar 的 sticky
+         会以滚动容器为准；这里只需注意别留出多余空白 */
+      padding: var(--qb-space-2) var(--qb-space-2) 0;
+    }
+    .brand { display: none; }
+    /* 导航横向滚动，但自身不能把父级撑破 */
+    .nav-list {
+      display: flex; gap: var(--qb-space-1);
+      overflow-x: auto; min-width: 0;
+      scrollbar-width: none;
+    }
+    .nav-list::-webkit-scrollbar { display: none; }
+    .nav-item { min-height: 34px; white-space: nowrap; width: auto; flex: 0 0 auto; }
+    .main { padding: var(--qb-space-3); min-width: 0; }
+    .topbar {
+      position: static;   /* 窄屏不需要吸顶：导航已在顶部，再吸会叠两层 */
+      padding: var(--qb-space-2) var(--qb-space-3); min-height: auto;
+    }
+    /* 顶栏标题与右侧按钮在窄屏会互相挤压，让按钮收缩而不是溢出 */
+    .topbar > * { min-width: 0; }
+    .card { max-width: 100%; padding: var(--qb-space-3); }
+    .picker { max-width: 100%; }
+    .search { max-width: 100%; }
+    table { max-width: 100%; }
   }
   .card {
     background: var(--qb-surface); border: 1px solid var(--qb-border);
     border-radius: var(--qb-radius); padding: var(--qb-space-4);
     margin-bottom: var(--qb-space-4);
+    /* 卡片本身占满宽度（和表格配合），但内容别拉成一条线：
+       输入框、下拉在 1600px 宽的屏幕上拉满是没法读的 */
+    max-width: 1080px;
   }
   .card h2 { font-size: var(--qb-text-sm); margin: 0 0 var(--qb-space-1); font-weight: 600; }
   .card .hint {
     color: var(--qb-fg-muted); font-size: var(--qb-text-xs);
     margin: 0 0 var(--qb-space-3); line-height: var(--qb-leading);
   }
+  /* 开关行：标签在左，控件紧靠右侧但在一个收敛的宽度内。
+     用 space-between 会把勾选框甩到 1080px 外，眼睛要在两端来回跳。 */
   .row {
-    display: flex; justify-content: space-between; align-items: center; gap: var(--qb-space-3);
-    padding: var(--qb-space-1) 0; border-bottom: 1px solid var(--qb-border);
+    display: flex; align-items: center; gap: var(--qb-space-3);
+    padding: var(--qb-space-2) 0; border-bottom: 1px solid var(--qb-border);
+    max-width: 560px;
   }
   .row:last-child { border-bottom: 0; }
-  .row .k { color: var(--qb-fg-muted); }
+  .row .k { flex: 1; }
+  .row input[type="checkbox"] { flex: 0 0 auto; }
+  /* 带说明的开关（如「虚拟工作区（需绑定 R2）」）用 muted 小字跟在标签后 */
+  .row .k .muted { margin-left: var(--qb-space-1); }
   .ok { color: var(--qb-success); }
   .bad { color: var(--qb-danger); }
   .warn { color: var(--qb-warning); }
 
-  table { width: 100%; border-collapse: collapse; font-size: var(--qb-text-xs); }
+  /* 表格别占满整个宽度：四列数据摊到 1080px 上，表头和数值隔了一屏 */
+  table { width: 100%; max-width: 860px; border-collapse: collapse; font-size: var(--qb-text-xs); }
   th, td { text-align: left; padding: var(--qb-space-2) var(--qb-space-1); border-bottom: 1px solid var(--qb-border); }
   th { color: var(--qb-fg-muted); font-weight: 500; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -95,7 +215,7 @@ export const PAGE_HTML = `<!doctype html>
     padding: var(--qb-space-2) var(--qb-space-3); font-size: var(--qb-text-xs);
     font-family: inherit;
   }
-  .search { width: 100%; margin-bottom: var(--qb-space-1); }
+  .search { width: 100%; max-width: 420px; margin-bottom: var(--qb-space-1); }
   select.select-inline { width: auto; min-width: 7rem; }
   .search:focus, select.select-inline:focus {
     outline: none; border-color: var(--qb-accent); box-shadow: 0 0 0 2px var(--qb-ring);
@@ -175,7 +295,21 @@ export const PAGE_HTML = `<!doctype html>
     background: var(--qb-input); color: var(--qb-fg); font-weight: 500;
   }
   .persona-item textarea { min-height: 4.5rem; margin-top: var(--qb-space-1); font-size: var(--qb-text-xs); }
-  .persona-item .lbl { color: var(--qb-fg-muted); font-size: var(--qb-text-xs); }
+  /* 必须 block：label 默认是 inline，后面的 input/textarea 会挤在同一行，
+     出现「可用工具 [输入框] 可见技能 [输入框]」挤成一坨的情况 */
+  .persona-item .lbl {
+    display: block;
+    color: var(--qb-fg-muted); font-size: var(--qb-text-xs);
+    margin: var(--qb-space-2) 0 var(--qb-space-1);
+  }
+  /* 人格编辑器里的单行输入（工具/技能白名单） */
+  .persona-item input:not(.p-name) {
+    width: 100%; max-width: 420px;
+    padding: var(--qb-space-1) var(--qb-space-2);
+    border-radius: var(--qb-radius-sm); border: 1px solid var(--qb-border);
+    background: var(--qb-input); color: var(--qb-fg);
+    font-size: var(--qb-text-xs);
+  }
   .badge-changed {
     display: inline-block; padding: 0 var(--qb-space-1);
     border-radius: var(--qb-radius-sm); font-size: var(--qb-text-xs);
@@ -227,12 +361,35 @@ export const PAGE_HTML = `<!doctype html>
 </style>
 </head>
 <body>
-<h1>Agent</h1>
-<div class="sub">
-  带工具调用的多轮对话。<strong>能在这里改的都在这里改</strong>——所有开关、人格、模型、会话。
-  <span class="muted" id="overrideHint"></span>
-</div>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-name">Agent</div>
+      <div class="brand-sub">带工具调用的多轮对话</div>
+    </div>
+    <nav class="nav-list" id="navList">
+      <button class="nav-item active" data-view="model" type="button"><span class="dot"></span>模型与人格</button>
+      <button class="nav-item" data-view="chat" type="button"><span class="dot"></span>对话行为</button>
+      <button class="nav-item" data-view="tools" type="button"><span class="dot"></span>工具</button>
+      <button class="nav-item" data-view="skills" type="button"><span class="dot"></span>技能</button>
+      <button class="nav-item" data-view="data" type="button"><span class="dot"></span>会话与任务</button>
+      <button class="nav-item" data-view="stats" type="button"><span class="dot"></span>统计</button>
+    </nav>
+  </aside>
 
+  <div class="workspace">
+    <header class="topbar">
+      <div>
+        <span class="topbar-kicker" id="viewKicker">配置</span>
+        <h1 id="viewTitle">模型与人格</h1>
+      </div>
+      <button class="ghost small" id="resetAll" type="button">全部恢复成配置值</button>
+    </header>
+
+    <main class="main" id="mainArea">
+
+<!-- ============ 面板：模型与人格 ============ -->
+<section class="panel active" data-panel="model">
 <div class="card">
   <h2>模型</h2>
   <p class="hint">点一下就切换。别名来自「LLM 接口」插件，不用手打。</p>
@@ -268,6 +425,10 @@ export const PAGE_HTML = `<!doctype html>
   </div>
 </div>
 
+</section>
+
+<!-- ============ 面板：对话行为 ============ -->
+<section class="panel" data-panel="chat">
 <div class="card">
   <h2>系统提示词</h2>
   <p class="hint">没有人格时用它。改完点保存立即生效。</p>
@@ -308,44 +469,6 @@ export const PAGE_HTML = `<!doctype html>
   <div class="row"><span class="k">单聊显示「正在输入」</span><input type="checkbox" id="showTyping" /></div>
 </div>
 
-<div class="card">
-  <h2>工具 <span class="muted small" id="toolCount"></span></h2>
-  <p class="hint">
-    关掉的工具<strong>根本不注册</strong>——模型看不到，也就不会去调用后被权限拒绝。
-    这比让模型反复撞权限墙更省 token。
-    <span class="muted">改完立即生效，下一轮对话就按新的来。</span>
-  </p>
-  <div id="toolList"><div class="loading">加载中…</div></div>
-</div>
-
-<div class="card">
-  <h2>技能 <span class="muted small" id="skillCount"></span></h2>
-  <p class="hint">
-    每轮只给模型一份目录（<code>- id: 描述</code>，最多 40 条，成本固定且很小）；
-    用户发 <code>/skill &lt;id&gt; &lt;任务&gt;</code> 激活后，才载入该技能的完整正文。
-    必须在「能力开关」里打开<strong>启用技能</strong>才会生效。
-  </p>
-  <div id="skillList" class="skill-list"><div class="loading">加载中…</div></div>
-  <div class="actions">
-    <button class="small" id="addSkill">新增技能</button>
-    <span class="muted small">正文上限 32KB；<code>description</code> 必填，它会进模型目录</span>
-  </div>
-  <div class="skill-editor" id="skillEditor" hidden>
-    <div class="field">
-      <label class="field-label">技能 id <span class="muted">（字母数字 . _ -，1–64 字符）</span></label>
-      <input id="skillId" class="search" placeholder="report" />
-    </div>
-    <div class="field">
-      <label class="field-label">SKILL.md 全文 <span class="muted">（含 frontmatter）</span></label>
-      <textarea id="skillBody" placeholder="---&#10;name: 写周报&#10;description: 把本周提交整理成周报&#10;---&#10;&#10;# 步骤&#10;1. …"></textarea>
-    </div>
-    <div class="actions">
-      <button class="small" id="saveSkill">保存技能</button>
-      <button class="ghost small" id="cancelSkill">取消</button>
-      <span class="muted small" id="skillEditorState"></span>
-    </div>
-  </div>
-</div>
 
 <div class="card">
   <h2>限额</h2>
@@ -374,7 +497,65 @@ export const PAGE_HTML = `<!doctype html>
   </div>
   <p class="muted small">改动即时保存，不需要再点保存。</p>
 </div>
+</section>
 
+<!-- ============ 面板：工具 ============ -->
+<section class="panel" data-panel="tools">
+<div class="card">
+  <h2>工具 <span class="muted small" id="toolCount"></span></h2>
+  <p class="hint">
+    关掉的工具<strong>根本不注册</strong>——模型看不到，也就不会去调用后被权限拒绝。
+    这比让模型反复撞权限墙更省 token。
+    <span class="muted">改完立即生效，下一轮对话就按新的来。</span>
+  </p>
+  <div class="actions" style="margin-bottom: var(--qb-space-2)">
+    <input class="search" id="toolSearch" placeholder="按名字或描述过滤…" style="max-width: 260px; margin: 0" />
+    <button class="ghost small" id="toolEnableAll">全部启用</button>
+    <button class="ghost small" id="toolDisableAll">全部关闭</button>
+  </div>
+  <div id="toolList"><div class="loading">加载中…</div></div>
+</div>
+
+</section>
+
+<!-- ============ 面板：技能 ============ -->
+<section class="panel" data-panel="skills">
+<div class="card">
+  <h2>技能 <span class="muted small" id="skillCount"></span></h2>
+  <p class="hint">
+    每轮只给模型一份目录（<code>- id: 描述</code>，最多 40 条，成本固定且很小）；
+    用户发 <code>/skill &lt;id&gt; &lt;任务&gt;</code> 激活后，才载入该技能的完整正文。
+    必须在「能力开关」里打开<strong>启用技能</strong>才会生效。
+  </p>
+  <div class="actions" style="margin-bottom: var(--qb-space-2)">
+    <input class="search" id="skillSearch" placeholder="按 id 或描述过滤…" style="max-width: 260px; margin: 0" />
+  </div>
+  <div id="skillList" class="skill-list"><div class="loading">加载中…</div></div>
+  <div class="actions">
+    <button class="small" id="addSkill">新增技能</button>
+    <span class="muted small">正文上限 32KB；<code>description</code> 必填，它会进模型目录</span>
+  </div>
+  <div class="skill-editor" id="skillEditor" hidden>
+    <div class="field">
+      <label class="field-label">技能 id <span class="muted">（字母数字 . _ -，1–64 字符）</span></label>
+      <input id="skillId" class="search" placeholder="report" />
+    </div>
+    <div class="field">
+      <label class="field-label">SKILL.md 全文 <span class="muted">（含 frontmatter）</span></label>
+      <textarea id="skillBody" placeholder="---&#10;name: 写周报&#10;description: 把本周提交整理成周报&#10;---&#10;&#10;# 步骤&#10;1. …"></textarea>
+    </div>
+    <div class="actions">
+      <button class="small" id="saveSkill">保存技能</button>
+      <button class="ghost small" id="cancelSkill">取消</button>
+      <span class="muted small" id="skillEditorState"></span>
+    </div>
+  </div>
+</div>
+
+</section>
+
+<!-- ============ 面板：会话与任务 ============ -->
+<section class="panel" data-panel="data">
 <div class="card">
   <h2>会话</h2>
   <p class="hint">每个会话一段独立记忆。绑过人格的会话列在这里，可以直接改。</p>
@@ -401,6 +582,10 @@ export const PAGE_HTML = `<!doctype html>
   </table>
 </div>
 
+</section>
+
+<!-- ============ 面板：统计 ============ -->
+<section class="panel" data-panel="stats">
 <div class="card">
   <h2>最近 14 天</h2>
   <table>
@@ -410,11 +595,16 @@ export const PAGE_HTML = `<!doctype html>
 </div>
 
 <div class="card">
-  <h2>恢复</h2>
-  <p class="hint">本页改过的项存在插件自己的存储里，覆盖面板配置。这里可以一次清空。</p>
+  <h2>覆盖状态</h2>
+  <p class="hint">本页改过的项存在插件自己的存储里，覆盖面板配置。工具栏右上角可一次清空。</p>
   <div class="actions">
-    <button class="ghost small" id="resetAll">全部恢复成配置里的值</button>
     <span class="muted small" id="overrideState"></span>
+    <span class="muted small" id="overrideHint"></span>
+  </div>
+</div>
+
+</section>
+    </main>
   </div>
 </div>
 
@@ -429,6 +619,55 @@ export const PAGE_HTML = `<!doctype html>
  * - 改完即时保存（或一个明确的保存按钮），成败都用 toast 说明；
  * - 每块都给出「已改 / 来自配置」的状态，可单项或整体恢复。
  */
+/* ---------------------------------------------------------------- 面板切换 */
+
+/**
+ * 视图定义：侧边栏每一项对应一个面板。
+ *
+ * 上一版是「13 张卡片一路堆在单页」，要滚很久才能找到东西，配置和统计表还混在一起。
+ * 现在按内容性质拆成 6 个面板，一屏只做一件事（对标 serverless-agent 的 admin-web）。
+ */
+const VIEWS = {
+  model: { title: '模型与人格', kicker: '配置' },
+  chat: { title: '对话行为', kicker: '配置' },
+  tools: { title: '工具', kicker: '能力' },
+  skills: { title: '技能', kicker: '能力' },
+  data: { title: '会话与任务', kicker: '运行数据' },
+  stats: { title: '统计', kicker: '运行数据' },
+}
+
+/** 当前视图。首次进入读 URL hash，刷新不跳回第一个面板 */
+let currentView = 'model'
+
+function applyView(name) {
+  const view = VIEWS[name] ? name : 'model'
+  currentView = view
+
+  for (const panel of document.querySelectorAll('.panel')) {
+    panel.classList.toggle('active', panel.dataset.panel === view)
+  }
+  for (const item of document.querySelectorAll('.nav-item')) {
+    item.classList.toggle('active', item.dataset.view === view)
+  }
+
+  $('viewTitle').textContent = VIEWS[view].title
+  $('viewKicker').textContent = VIEWS[view].kicker
+  // hash 记住当前面板：面板里刷新/重开不会跳回第一个
+  if (location.hash !== '#' + view) history.replaceState(null, '', '#' + view)
+
+  bridge?.resize?.()
+  window.scrollTo(0, 0)
+}
+
+function initNavigation() {
+  for (const item of document.querySelectorAll('.nav-item')) {
+    item.addEventListener('click', () => applyView(item.dataset.view))
+  }
+  // 支持 #tools 这类直接定位（面板里刷新、或者从别处链接过来）
+  const fromHash = location.hash.replace(/^#/, '')
+  applyView(VIEWS[fromHash] ? fromHash : 'model')
+}
+
 const $ = (id) => document.getElementById(id)
 const yes = (v) => v ? '<span class="ok">开</span>' : '<span class="bad">关</span>'
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
@@ -891,15 +1130,32 @@ const SIDE_EFFECT_TAG = {
 }
 
 function renderTools(toolState) {
-  const list = toolState?.list ?? []
+  const all = toolState?.list ?? []
   const disabled = new Set(toolState?.disabled ?? [])
-  $('toolCount').textContent = list.length
-    ? '(' + (list.length - disabled.size) + '/' + list.length + ' 已启用)'
-    : ''
+  // 过滤只在渲染层做，不改 state —— 否则打一个字就丢了完整的开关状态
+  const keyword = ($('toolSearch')?.value ?? '').trim().toLowerCase()
+  const list = keyword
+    ? all.filter(
+        (t) =>
+          t.name.toLowerCase().includes(keyword) ||
+          (t.description ?? '').toLowerCase().includes(keyword),
+      )
+    : all
 
-  if (!list.length) {
+  $('toolCount').textContent = all.length
+    ? '(' + (all.length - disabled.size) + '/' + all.length + ' 已启用)'
+    : ''
+  $('toolEnableAll').disabled = disabled.size === 0
+  $('toolDisableAll').disabled = all.length === 0 || disabled.size === all.length
+
+  if (!all.length) {
     $('toolList').innerHTML =
       '<div class="empty">没有可用工具。可能「工具调用」这个总开关被关掉了。</div>'
+    return
+  }
+  if (!list.length) {
+    $('toolList').innerHTML =
+      '<div class="empty">没有匹配「' + esc(keyword) + '」的工具</div>'
     return
   }
 
@@ -947,16 +1203,34 @@ async function saveToolToggle(name, enabled) {
 /* ---------------------------------------------------------------- 技能 */
 
 function renderSkills(skills) {
-  $('skillCount').textContent = skills?.length ? '(' + skills.length + ')' : ''
+  const all = skills ?? []
+  const keyword = ($('skillSearch')?.value ?? '').trim().toLowerCase()
+  const list = keyword
+    ? all.filter(
+        (s) =>
+          s.id.toLowerCase().includes(keyword) ||
+          (s.name ?? '').toLowerCase().includes(keyword) ||
+          (s.description ?? '').toLowerCase().includes(keyword),
+      )
+    : all
 
-  if (!skills?.length) {
+  $('skillCount').textContent = all.length ? '(' + all.length + ')' : ''
+
+  if (all.length && !list.length) {
+    $('skillList').innerHTML =
+      '<div class="empty">没有匹配「' + esc(keyword) + '」的技能</div>'
+    return
+  }
+  const skills2 = list
+
+  if (!skills2?.length) {
     $('skillList').innerHTML =
       '<div class="empty">还没有技能。点「新增技能」写一份 SKILL.md —— ' +
       '它能把你反复交代的做事流程固定下来，不用每轮都塞进系统提示词。</div>'
     return
   }
 
-  $('skillList').innerHTML = skills.map((skill) =>
+  $('skillList').innerHTML = skills2.map((skill) =>
     '<div class="skill-item" data-skill="' + esc(skill.id) + '">' +
       '<div class="skill-head">' +
         '<span class="skill-id">' + esc(skill.id) + '</span>' +
@@ -1128,6 +1402,26 @@ $('savePersonaList')?.addEventListener('click', savePersonas)
 $('convSearch').addEventListener('input', renderConversations)
 $('resetAll').addEventListener('click', resetAll)
 
+/* 工具栏：搜索与批量开关 */
+$('toolSearch').addEventListener('input', () => renderTools(state.tools ?? { list: [], disabled: [] }))
+$('skillSearch').addEventListener('input', () => renderSkills(state.skills ?? []))
+
+/** 批量设置：一次提交整批状态，避免逐个请求导致中间态不一致 */
+async function saveAllTools(disabledList) {
+  try {
+    await postJson('/api/tools', { disabled: disabledList })
+    notify(disabledList.length ? '已关闭所选的 ' + disabledList.length + ' 个工具' : '已全部启用', 'success')
+    await load()
+  } catch (e) {
+    notify('保存失败：' + e.message, 'error')
+    await load()
+  }
+}
+$('toolEnableAll').addEventListener('click', () => { void saveAllTools([]) })
+$('toolDisableAll').addEventListener('click', () => {
+  void saveAllTools((state.tools?.list ?? []).map((t) => t.name))
+})
+
 /* 工具栏：checkbox 用事件委托——列表是渲染出来的，绑不上固定 id。
    而且每次 load() 都会重建 DOM，委托能避免重复绑定。 */
 $('toolList').addEventListener('change', (e) => {
@@ -1177,6 +1471,8 @@ $('testBtn').addEventListener('click', async () => {
   }
 })
 
+// 先建导航再拉数据：即使接口挂了，用户也能在面板之间切换、看到哪块报错
+initNavigation()
 load()
 bridge?.resize?.()
 </script>
