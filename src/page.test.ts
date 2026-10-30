@@ -251,3 +251,59 @@ describe('可用性：不要让人手打机器该给的东西', () => {
     expect(PAGE_HTML).not.toContain('不需要回面板填表单')
   })
 })
+
+/**
+ * 单项「已改」标记 + 单项恢复。
+ *
+ * 之前只有底部一个「全部恢复成配置值」：改了某一项想单独退回去，
+ * 只能全部重置再重改一遍。对标 AstrBot 的「改过的字段标圆点、可恢复默认」。
+ *
+ * 后端早就支持（`POST /api/settings` 的 `reset: [字段]`），
+ * 这部分纯粹是 UI 没用足 —— 所以测试重点在「接线」而不是接口。
+ */
+describe('单项已改标记与恢复', () => {
+  it('有渲染徽标的函数，且在 renderConfig 里被调用', () => {
+    expect(PAGE_HTML).toContain('function renderOverrideBadges')
+    expect(PAGE_HTML).toContain('renderOverrideBadges()')
+  })
+
+  it('每个配置项都有字段 → 控件的映射', () => {
+    // 覆盖所有会进 overriddenKeys 的字段，漏一个就有一项恢复不了
+    for (const field of [
+      'model', 'system_prompt', 'wake_prefix', 'friend_needs_wake_prefix',
+      'max_model_steps', 'max_tool_calls', 'history_limit', 'request_timeout_ms',
+      'timezone', 'context_compression', 'max_context_tokens', 'rate_limit_per_minute',
+      'enable_tools', 'enable_vfs', 'enable_schedule', 'enable_skills',
+      'enable_audit', 'show_typing', 'content_filter_keywords',
+      'personas', 'default_persona',
+    ]) {
+      expect(PAGE_HTML, `缺少 ${field} 的映射`).toContain(field + ':')
+    }
+  })
+
+  it('恢复单个字段走 reset 数组，而不是整体重置', () => {
+    expect(PAGE_HTML).toContain('function resetField')
+    // 关键：只重置这一项，不能误用 reset: true 把全部清掉
+    expect(PAGE_HTML).toContain('reset: [field]')
+  })
+
+  it('标记是幂等注入的（反复渲染不重复堆叠）', () => {
+    // 每次都先清理再插，否则每轮 load() 都会多一层徽标
+    expect(PAGE_HTML).toContain('function clearOverrideBadges')
+    expect(PAGE_HTML).toContain('clearOverrideBadges()')
+  })
+
+  it('撤消按钮有可访问名（不是只有一个 × 符号）', () => {
+    expect(PAGE_HTML).toContain('aria-label')
+    expect(PAGE_HTML).toContain("'恢复「'")
+  })
+
+  it('标记有 title 说明它改的是哪一项', () => {
+    expect(PAGE_HTML).toContain('被本页改过，点 × 恢复成插件配置里的值')
+  })
+
+  it('不再重复显示「已改」文字（徽标已经表达了）', () => {
+    // 之前 modelHint / promptState 也写「已改」，和徽标重复
+    expect(PAGE_HTML).not.toContain('本页覆盖</span>')
+  })
+})

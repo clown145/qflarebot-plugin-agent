@@ -31,9 +31,9 @@ function renderModel() {
     if (alias === current) option.selected = true
     select.appendChild(option)
   }
-  $('modelHint').innerHTML = isOverridden('model')
-    ? '已改 <span class="badge badge--warning">本页覆盖</span>'
-    : '来自插件配置'
+  // 「已改」由 renderOverrideBadges 统一打徽标，这里只说明来源；
+  // 两边都说一遍是重复信息，用户会以为是两件事
+  $('modelHint').textContent = '来自插件配置'
 }
 
 /* ---------------------------------------------------------------- 渲染：人格 */

@@ -154,8 +154,9 @@ function renderConfig() {
   const c = state.config
 
   $('promptBox').value = c.system_prompt ?? ''
+  // 「已改」由徽标统一表达，这里只说来源，不重复
   $('promptState').textContent = isOverridden('system_prompt')
-    ? '已改（配置里是另一份）'
+    ? '本页的这份覆盖了插件配置里的值，点标题旁的 × 可恢复'
     : '来自插件配置'
 
   $('wakePrefix').value = c.wake_prefix ?? '/'
@@ -180,6 +181,9 @@ function renderConfig() {
     (values) => void savePatch({ content_filter_keywords: values.join(',') }),
     '关键词回车',
   )
+
+  // 最后统一打「已改」标记：它依赖上面所有控件的值都已渲染完
+  renderOverrideBadges()
 }
 
 function splitKeywords(raw) {
@@ -189,4 +193,206 @@ function splitKeywords(raw) {
     .map((s) => s.trim())
     .filter(Boolean)
 }
+
+/**
+ * 给「被页面改过」的配置项加「已改」标记 + 单项恢复。
+ *
+ * ## 为什么要做
+ *
+ * 之前只有底部一个「全部恢复成配置值」。用户改了某一项想单独退回去，
+ * 只能全部重置再重改一遍——而面板配置是权威默认值，改坏了很难找回原样。
+ * AstrBot 的做法是「改过的字段标圆点，和默认不一样的可以恢复默认」。
+ *
+ * ## 实现方式：幂等注入，不改 HTML 结构
+ *
+ * 标记不写死在 HTML 里，而是渲染时按 overriddenKeys 动态插到对应
+ * setting-row 的标题旁。好处：
+ * - 字段增减只改这张映射表，不用同时改模板
+ * - 反复渲染不会重复插入（先清理再插）
+ *
+ * ## 为什么用「字段 → 控件 id」而不是反过来
+ *
+ * 一个配置项可能对应多个控件（比如 friend_needs_wake_prefix 是开关），
+ * 反过来查需要遍历 DOM；用映射表直接定位更快也更明确。
+ */
+const FIELD_CONTROL = {
+  model: 'modelSelect',
+  system_prompt: 'promptBox',
+  wake_prefix: 'wakePrefix',
+  friend_needs_wake_prefix: 'friendPrefix',
+  max_model_steps: 'maxSteps',
+  max_tool_calls: 'maxToolCalls',
+  history_limit: 'historyLimit',
+  request_timeout_ms: 'timeoutMs',
+  timezone: 'timezone',
+  context_compression: 'contextCompression',
+  max_context_tokens: 'maxContextTokens',
+  rate_limit_per_minute: 'rateLimit',
+  enable_tools: null,
+  enable_vfs: null,
+  enable_schedule: null,
+  enable_skills: null,
+  enable_audit: null,
+  show_typing: null,
+  content_filter_keywords: 'filterKeywords',
+  personas: null,
+  default_persona: 'defaultPersona',
+}
+
+/** 字段 → 人话名字。标在标记的 title 上，鼠标悬停能看到改的是哪一项 */
+const FIELD_LABEL = {
+  model: '模型',
+  system_prompt: '系统提示词',
+  wake_prefix: '唤醒前缀',
+  friend_needs_wake_prefix: '单聊需要前缀',
+  max_model_steps: '模型步数',
+  max_tool_calls: '工具调用数',
+  history_limit: '历史条数',
+  request_timeout_ms: '模型超时',
+  timezone: '时区',
+  context_compression: '上下文压缩',
+  max_context_tokens: '压缩阈值',
+  rate_limit_per_minute: '每分钟上限',
+  enable_tools: '工具调用',
+  enable_vfs: '虚拟工作区',
+  enable_schedule: '定时任务',
+  enable_skills: '技能',
+  enable_audit: '记录工具调用',
+  show_typing: '正在输入',
+  content_filter_keywords: '内容安全关键词',
+  personas: '人格列表',
+  default_persona: '默认人格',
+}
+
+/**
+ * 把一个控件定位到它所在的 setting-row（或等价的容器）。
+ *
+ * 找不到就返回 null —— 标记是**增强**，不该因为 DOM 结构变化就报错。
+ */
+function rowOf(control) {
+  if (!control) return null
+  // 开关按钮的直接父级是 .setting-control，再往上是 .setting-row
+  return control.closest('.setting-row') ?? control.closest('.field') ?? null
+}
+
+/** 清掉上一次渲染插入的标记（幂等的前提） */
+function clearOverrideBadges() {
+  for (const el of document.querySelectorAll('.override-badge')) el.remove()
+}
+
+/**
+ * 给一个字段的控件加「已改」标记 + 恢复按钮。
+ *
+ * 标记挂在标题（.setting-label）后面而不是控件旁边：控件区通常已经
+ * 很挤（输入框 + 单位），再塞按钮会换行。
+ */
+function markOverridden(field, control) {
+  const row = rowOf(control)
+  if (!row) return
+
+  const host = row.querySelector('.setting-label') ?? row.querySelector('label') ?? row
+  const badge = document.createElement('span')
+  badge.className = 'override-badge'
+  badge.style.cssText = [
+    'display: inline-flex',
+    'align-items: center',
+    'gap: 4px',
+    'margin-left: 6px',
+    'padding: 0 6px',
+    'height: 18px',
+    'border-radius: 999px',
+    'border: 1px solid var(--qb-warning)',
+    'color: var(--qb-warning)',
+    'font-size: 11px',
+    'font-weight: 500',
+    'vertical-align: middle',
+  ].join(';')
+  badge.title = '「' + (FIELD_LABEL[field] ?? field) + '」被本页改过，点 × 恢复成插件配置里的值'
+
+  const text = document.createElement('span')
+  text.textContent = '已改'
+  badge.appendChild(text)
+
+  const undo = document.createElement('button')
+  undo.type = 'button'
+  undo.textContent = '×'
+  undo.setAttribute('aria-label', '恢复「' + (FIELD_LABEL[field] ?? field) + '」为插件配置里的值')
+  // 点击热区要够大：规范要求触控目标不小于 44px，但这个 × 很小，
+  // 用 padding 把热区撑开（视觉上仍是小 ×，不会撑大徽标）
+  undo.style.cssText = [
+    'border: 0',
+    'background: transparent',
+    'color: inherit',
+    'cursor: pointer',
+    'font-size: 13px',
+    'line-height: 1',
+    'padding: 0 2px',
+    'margin: -8px -4px -8px 0',
+    'min-width: 24px',
+    'min-height: 24px',
+  ].join(';')
+  undo.addEventListener('click', async (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    await resetField(field)
+  })
+  badge.appendChild(undo)
+
+  host.appendChild(badge)
+}
+
+/**
+ * 恢复单个字段。
+ *
+ * 走 POST /api/settings 的 reset: [字段] —— 后端早就支持，
+ * 之前只是页面没用。patch: { 字段: null } 效果相同，用 reset 更直白。
+ */
+async function resetField(field) {
+  try {
+    await postJson('/api/settings', { reset: [field] })
+    notify('已恢复「' + (FIELD_LABEL[field] ?? field) + '」', 'success')
+    await load()
+  } catch (e) {
+    notify('恢复失败：' + e.message, 'error')
+    // 失败也要刷回真实值，否则标记和实际状态不一致
+    await load()
+  }
+}
+
+/**
+ * 给所有被改过的项加标记。在 renderConfig 末尾调。
+ *
+ * 注意 personas / default_persona 这类也在 overriddenKeys 里，
+ * 但它们没有单一控件，标记会挂在「人格」卡片的标题上。
+ */
+function renderOverrideBadges() {
+  clearOverrideBadges()
+  const keys = state.config.overriddenKeys ?? []
+  if (!keys.length) return
+
+  for (const field of keys) {
+    const controlId = FIELD_CONTROL[field]
+    if (controlId) {
+      const control = $(controlId)
+      if (control) markOverridden(field, control)
+      continue
+    }
+
+    // 没有单一控件的（人格列表、默认人格）：挂到「人格」卡片的标题上。
+    //
+    // 用标题文本定位而不是「面板 + 第几个卡片」这种路径选择器：
+    // 后者依赖 DOM 层级和顺序，改一下卡片布局就失效，
+    // 而且选择器字符串会和结构测试里的面板统计互相干扰。
+    if (field === 'personas' || field === 'default_persona') {
+      const title = [...document.querySelectorAll('.card-title')].find((el) =>
+        el.textContent.includes('人格'),
+      )
+      if (title) markOverridden(field, title)
+      continue
+    }
+    const sw = document.querySelector('[data-flag="' + field + '"]')
+    if (sw) markOverridden(field, sw)
+  }
+}
+
 `
