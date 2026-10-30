@@ -69,8 +69,11 @@ export function createPageRoutesPage(): Route<AgentConfig>[] {
         // 再也点不到「重新开启」。这里同步建一次 registry（buildRegistry 是纯函数、
         // 不碰网络），r2 探测用 false 代替——页面只需要工具清单与权限级别，
         // 而真实探测一次要多一个 R2 往返。
+        // **必须把 toolSettings.config 传进去**：不传的话 buildRegistry 认为
+        // 没有任何工具配置，页面就永远显示「未配置」——用户填了搜索 Key，
+        // 回到工具栏却看不到「已配置」，会以为没保存成功。
         const catalogTools = toToolCatalog(
-          (await buildRegistry(ctx, config, false)).list(),
+          (await buildRegistry(ctx, config, false, new Set(), undefined, toolSettings.config ?? {})).list(),
           toolSettings,
         )
 

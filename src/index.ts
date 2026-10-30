@@ -40,6 +40,7 @@ import { hydrateImageAttachments } from './agent/media.js'
 import { withMention, type MentionMode } from './agent/mention.js'
 import { BLOCKED_REPLY, checkContent, parseKeywords } from './agent/safety.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
+import { ensureColumns, REQUIRED_COLUMNS } from './store/migrate.js'
 import {
   advanceSchedule,
   cancelSchedule,
@@ -584,6 +585,7 @@ async function ensureSchema(ctx: PluginContext<AgentConfig>): Promise<void> {
   for (const statement of SCHEMA_STATEMENTS) {
     await ctx.db.exec(statement)
   }
+  await ensureColumns(ctx, REQUIRED_COLUMNS)
   schemaReady = true
 }
 
