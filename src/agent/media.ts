@@ -9,16 +9,41 @@
  *
  * 所以入站时就把图片取回来（此时签名一定有效），转成 base64 存进消息里。
  *
- * ## 为什么限制大小
+ * ## 体积限制从哪来
  *
- * base64 编码会把体积撑大约 1/3，而一次模型请求的 body 上限是 256 KB
- * （见 plugin-llm 的限制说明）。所以单张图片限制在 1.5 MB 以内，
- * 超过的直接降级成"发不了"，而不是让整个对话因为超限失败。
+ * **不是** plugin-llm 的 `body_max_bytes`（256 KB）——那个只管它自己的管理页 API
+ * （`PUT /api/config` 之类），`llm.chat()` 是进程内直调、不经那条路，请求方向
+ * 没有任何体积校验。真实约束在别处：
+ *
+ * - **Worker 内存**：一次事件里整个请求体、base64 编码的中间串、克隆出来的
+ *   消息副本都要同时存在。免费版 Worker 的内存上限只有 128 MB，而且这是
+ *   全机器人所有插件共享的。
+ * - **CPU**：base64 编码是纯 CPU 活，而免费版一次事件只有 10 ms CPU。
+ *   大图会直接把这一轮算超时。
+ * - **上游**：多数 provider 对单张图片有自己的上限（常见 5–20 MB），但那是
+ *   上游的规矩，不该由我们替它赌。
+ *
+ * 所以这里用**两道闸**：单张上限挡掉个别大图，总量上限挡掉「4 张中等图叠起来
+ * 依然过大」这种组合。超限的图不下载、只留一句说明，整条对话不受影响。
  */
 import type { MessageAttachment } from '../types.js'
 
-/** 单张图片上限：base64 后约 2 MB，留足 JSON 结构与其他消息的余量 */
-const MAX_IMAGE_BYTES = 1_500_000
+/**
+ * 单张图片上限（原始字节，未编码）。
+ *
+ * base64 会把体积撑大约 4/3，所以 800 KB 的原图编码后约 1.07 MB。
+ * 这个数字是权衡：手机直出的照片常在 2–4 MB，基本都会被挡在这里——
+ * 但那种尺寸塞进 Worker 内存和 10 ms CPU 预算里本来就不现实。
+ */
+const MAX_IMAGE_BYTES = 800_000
+
+/**
+ * 一次请求里所有图片的**总量**上限（原始字节）。
+ *
+ * 光有单张上限不够：4 张各 700 KB 的图全是合法单张，加起来编码后接近 3.7 MB。
+ * 总量取 1.5 MB（编码后约 2 MB），在 Worker 内存里留足余量。
+ */
+const MAX_TOTAL_IMAGE_BYTES = 1_500_000
 
 /** 一次最多取几张图。群里有人连发十几张时不能全下 */
 const MAX_IMAGES = 4
@@ -43,9 +68,19 @@ export async function hydrateImageAttachments(
 
   const notes: string[] = []
   const hydrated: MessageAttachment[] = []
+  /** 已收下图片的原始字节总和（base64 前的口径） */
+  let totalBytes = 0
 
   for (const image of images) {
+    // 已经有 base64 的（重入路径）：按编码后的长度折回原始字节，同样要计入总量。
+    // 不折回来就会漏算——一张已有的 700 KB 图 + 三张新图还是可能超限。
     if (image.dataBase64) {
+      const rawEstimate = Math.ceil((image.dataBase64.length * 3) / 4)
+      if (totalBytes + rawEstimate > MAX_TOTAL_IMAGE_BYTES) {
+        notes.push('图片总大小超过上限，最后几张没有读取')
+        continue
+      }
+      totalBytes += rawEstimate
       hydrated.push(image)
       continue
     }
@@ -67,6 +102,12 @@ export async function hydrateImageAttachments(
         notes.push(`有一张图片太大（${Math.round(buffer.byteLength / 1024)} KB），没有读取`)
         continue
       }
+      // 单张合格但累计超限：说明「几张中等图叠起来」已经逼近内存与 CPU 预算
+      if (totalBytes + buffer.byteLength > MAX_TOTAL_IMAGE_BYTES) {
+        notes.push('图片总大小超过上限，最后几张没有读取')
+        continue
+      }
+      totalBytes += buffer.byteLength
 
       hydrated.push({
         ...image,
