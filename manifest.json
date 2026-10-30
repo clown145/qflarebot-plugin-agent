@@ -133,7 +133,9 @@
     }
   ],
   "hasMiddleware": false,
-  "services": [],
+  "services": [
+    "agent"
+  ],
   "durableObjects": [
     "Agent"
   ],

@@ -29,6 +29,7 @@ import { resolveConfig } from '../effective-config.js'
 import { BLOCKED_REPLY, checkContent, parseKeywords } from './safety.js'
 import { getSkill, listSkills, type LoadedSkill, type SkillCatalogItem } from '../skills/store.js'
 import { parseSkillCommand } from '../skills/context.js'
+import { buildFragmentBlock, listActiveFragments } from '../prompt-fragments.js'
 
 /** release / retryLater 之后可能返回「队列里下一个已认领的 run」 */
 export interface NextRun {
@@ -198,6 +199,12 @@ async function runLoopOnce(input: {
   // **人格提示词是追加，不是替换**（`personaPrompt` 单独传）：
   // 基础提示词里的运行时约定（时间、会话、工具规范、回复格式）不能被丢掉，
   // 否则配了人格之后模型就开始输出 Markdown、也不知道有工具了。
+  // 其他插件注册的提示词片段。读失败不该中断对话——这是增强，不是必需品。
+  // 注意它属于 system 的**稳定部分**：只要插件不改片段，前缀缓存就命中。
+  const fragmentBlock = buildFragmentBlock(
+    await listActiveFragments(ctx.db).catch(() => []),
+  )
+
   const messages = buildMessages(effectiveMessage, history, {
     systemPrompt: config.system_prompt,
     ...(persona.prompt ? { personaPrompt: persona.prompt } : {}),
@@ -205,6 +212,7 @@ async function runLoopOnce(input: {
     historyLimit: config.history_limit,
     supportsVision: modelInfo?.capabilities.includes('image') ?? false,
     toolNames: registry.list().map((tool) => tool.definition.name),
+    ...(fragmentBlock ? { pluginPrompts: [fragmentBlock] } : {}),
     ...(persona.beginDialogs.length ? { beginDialogs: persona.beginDialogs } : {}),
     ...(skillCatalog.length ? { skillCatalog } : {}),
     ...(activeSkill ? { activeSkill } : {}),

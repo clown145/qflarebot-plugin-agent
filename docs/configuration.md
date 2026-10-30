@@ -42,6 +42,25 @@ DEFAULT_SYSTEM_PROMPT  ──> defaultConfig（内置默认值）
 
 人格的排列顺序就是配置里的数组顺序（管理页可以上移/下移）。
 
+### 提示词的分层与缓存
+
+system prompt 分三层，**从上到下越来越稳定**：
+
+| 层 | 内容 | 跨轮变化？ |
+| --- | --- | --- |
+| 基础 + 人格 + 工具规范 | `system_prompt`、人格 `prompt`、工具使用规范 | 不变 |
+| 其他插件注入的片段 | `ctx.service('agent').registerPrompt(...)` | 只有插件主动改才变 |
+| **本轮动态信息** | 时间、会话类型、说话人 | **每轮变，所以不在 system 里** |
+
+最后一行是关键：模型的 prompt 缓存是**前缀匹配**的，system 里只要有一处每轮变化，
+**它之后的全部内容每轮都要重新计费**。
+
+所以时间、会话、说话人被放进 `<system_reminder>`，附在**本轮 user 消息**上，
+system 保持 100% 稳定。实测：跨时间、跨用户、跨会话时 system 完全相同。
+
+> 这也是 AstrBot 的做法：它把群名、时间塞进 `req.extra_user_content_parts`，
+> system 只留稳定内容（`astr_main_agent.py:997-1002`）。
+
 ### 人格提示词是「追加」，不是「替换」
 
 这一点与 AstrBot 一致（`req.system_prompt += "\n# Persona Instructions\n\n{prompt}\n"`）。

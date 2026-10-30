@@ -171,7 +171,10 @@ describe('技能接通 buildMessages', () => {
       skillCatalog: catalog,
       activeSkill,
     })
-    expect(messages.at(-1)).toEqual({ role: 'user', content: '你好' })
+    const last = messages.at(-1)
+    expect(last?.role).toBe('user')
+    // 正文仍在（前面带 system_reminder）
+    expect(String(last && 'content' in last ? last.content : '')).toContain('你好')
   })
 
   it('有历史时技能仍在历史之前', () => {
@@ -227,14 +230,18 @@ describe('人格提示词是追加不是替换', () => {
     expect(content).toContain('# Persona Instructions')
   })
 
-  it('运行时信息（时间/会话/回复格式）**没有被人格挤掉**', () => {
+  it('运行时信息**没有被人格挤掉**', () => {
     const messages = buildMessages(message, [], { ...baseOptions, personaPrompt })
     const system = messages[0]
-    const content = system && system.role === 'system' ? system.content : ''
-    // 这三样是最容易被「替换」弄丢的
-    expect(content).toContain('## 当前环境')
-    expect(content).toContain('现在时间')
-    expect(content).toContain('纯文本')
+    const systemContent = system && system.role === 'system' ? String(system.content) : ''
+    const last = messages.at(-1)
+    const userContent = String(last && 'content' in last ? last.content : '')
+
+    // 回复格式要求（稳定）留在 system
+    expect(systemContent).toContain('纯文本')
+    // 时间/会话（每轮变）在 user 里，避免破坏缓存
+    expect(userContent).toContain('现在时间')
+    expect(userContent).not.toBe('')
   })
 
   it('基础提示词仍然在最前面（人格不覆盖身份）', () => {
@@ -248,11 +255,11 @@ describe('人格提示词是追加不是替换', () => {
     expect(content.indexOf('基础身份')).toBeLessThan(content.indexOf('# Persona Instructions'))
   })
 
-  it('运行时信息排在人格之后（越靠后模型越遵守）', () => {
+  it('回复格式要求排在人格之后（越靠后模型越遵守）', () => {
     const messages = buildMessages(message, [], { ...baseOptions, personaPrompt })
     const system = messages[0]
-    const content = system && system.role === 'system' ? system.content : ''
-    expect(content.indexOf('# Persona Instructions')).toBeLessThan(content.indexOf('## 当前环境'))
+    const content = system && system.role === 'system' ? String(system.content) : ''
+    expect(content.indexOf('# Persona Instructions')).toBeLessThan(content.indexOf('纯文本'))
   })
 
   it('没有人格时不出现人格段落（不留空标题）', () => {

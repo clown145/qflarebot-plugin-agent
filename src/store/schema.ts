@@ -126,4 +126,21 @@ export const SCHEMA_STATEMENTS = [
      body TEXT NOT NULL,
      updated_at INTEGER NOT NULL
    ) WITHOUT ROWID`,
+
+  // 其他插件注册的提示词片段（`ctx.service('agent')` 的 registerPrompt）。
+  //
+  // 为什么必须落库：宿主的 `services` 工厂**每个请求调用一次**，
+  // 「别的插件来登记」这种内存态活不过本次请求（SDK 明确写了这条限制）。
+  // 所以注册动作写进 D1，注入时读出来。
+  //
+  // `plugin` 作为主键的一部分：一个插件只能有一份片段（重复注册等于覆盖），
+  // 也能借它做「卸载后清理」（按插件名删）。
+  `CREATE TABLE IF NOT EXISTS {prompt_fragments} (
+     plugin TEXT NOT NULL,
+     fragment TEXT NOT NULL,
+     priority INTEGER NOT NULL DEFAULT 0,
+     enabled INTEGER NOT NULL DEFAULT 1,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (plugin)
+   ) WITHOUT ROWID`,
 ] as const

@@ -46,6 +46,13 @@ import {
   pruneToolAudit,
 } from './store/d1.js'
 import { createPageRoutes } from './routes.js'
+import {
+  listAllFragments,
+  removeFragment,
+  setFragmentEnabled,
+  upsertFragment,
+  type AgentPromptService,
+} from './prompt-fragments.js'
 import { getSkill, listSkills } from './skills/store.js'
 
 export { Agent }
@@ -94,6 +101,48 @@ export default definePlugin<AgentConfig>({
   durableObjects: { Agent: Agent },
 
   ui: { path: '/ui/', title: 'Agent' },
+
+  /**
+   * 对外提供服务：别的插件可以往本插件的 system prompt 里插一段话。
+   *
+   * 对标 AstrBot 的 `OnLLMRequestEvent`（插件能改每次 LLM 请求），
+   * 但 QFlareBot 没有钩子机制，只能用 `services` + `ctx.service('agent')`。
+   *
+   * 用法（在**调用方**插件里）：
+   *
+   * ```ts
+   * // 1. manifest 里声明依赖：depends: { agent: 'optional' }
+   * // 2. 处理器里：
+   * try {
+   *   const agent = ctx.service<AgentPromptService>('agent')
+   *   await agent.registerPrompt(ctx.plugin.name, '回答时优先用中文，不要用表情符号。')
+   * } catch {
+   *   // 没装 / 停用了 Agent 插件，按没有处理
+   * }
+   * ```
+   *
+   * **为什么 register 是写库而不是内存**：宿主对 `services` 的约定是
+   * 「工厂每个请求调用一次」，内存里登记的活不过本次请求（SDK 注释明确写了）。
+   *
+   * 片段拼在 system prompt 末尾（稳定内容，不破坏缓存），
+   * 有长度上限与去重，细节见 `src/prompt-fragments.ts`。
+   */
+  services: {
+    agent: (ctx): AgentPromptService => ({
+      async registerPrompt(plugin, fragment, priority) {
+        return upsertFragment(ctx.db, { plugin, fragment, priority })
+      },
+      async disablePrompt(plugin) {
+        await setFragmentEnabled(ctx.db, plugin, false)
+      },
+      async clearPrompt(plugin) {
+        await removeFragment(ctx.db, plugin)
+      },
+      async listPrompts() {
+        return listAllFragments(ctx.db)
+      },
+    }),
+  },
 
   hooks: {
     async onInstall(ctx) {

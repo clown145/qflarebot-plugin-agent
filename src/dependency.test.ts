@@ -35,8 +35,16 @@ describe('对 llm 插件的依赖声明', () => {
     expect(plugin.depends).toEqual({ llm: '*' })
   })
 
-  it('自己不再提供服务（不是 llm 的替代品）', () => {
-    expect(plugin.services ?? {}).toEqual({})
+  it('不提供 llm 服务（不是 llm 插件的替代品）', () => {
+    // 本插件只**消费** llm 服务；如果把 llm 也导出一份，
+    // 会和真正的 LLM 插件抢「同名服务」，面板上让用户选谁提供时更混乱
+    expect(plugin.services ?? {}).not.toHaveProperty('llm')
+  })
+
+  it('对外提供 agent 服务，供其他插件注入提示词', () => {
+    // 对标 AstrBot 的 OnLLMRequestEvent：别的插件能往本插件的 system prompt 里插话。
+    // QFlareBot 没有钩子机制，所以走 services + ctx.service('agent')
+    expect(plugin.services ?? {}).toHaveProperty('agent')
   })
 })
 

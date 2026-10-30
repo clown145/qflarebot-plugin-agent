@@ -33,6 +33,13 @@ export interface ContextOptions {
   personaPrompt?: string
   /** 本轮给模型开放了哪些工具（只用于拼「工具使用规范」，见 TOOL_USE_GUIDE） */
   toolNames?: string[]
+  /**
+   * 其他插件注册的提示词片段（`ctx.service('agent').registerPrompt`）。
+   *
+   * 拼在 system prompt **末尾**：属于稳定内容的一部分，只要插件不改它，
+   * 前缀缓存就是稳的。注意这是纯文本，不做模板替换（见 prompt-fragments.ts）。
+   */
+  pluginPrompts?: string[]
   timezone: string
   /** 历史条数上限 */
   historyLimit: number
@@ -71,10 +78,9 @@ export function buildMessages(
       role: 'system',
       content: buildSystemPrompt(
         options.systemPrompt,
-        options.timezone,
-        message,
         options.toolNames,
         options.personaPrompt,
+        options.pluginPrompts,
       ),
     },
   ]
@@ -99,7 +105,15 @@ export function buildMessages(
     messages.push(toModelMessage(row))
   }
 
-  messages.push({ role: 'user', content: buildUserContent(message, options.supportsVision) })
+  // 本轮的动态上下文（时间/会话/说话人）附在**这条 user 消息**上，
+  // 而不是塞进 system —— 理由见 buildSystemReminder 的注释（缓存）。
+  messages.push({
+    role: 'user',
+    content: withReminder(
+      buildUserContent(message, options.supportsVision),
+      buildSystemReminder(message, options.timezone),
+    ),
+  })
 
   // 兜底修一次配对：历史里可能出现「有 assistant.toolCalls 但工具结果没存下来」
   // （目前 run.ts 只存纯文本，不会产生这种数据；但一旦开始存 toolCalls，
@@ -143,17 +157,55 @@ const TOOL_USE_GUIDE = [
  * 人格放中间、运行时信息放最后：越靠后模型越容易遵守，
  * 而「不要用 Markdown」这类硬约束最需要被遵守。
  */
+/**
+ * 拼 system prompt。**这里放的东西必须跨轮稳定**——原因见文件顶上关于缓存的说明。
+ *
+ * 动态内容（时间、会话类型、说话人）**不在**这里，而是作为 system_reminder
+ * 附在本轮 user 消息上（`buildSystemReminder`）。
+ */
 function buildSystemPrompt(
   configured: string | undefined,
-  timezone: string,
-  message: InboundMessage,
   toolNames: string[] = [],
   personaPrompt?: string,
+  pluginPrompts: string[] = [],
 ): string {
   const base = configured?.trim() || DEFAULT_SYSTEM_PROMPT
+
+  // 用数组 join 而不是过滤空串：段落之间的空行是**可读性**的一部分，
+  // `.filter(Boolean)` 会把它们一起删掉，导致标题和正文挤在一起
+  return [
+    base,
+    personaPrompt ? `\n# Persona Instructions\n\n${personaPrompt}` : '',
+    toolNames.length ? `\n${TOOL_USE_GUIDE}` : '',
+    // 其他插件插的片段：放在最后，属于稳定内容（只要插件不改就命中缓存）
+    ...pluginPrompts.map((block) => `\n${block}`),
+    '\n回复要求：纯文本，不要用 Markdown 语法（QQ 不渲染），不要输出思考过程。',
+  ].join('')
+}
+
+/**
+ * 每轮会变的信息，作为 system_reminder 附在**本轮 user 消息**上。
+ *
+ * ## 为什么不放进 system prompt
+ *
+ * 模型的 prompt 缓存是**前缀匹配**的：从第一个字符逐字比对，命中到缓存断点为止。
+ * 把时间放进 system（哪怕放在中间）会让它之后的全部内容每轮失效 ——
+ * 实测时间戳出现在 system 的第 42/322 字符处，也就是后面 **87% 的内容
+ * 每轮都要重新计费**，而且必然如此（时间精确到分钟）。
+ *
+ * 用户名也一样：同一个群里不同人说话会轮流击穿缓存。
+ *
+ * AstrBot 的做法是同一个道理 —— 它把群名、时间这些塞进
+ * `req.extra_user_content_parts`，system 只留稳定内容
+ * （见 `astr_main_agent.py:997-1002`）。
+ *
+ * 用 `<system_reminder>` 包起来是沿用 AstrBot 的标记，模型能理解这是
+ * 系统给的即时上下文，而不是用户在说话。
+ */
+function buildSystemReminder(message: InboundMessage, timezone: string): string {
   const now = new Date()
 
-  // 模型没有时钟，把当前时间和时区写进提示词，比让它每轮调 time.now 便宜
+  // 模型没有时钟，把当前时间告诉它，比让它每轮调 time.now 便宜
   let localTime = now.toISOString()
   try {
     localTime = new Intl.DateTimeFormat('zh-CN', {
@@ -166,17 +218,11 @@ function buildSystemPrompt(
   }
 
   return [
-    base,
-    // 人格段落：与 AstrBot 同一个小标题，语义清楚且模型认识
-    ...(personaPrompt ? ['', '# Persona Instructions', '', personaPrompt] : []),
-    '',
-    '## 当前环境',
+    '<system_reminder>',
     `- 现在时间：${localTime}（时区 ${timezone}）`,
     `- 当前会话：${message.scene === 'c2c' ? '单聊' : '群聊'}`,
     message.userName ? `- 正在和你说话的人：${message.userName}` : '',
-    ...(toolNames.length ? ['', TOOL_USE_GUIDE] : []),
-    '',
-    '回复要求：纯文本，不要用 Markdown 语法（QQ 不渲染），不要输出思考过程。',
+    '</system_reminder>',
   ]
     .filter(Boolean)
     .join('\n')
@@ -252,6 +298,23 @@ function parseToolTraces(json: string | null): HistoryToolTrace[] {
     // 历史里的坏数据不该让整个对话失败
     return []
   }
+}
+
+/**
+ * 把 system_reminder 拼到本轮 user 内容上。
+ *
+ * 文本内容直接前置；多模态（带图）时要拼成一个 text 片段放在最前面，
+ * 否则图片和文字的顺序会乱。
+ *
+ * 为什么放**前面**而不是后面：模型读到最后一句的印象最深，而这里是
+ * 环境信息（现在几点、在哪说话），提前给比追加强。
+ */
+function withReminder(content: ModelContent, reminder: string): ModelContent {
+  if (typeof content === 'string') {
+    return `${reminder}\n\n${content}`
+  }
+  // 多模态：把 reminder 作为第一个 text 片段
+  return [{ type: 'text', text: reminder }, ...content]
 }
 
 function buildUserContent(message: InboundMessage, supportsVision: boolean): ModelContent {

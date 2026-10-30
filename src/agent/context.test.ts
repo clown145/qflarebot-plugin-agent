@@ -28,24 +28,38 @@ describe('buildMessages', () => {
   it('第一条永远是 system，最后一条是本轮用户消息', () => {
     const messages = buildMessages(message(), [], baseOptions)
     expect(messages[0]?.role).toBe('system')
-    expect(messages.at(-1)).toEqual({ role: 'user', content: '你好' })
+    const last = messages.at(-1)
+    expect(last?.role).toBe('user')
+    // 用户消息前面会带 system_reminder（时间/会话/说话人），正文仍在末尾
+    expect(String(last && 'content' in last ? last.content : '')).toContain('你好')
   })
 
-  it('系统提示词里带上当前时间与时区，模型不需要调工具问时间', () => {
+  /**
+   * 环境信息（时间/时区）在**本轮 user 消息**里，不在 system 里。
+   *
+   * 这是缓存修复的核心：system 必须跨轮稳定，否则前缀缓存每轮失效。
+   * 见 `buildSystemReminder` 的注释。
+   */
+  it('环境信息（时间/时区）附在本轮用户消息上，模型不用调工具问时间', () => {
     const messages = buildMessages(message(), [], { ...baseOptions, timezone: 'Asia/Shanghai' })
-    const system = messages[0]
-    expect(system?.role).toBe('system')
-    const content = system && 'content' in system ? system.content : ''
+    const last = messages.at(-1)
+    const content = String(last && 'content' in last ? last.content : '')
     expect(content).toContain('Asia/Shanghai')
     expect(content).toContain('现在时间')
+    expect(content).toContain('<system_reminder>')
   })
 
-  it('自定义提示词会盖掉默认人格，但环境信息仍然追加', () => {
+  it('自定义提示词在 system 里，环境信息在 user 里', () => {
     const messages = buildMessages(message(), [], { ...baseOptions, systemPrompt: '你是猫娘' })
     const system = messages[0]
-    const content = system && 'content' in system ? system.content : ''
-    expect(content).toContain('你是猫娘')
-    expect(content).toContain('现在时间')
+    const systemContent = system && 'content' in system ? String(system.content) : ''
+    const last = messages.at(-1)
+    const userContent = String(last && 'content' in last ? last.content : '')
+
+    expect(systemContent).toContain('你是猫娘')
+    // 环境信息不该在 system 里（那会破坏缓存）
+    expect(systemContent).not.toContain('现在时间')
+    expect(userContent).toContain('现在时间')
   })
 
   it('historyLimit 为 0 时不带任何历史', () => {
@@ -159,5 +173,113 @@ describe('serializeToolTraces', () => {
   it('没有工具调用时返回 null，不是 "[]"', () => {
     // 存 "[]" 会让历史回放误以为「有工具调用但结果为空」
     expect(serializeToolTraces([])).toBeNull()
+  })
+})
+
+/**
+ * 缓存：system prompt 必须跨轮稳定。
+ *
+ * 模型的 prompt 缓存是**前缀匹配**的 —— 从第一个字符逐字比对，命中到断点为止。
+ * 只要 system 里有任何每轮会变的内容（时间、会话、说话人），
+ * 它**之后**的全部内容每轮都要重新计费。
+ *
+ * 这组测试把「system 不含动态内容」变成契约，防止以后有人图方便把
+ * 时间又塞回 system。
+ */
+describe('缓存：system prompt 跨轮稳定', () => {
+  /** 取出 system 内容 */
+  function systemOf(messages: ReturnType<typeof buildMessages>): string {
+    const first = messages[0]
+    return first && first.role === 'system' ? String(first.content) : ''
+  }
+
+  it('不同时间构造的 system 完全相同（时间不在 system 里）', () => {
+    // 用手动改 Date 的方式模拟「跨分钟」
+    const realNow = Date.now
+    try {
+      Date.now = () => new Date('2026-10-30T10:00:00+08:00').getTime()
+      const morning = systemOf(buildMessages(message(), [], baseOptions))
+
+      Date.now = () => new Date('2026-10-30T23:59:00+08:00').getTime()
+      const night = systemOf(buildMessages(message(), [], baseOptions))
+
+      expect(morning).toBe(night)
+    } finally {
+      Date.now = realNow
+    }
+  })
+
+  it('不同说话人的 system 完全相同', () => {
+    const a = systemOf(buildMessages(message({ userName: '小明' }), [], baseOptions))
+    const b = systemOf(buildMessages(message({ userName: '小红' }), [], baseOptions))
+    expect(a).toBe(b)
+  })
+
+  it('群聊与单聊的 system 完全相同', () => {
+    const group = systemOf(buildMessages(message({ scene: 'group' }), [], baseOptions))
+    const c2c = systemOf(buildMessages(message({ scene: 'c2c' }), [], baseOptions))
+    expect(group).toBe(c2c)
+  })
+
+  it('system 里不出现任何动态内容', () => {
+    const content = systemOf(buildMessages(message(), [], baseOptions))
+    expect(content).not.toContain('现在时间')
+    expect(content).not.toContain('Asia/Shanghai')
+    expect(content).not.toContain('单聊')
+    expect(content).not.toContain('群聊')
+    expect(content).not.toContain('小明')
+  })
+
+  it('动态内容确实在 user 消息里（不是丢了）', () => {
+    const messages = buildMessages(message(), [], { ...baseOptions, timezone: 'Asia/Shanghai' })
+    const last = messages.at(-1)
+    const content = String(last && 'content' in last ? last.content : '')
+    expect(content).toContain('<system_reminder>')
+    expect(content).toContain('现在时间')
+    expect(content).toContain('Asia/Shanghai')
+    expect(content).toContain('群聊')
+    expect(content).toContain('小明')
+  })
+})
+
+/**
+ * 其他插件注册的提示词片段。
+ *
+ * 拼在 system prompt **末尾**，属于稳定内容 —— 只要插件不改片段，
+ * 前缀缓存就命中。这里验证「注入成功」+「不破坏稳定性」两件事。
+ */
+describe('插件提示词片段注入', () => {
+  function systemOf(messages: ReturnType<typeof buildMessages>): string {
+    const first = messages[0]
+    return first && first.role === 'system' ? String(first.content) : ''
+  }
+
+  it('片段出现在 system prompt 里', () => {
+    const messages = buildMessages(message(), [], {
+      ...baseOptions,
+      pluginPrompts: ['## 来自插件 weather\n天气要用中文'],
+    })
+    expect(systemOf(messages)).toContain('天气要用中文')
+  })
+
+  it('片段排在回复格式要求之前（属于稳定内容区）', () => {
+    const messages = buildMessages(message(), [], {
+      ...baseOptions,
+      pluginPrompts: ['## 来自插件 weather\n天气要用中文'],
+    })
+    const content = systemOf(messages)
+    expect(content.indexOf('天气要用中文')).toBeLessThan(content.indexOf('纯文本'))
+  })
+
+  it('没有片段时不产生空段落', () => {
+    const withNone = systemOf(buildMessages(message(), [], baseOptions))
+    expect(withNone).not.toContain('来自插件')
+  })
+
+  it('相同片段产生相同 system（不破坏缓存）', () => {
+    const opts = { ...baseOptions, pluginPrompts: ['## 来自插件 a\nX'] }
+    expect(systemOf(buildMessages(message({ userName: '小明' }), [], opts))).toBe(
+      systemOf(buildMessages(message({ userName: '小红' }), [], opts)),
+    )
   })
 })
