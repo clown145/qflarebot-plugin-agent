@@ -118,4 +118,4 @@ npm run sync     # 生成 manifest.json 并提交
 
 ## License
 
-MIT。本插件参考了 [serverless-agent](https://github.com/clown145/serverless-agent)（GPL-3.0-or-later）的结构，其中三个零依赖的纯函数文件是原样复制的——**存在许可证冲突，详见[开发指南的「来源与许可证」](./docs/development.md#来源与许可证)**。
+MIT。其中三个零依赖的纯函数文件复用自 [serverless-agent](https://github.com/clown145/serverless-agent)（同一作者），出处见[开发指南 · 来源](./docs/development.md#来源)。

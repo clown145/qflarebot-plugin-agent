@@ -41,6 +41,6 @@
 
 ## 来源与许可
 
-本插件参考了 [serverless-agent](https://github.com/clown145/serverless-agent) 的结构，
-其中三个零依赖的纯函数文件是原样复制的 —— **存在 GPL 与 MIT 的许可证冲突**，
-详见[开发指南 · 来源与许可证](./development.md#来源与许可证)。
+本插件以 **MIT** 发布。其中三个零依赖的纯函数文件复用自
+[serverless-agent](https://github.com/clown145/serverless-agent)（同一作者的另一个项目），
+出处见[开发指南 · 来源](./development.md#来源)。

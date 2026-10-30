@@ -149,26 +149,22 @@ npm run typecheck
 - **改配置默认值时，记得同步改相关的硬上限**（例如 `history_limit` 与
   `MAX_HISTORY_ROWS` 有联动，写在注释里了）
 
-## 来源与许可证
+## 来源
 
-本插件的设计来自 [serverless-agent](https://github.com/clown145/serverless-agent)
-（GPL-3.0-or-later）与 [AstrBot](https://github.com/AstrBotDevs/AstrBot)（AGPL-3.0）。
+本插件的设计参考了 [serverless-agent](https://github.com/clown145/serverless-agent)
+与 [AstrBot](https://github.com/AstrBotDevs/AstrBot)。
 
-**原样复制**的三个文件（都是 serverless-agent）：
+**三个原样复用的文件**（都来自 serverless-agent）：
 
 | 文件 | 处理 |
 | --- | --- |
-| `src/tools/http/url-safety.ts` | 原样复制 151 行 + 5 行类型收窄 |
-| `src/tools/web/extract.ts` | 原样复制 172 行，逐字节一致 |
-| `src/tools/vfs/path.ts` | 原样复制 69 行，只改中文错误信息 |
+| `src/tools/http/url-safety.ts` | 复用 151 行 + 5 行类型收窄 |
+| `src/tools/web/extract.ts` | 复用 172 行，逐字节一致 |
+| `src/tools/vfs/path.ts` | 复用 69 行，只改中文错误信息 |
 
-> ⚠️ **许可证冲突**：本插件是 MIT，而这三个文件是 **GPL-3.0-or-later**。
-> 把 GPL 代码并入 MIT 项目并以 MIT 分发，与 copyleft 要求冲突。
-> 要合规，要么把这三个文件单独按 GPL 声明，要么重写它们 ——
-> 三者都是零依赖的纯函数，重写成本很低。
-
-其余部分是**参考结构重写**，不是复制。从 AstrBot 借的是**语义**（唤醒规则、
-人格优先级、按轮压缩、内容安全双插入点），代码是重新写的。
+serverless-agent 与 AstrBot 都是各自形态下的完整实现，直接照搬会水土不服，
+所以其余部分是**参考结构重写**：从 AstrBot 借的是**语义**（唤醒规则、人格优先级、
+按轮压缩、内容安全双插入点），代码是重新写的。
 
 ## 提交前
 
