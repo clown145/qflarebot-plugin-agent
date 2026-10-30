@@ -132,6 +132,24 @@ export interface AgentConfig {
   show_typing: boolean
 
   /**
+   * 群聊是否**按成员隔离会话**（每人一段独立历史）。
+   *
+   * 默认关：整个群共享一段历史，和人类在群里聊天的直觉一致。
+   * 打开后同一个群里 A 和 B 各聊各的，互相看不到对方的上下文 ——
+   * 适合客服、多租户这类「一人一档」的场景。
+   *
+   * 对标 AstrBot 的 `platform_settings.unique_session`
+   * （`waking_check/stage.py:88-92`，它拼 `sender_id + group_id`）。
+   *
+   * **只影响群聊与频道**，单聊和频道私信本来就一人一档。
+   *
+   * ⚠️ 切换后**已有记忆不会迁移**：会话键变了，DO 里那批历史查不到，
+   * 所有人等于重新开始。不做迁移是因为旧历史里压根没存 userId，
+   * 技术上分不出哪句话是谁说的。
+   */
+  isolate_sessions: boolean
+
+  /**
    * 是否让模型知道**说话人的 openid**。
    *
    * 默认关。开启后提示词里会带一行 `User ID: <openid>`，模型可以据此
@@ -147,7 +165,16 @@ export interface AgentConfig {
    */
   expose_sender_id: boolean
 
-  /** 是否把当前时间告诉模型。默认开：模型没有时钟，不给就会瞎猜日期 */
+  /**
+   * 是否把当前时间告诉模型。**默认关**。
+   *
+   * 关的理由：`time.now` 工具已经能取时间，每轮都塞进提示词是重复供养、
+   * 白占上下文。
+   *
+   * 但确实有代价：模型**经常忘记调工具**，直接说「今天是 2024 年」。
+   * 所以这个开关要留着——需要精确日期（比如算「三天后是几号」）的部署
+   * 可以打开，代价是每轮多一行。
+   */
   expose_datetime: boolean
 
   /** 时区，用于 time 工具与提示词 */
@@ -208,8 +235,9 @@ export const defaultConfig: AgentConfig = {
   enable_skills: false,
   enable_audit: false,
   show_typing: true,
+  isolate_sessions: false,
   expose_sender_id: false,
-  expose_datetime: true,
+  expose_datetime: false,
   timezone: 'Asia/Shanghai',
   context_compression: 'truncate',
   max_context_tokens: 12000,
@@ -302,6 +330,15 @@ export const configSchema = {
       description: '仅单聊有效',
       default: defaultConfig.show_typing,
     },
+    isolate_sessions: {
+      type: 'boolean',
+      title: '群聊按成员隔离会话',
+      description:
+        '打开后每个群成员拥有独立的历史，互相看不到对方聊的内容；' +
+        '适合客服、多租户。关闭时整个群共享一段历史（默认）。' +
+        '⚠️ 切换后已有记忆查不到，等于所有人重新开始',
+      default: defaultConfig.isolate_sessions,
+    },
     expose_sender_id: {
       type: 'boolean',
       title: '让模型知道说话人 ID',
@@ -313,9 +350,10 @@ export const configSchema = {
     },
     expose_datetime: {
       type: 'boolean',
-      title: '让模型知道当前时间',
+      title: '在提示词里带上当前时间',
       description:
-        '模型没有时钟，关掉后它只能凭记忆猜日期。' +
+        '关闭时模型需要自己调 time.now 取时间，省一点上下文。' +
+        '但模型经常忘记调、直接凭记忆编日期，需要精确日期的场景可以打开。' +
         '注意这条不影响缓存——时间放在本轮用户消息里，不在系统提示词里',
       default: defaultConfig.expose_datetime,
     },

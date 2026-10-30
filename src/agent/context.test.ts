@@ -41,7 +41,12 @@ describe('buildMessages', () => {
    * 见 `buildSystemReminder` 的注释。
    */
   it('环境信息（时间/时区）附在本轮用户消息上，模型不用调工具问时间', () => {
-    const messages = buildMessages(message(), [], { ...baseOptions, timezone: 'Asia/Shanghai' })
+    const messages = buildMessages(message(), [], {
+      ...baseOptions,
+      timezone: 'Asia/Shanghai',
+      // 时间默认关了（time.now 工具能取），这条测的是「放在哪」不是「开不开」
+      exposeDatetime: true,
+    })
     const last = messages.at(-1)
     const content = String(last && 'content' in last ? last.content : '')
     expect(content).toContain('Asia/Shanghai')
@@ -50,7 +55,11 @@ describe('buildMessages', () => {
   })
 
   it('自定义提示词在 system 里，环境信息在 user 里', () => {
-    const messages = buildMessages(message(), [], { ...baseOptions, systemPrompt: '你是猫娘' })
+    const messages = buildMessages(message(), [], {
+      ...baseOptions,
+      systemPrompt: '你是猫娘',
+      exposeDatetime: true,
+    })
     const system = messages[0]
     const systemContent = system && 'content' in system ? String(system.content) : ''
     const last = messages.at(-1)
@@ -231,7 +240,12 @@ describe('缓存：system prompt 跨轮稳定', () => {
   })
 
   it('动态内容确实在 user 消息里（不是丢了）', () => {
-    const messages = buildMessages(message(), [], { ...baseOptions, timezone: 'Asia/Shanghai' })
+    const messages = buildMessages(message(), [], {
+      ...baseOptions,
+      timezone: 'Asia/Shanghai',
+      exposeDatetime: true,
+      exposeSenderId: true,
+    })
     const last = messages.at(-1)
     const content = String(last && 'content' in last ? last.content : '')
     expect(content).toContain('<system_reminder>')
@@ -341,8 +355,13 @@ describe('说话人身份与时是否暴露', () => {
     expect(text).toContain('当前会话')
   })
 
-  it('时间默认是开的（模型没有时钟）', () => {
+  it('时间默认是关的（time.now 工具已经能取）', () => {
     const messages = buildMessages(message(), [], baseOptions)
+    expect(userText(messages)).not.toContain('现在时间')
+  })
+
+  it('打开后时间出现，且不影响缓存', () => {
+    const messages = buildMessages(message(), [], { ...baseOptions, exposeDatetime: true })
     expect(userText(messages)).toContain('现在时间')
   })
 

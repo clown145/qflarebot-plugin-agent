@@ -216,6 +216,21 @@ export const PAGE_HTML_BODY = `
           </div>
           <div class="setting-row">
             <div class="setting-text">
+              <p class="setting-label">群聊按成员隔离会话</p>
+              <p class="setting-hint">
+                打开后每个群成员拥有独立历史，互相看不到对方聊的内容；适合客服、多租户。
+                关闭时整个群共享一段历史（默认）。
+                <strong>切换后已有记忆查不到，等于所有人重新开始。</strong>
+              </p>
+            </div>
+            <div class="setting-control">
+              <button class="switch" data-flag="isolate_sessions" role="switch" aria-checked="false" aria-label="群聊按成员隔离会话" type="button">
+                <span class="switch-track"><span class="switch-knob"></span></span>
+              </button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-text">
               <p class="setting-label">让模型知道说话人 ID</p>
               <p class="setting-hint">
                 提示词里带上说话人的 openid。开了模型才能区分群里不同的人；关掉时只给昵称。

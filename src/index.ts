@@ -205,7 +205,8 @@ export default definePlugin<AgentConfig>({
       // 都能把整个群的记忆清掉。清空是单会话范围内不可逆的。
       permission: 'group_admin',
       async handler({ session, ctx }) {
-        const stub = agentStub(ctx, conversationKey(session))
+        const cfg = await resolveConfig(ctx)
+        const stub = agentStub(ctx, conversationKey(session, cfg.isolate_sessions))
         await stub.reset()
         return '这个会话的记忆已经清空了。'
       },
@@ -225,7 +226,8 @@ export default definePlugin<AgentConfig>({
       aliases: ['agent 停', 'agent 别说了'],
       description: '打断正在进行的回答（保留记忆）',
       async handler({ session, ctx }) {
-        const stub = agentStub(ctx, conversationKey(session))
+        const cfg = await resolveConfig(ctx)
+        const stub = agentStub(ctx, conversationKey(session, cfg.isolate_sessions))
         const result = await stub.stop()
         return result.stopped
           ? '好，这次回答停下了。之前的对话记忆还在。'
@@ -250,7 +252,8 @@ export default definePlugin<AgentConfig>({
       // 和 reset 同档：清空是单会话范围内不可逆的
       permission: 'group_admin',
       async handler({ session, ctx }) {
-        const stub = agentStub(ctx, conversationKey(session))
+        const cfg = await resolveConfig(ctx)
+        const stub = agentStub(ctx, conversationKey(session, cfg.isolate_sessions))
         await stub.reset()
         return '好，重新开始。之前的对话我已经不记得了。'
       },
@@ -271,7 +274,8 @@ export default definePlugin<AgentConfig>({
       aliases: ['agent 用量'],
       description: '查看本会话的记忆规模与今日用量',
       async handler({ session, ctx }) {
-        const conversation = conversationKey(session)
+        const cfgForKey = await resolveConfig(ctx)
+        const conversation = conversationKey(session, cfgForKey.isolate_sessions)
         const stub = agentStub(ctx, conversation)
         const [size, recent] = await Promise.all([
           stub.stats().catch(() => ({ history: 0, pending: 0, locked: false })),
@@ -346,7 +350,8 @@ export default definePlugin<AgentConfig>({
       description: '查看本会话的定时任务',
       usage: '/agent schedule [cancel <id>]',
       async handler({ session, ctx, argText }) {
-        const conversation = conversationKey(session)
+        const cfgForKey = await resolveConfig(ctx)
+        const conversation = conversationKey(session, cfgForKey.isolate_sessions)
         const arg = argText.trim()
 
         // /agent schedule cancel <id>
@@ -380,7 +385,8 @@ export default definePlugin<AgentConfig>({
       description: '查看或切换本会话的人格',
       usage: '/agent persona [名字]',
       async handler({ session, ctx, argText }) {
-        const conversation = conversationKey(session)
+        const cfgForKey = await resolveConfig(ctx)
+        const conversation = conversationKey(session, cfgForKey.isolate_sessions)
         const wanted = argText.trim()
         const cfg = await resolveConfig(ctx)
         const available = (cfg.personas ?? []).map((p) => p.name.trim()).filter(Boolean)
@@ -676,8 +682,12 @@ async function resolveLlmOrExplain(
  * 图片必须**在入站时**取回来：QQ 的图片 URL 带签名且有效期很短，
  * 等 cron 段（最坏 5 分钟后）再取可能已经 403。
  */
-async function prepareInbound(session: Session, text: string): Promise<InboundMessage> {
-  const message = toInboundMessage(session)
+async function prepareInbound(
+  session: Session,
+  text: string,
+  isolateSessions = false,
+): Promise<InboundMessage> {
+  const message = toInboundMessage(session, isolateSessions)
 
   // 事件里拿到的正文可能带 /agent 前缀，剥掉
   const cleaned = text.replace(/^\/agent\s*/i, '').trim()
@@ -715,7 +725,7 @@ async function handleMessage(
   const llm = await resolveLlmOrExplain(session, ctx)
   if (!llm) return
 
-  const message = await prepareInbound(session, text)
+  const message = await prepareInbound(session, text, config.isolate_sessions)
   const stub = agentStub(ctx, message.conversation)
   const reply = replyFromSession(session)
 

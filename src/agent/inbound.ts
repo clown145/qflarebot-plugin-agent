@@ -16,7 +16,7 @@ export function isTextMessage(session: Session): boolean {
   return Boolean(session.content?.trim()) || (session.attachments?.length ?? 0) > 0
 }
 
-export function toInboundMessage(session: Session): InboundMessage {
+export function toInboundMessage(session: Session, isolateSessions = false): InboundMessage {
   const attachments: MessageAttachment[] = (session.attachments ?? []).map((attachment) => ({
     type: classifyAttachment(attachment.contentType, attachment.filename),
     url: attachment.url,
@@ -25,7 +25,7 @@ export function toInboundMessage(session: Session): InboundMessage {
   }))
 
   return {
-    conversation: conversationKey(session),
+    conversation: conversationKey(session, isolateSessions),
     userId: session.userId,
     userName: session.userName ?? '',
     text: session.content ?? '',
@@ -43,20 +43,38 @@ export function toInboundMessage(session: Session): InboundMessage {
 /**
  * 会话键。
  *
- * 群聊按群（整个群共享一段历史，和人类在群里聊天的直觉一致）；
+ * 默认**群聊按群**（整个群共享一段历史，和人类在群里聊天的直觉一致）；
  * 单聊按用户；频道按频道。
  *
- * 注意：**不要**把 userId 拼进群聊的键——那样同一个人每次说话都换一个
- * DO 实例，群里的上下文就断了。
+ * ## 隔离模式（`isolate_sessions`）
+ *
+ * 打开后，群聊的键会拼上发信人，变成「每个人一段独立历史」。
+ * 对标 AstrBot 的 `platform_settings.unique_session`
+ * （`waking_check/stage.py:88-92`，它拼 `sender_id + group_id`）。
+ *
+ * **只影响群聊**：单聊本来就一人一 DO，再拼一次是废话；
+ * 频道（`guild`）是公开帖，语义更接近群，同样按开关处理。
+ *
+ * ## 切换的代价（重要）
+ *
+ * 键变了，DO 里那批历史就**查不到了** —— 等于所有人重新开始。
+ * 不做迁移：迁移要把 N 个人的历史拆开，而旧历史里根本分不出哪句是谁说的
+ * （之前压根没存 userId）。所以切换前要在页面上明确告诉用户。
+ *
+ * @param isolate 是否按成员隔离。缺省 false = 原来「一群一会话」的行为
  */
-export function conversationKey(session: Session): string {
+export function conversationKey(session: Session, isolate = false): string {
+  // 只有「多人共享」的场景才需要隔离判断
+  const shareable = session.scene === 'group' || session.scene === 'guild'
+  const suffix = isolate && shareable && session.userId ? `:${session.userId}` : ''
+
   switch (session.scene) {
     case 'group':
-      return `group:${session.targetId}`
+      return `group:${session.targetId}${suffix}`
     case 'c2c':
       return `c2c:${session.targetId}`
     case 'guild':
-      return `guild:${session.targetId}`
+      return `guild:${session.targetId}${suffix}`
     case 'guild_dm':
       return `guild_dm:${session.targetId}`
     default:

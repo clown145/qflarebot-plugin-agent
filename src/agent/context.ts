@@ -122,7 +122,7 @@ export function buildMessages(
       buildUserContent(message, options.supportsVision),
       buildSystemReminder(message, options.timezone, {
         senderId: options.exposeSenderId ?? false,
-        datetime: options.exposeDatetime ?? true,
+        datetime: options.exposeDatetime ?? false,
       }),
     ),
   })
@@ -217,9 +217,12 @@ function buildSystemPrompt(
 function buildSystemReminder(
   message: InboundMessage,
   timezone: string,
+  // 默认值要和配置的默认值一致：两个都关。
+  // 这里的默认值只影响「调用方没传」的情况（主要是一些老测试），
+  // 真实路径由 run.ts 从 config 传进来。
   expose: { senderId: boolean; datetime: boolean } = {
     senderId: false,
-    datetime: true,
+    datetime: false,
   },
 ): string {
   const lines: string[] = []

@@ -231,7 +231,12 @@ describe('人格提示词是追加不是替换', () => {
   })
 
   it('运行时信息**没有被人格挤掉**', () => {
-    const messages = buildMessages(message, [], { ...baseOptions, personaPrompt })
+    const messages = buildMessages(message, [], {
+      ...baseOptions,
+      personaPrompt,
+      // 时间默认关了，这条要验的是「人格有没有挤掉运行时信息」
+      exposeDatetime: true,
+    })
     const system = messages[0]
     const systemContent = system && system.role === 'system' ? String(system.content) : ''
     const last = messages.at(-1)

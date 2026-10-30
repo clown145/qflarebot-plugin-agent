@@ -254,6 +254,12 @@
         "description": "仅单聊有效",
         "default": true
       },
+      "isolate_sessions": {
+        "type": "boolean",
+        "title": "群聊按成员隔离会话",
+        "description": "打开后每个群成员拥有独立的历史，互相看不到对方聊的内容；适合客服、多租户。关闭时整个群共享一段历史（默认）。⚠️ 切换后已有记忆查不到，等于所有人重新开始",
+        "default": false
+      },
       "expose_sender_id": {
         "type": "boolean",
         "title": "让模型知道说话人 ID",
@@ -262,9 +268,9 @@
       },
       "expose_datetime": {
         "type": "boolean",
-        "title": "让模型知道当前时间",
-        "description": "模型没有时钟，关掉后它只能凭记忆猜日期。注意这条不影响缓存——时间放在本轮用户消息里，不在系统提示词里",
-        "default": true
+        "title": "在提示词里带上当前时间",
+        "description": "关闭时模型需要自己调 time.now 取时间，省一点上下文。但模型经常忘记调、直接凭记忆编日期，需要精确日期的场景可以打开。注意这条不影响缓存——时间放在本轮用户消息里，不在系统提示词里",
+        "default": false
       },
       "personas": {
         "type": "array",
@@ -395,8 +401,9 @@
     "enable_skills": false,
     "enable_audit": false,
     "show_typing": true,
+    "isolate_sessions": false,
     "expose_sender_id": false,
-    "expose_datetime": true,
+    "expose_datetime": false,
     "timezone": "Asia/Shanghai",
     "context_compression": "truncate",
     "max_context_tokens": 12000,
