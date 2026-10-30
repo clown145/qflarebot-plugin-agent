@@ -58,23 +58,23 @@ const baseOptions = {
 }
 
 describe('工具栏接通 buildRegistry', () => {
-  it('不传 disabled 时注册全部工具', () => {
-    const registry = buildRegistry(fakeCtx(), defaultConfig, false)
+  it('不传 disabled 时注册全部工具', async () => {
+    const registry = await buildRegistry(fakeCtx(), defaultConfig, false)
     const names = registry.list().map((tool) => tool.definition.name)
     expect(names).toContain('time.now')
     expect(names).toContain('http.request')
   })
 
-  it('被关掉的工具根本不注册（模型看不到）', () => {
-    const registry = buildRegistry(fakeCtx(), defaultConfig, false, new Set(['http.request']))
+  it('被关掉的工具根本不注册（模型看不到）', async () => {
+    const registry = await buildRegistry(fakeCtx(), defaultConfig, false, new Set(['http.request']))
     const names = registry.list().map((tool) => tool.definition.name)
     expect(names).not.toContain('http.request')
     // 其他工具不受影响
     expect(names).toContain('time.now')
   })
 
-  it('enable_tools 关掉时什么都没有——开关优先级更高', () => {
-    const registry = buildRegistry(
+  it('enable_tools 关掉时什么都没有——开关优先级更高', async () => {
+    const registry = await buildRegistry(
       fakeCtx(),
       { ...defaultConfig, enable_tools: false },
       false,
@@ -83,22 +83,22 @@ describe('工具栏接通 buildRegistry', () => {
     expect(registry.list()).toHaveLength(0)
   })
 
-  it('关掉一个不存在的工具名是无害的', () => {
-    const registry = buildRegistry(fakeCtx(), defaultConfig, false, new Set(['no.such.tool']))
+  it('关掉一个不存在的工具名是无害的', async () => {
+    const registry = await buildRegistry(fakeCtx(), defaultConfig, false, new Set(['no.such.tool']))
     expect(registry.list().length).toBeGreaterThan(0)
   })
 })
 
 describe('applyToolSettings 与 buildRegistry 的一致性', () => {
-  it('两者过滤结果相同（防止接线时用了不同的过滤逻辑）', () => {
+  it('两者过滤结果相同（防止接线时用了不同的过滤逻辑）', async () => {
     const ctx = fakeCtx()
     const settings = { disabled: ['web.fetch_page'], config: {} }
-    const viaRegistry = buildRegistry(ctx, defaultConfig, false, new Set(settings.disabled))
+    const viaRegistry = (await buildRegistry(ctx, defaultConfig, false, new Set(settings.disabled)))
       .list()
       .map((t) => t.definition.name)
       .sort()
 
-    const allTools = buildRegistry(ctx, defaultConfig, false).list()
+    const allTools = (await buildRegistry(ctx, defaultConfig, false)).list()
     const viaApply = applyToolSettings(allTools, settings)
       .map((t) => t.definition.name)
       .sort()
@@ -200,8 +200,8 @@ describe('技能接通 buildMessages', () => {
 })
 
 describe('工具白名单与提示词一致', () => {
-  it('提示词里的工具名与注册表一致（关掉的不会出现在提示词里）', () => {
-    const registry = buildRegistry(fakeCtx(), defaultConfig, false, new Set(['http.request']))
+  it('提示词里的工具名与注册表一致（关掉的不会出现在提示词里）', async () => {
+    const registry = await buildRegistry(fakeCtx(), defaultConfig, false, new Set(['http.request']))
     const toolNames = registry.list().map((t) => t.definition.name)
     const messages = buildMessages(message, [], { ...baseOptions, toolNames })
     const system = messages[0]
@@ -274,8 +274,8 @@ describe('人格提示词是追加不是替换', () => {
  * 人格工具白名单与全局开关叠加：两道收窄但都是「减少」，不会互相抵消。
  */
 describe('人格工具白名单接通 buildRegistry', () => {
-  it('白名单只放行名单里的工具', () => {
-    const registry = buildRegistry(
+  it('白名单只放行名单里的工具', async () => {
+    const registry = await buildRegistry(
       fakeCtx(),
       defaultConfig,
       false,
@@ -286,18 +286,18 @@ describe('人格工具白名单接通 buildRegistry', () => {
     expect(names).toEqual(['time.now'])
   })
 
-  it('undefined 表示不限（老配置的语义）', () => {
-    const registry = buildRegistry(fakeCtx(), defaultConfig, false, new Set(), undefined)
+  it('undefined 表示不限（老配置的语义）', async () => {
+    const registry = await buildRegistry(fakeCtx(), defaultConfig, false, new Set(), undefined)
     expect(registry.list().length).toBeGreaterThan(3)
   })
 
-  it('空数组表示一个都不给（与 undefined 含义相反）', () => {
-    const registry = buildRegistry(fakeCtx(), defaultConfig, false, new Set(), [])
+  it('空数组表示一个都不给（与 undefined 含义相反）', async () => {
+    const registry = await buildRegistry(fakeCtx(), defaultConfig, false, new Set(), [])
     expect(registry.list()).toHaveLength(0)
   })
 
-  it('与全局开关叠加：人格白名单外的工具即使没被全局关也拿不到', () => {
-    const registry = buildRegistry(
+  it('与全局开关叠加：人格白名单外的工具即使没被全局关也拿不到', async () => {
+    const registry = await buildRegistry(
       fakeCtx(),
       defaultConfig,
       false,
@@ -397,5 +397,177 @@ describe('富媒体回复链路', () => {
     const payload = sent[0] as { media?: { type?: string; filename?: string } }
     expect(payload.media?.type).toBe('file')
     expect(payload.media?.filename).toBe('报告.pdf')
+  })
+})
+
+/**
+ * 插件提供的工具：从注册到能被模型调用的完整链路。
+ *
+ * 这是本轮功能的端到端验证 —— 单独测存储（plugin-tools.test.ts）只能证明
+ * 「写进去了」，证明不了「模型真的能调到」。这类「代码写了但没接线」的 bug
+ * 在本项目里出现过多次（allowDangerous、/skill），所以必须端到端测。
+ */
+describe('插件提供的工具接通 buildRegistry', () => {
+  /** 造一个能返回指定工具元数据的 fake db，以及一个带 tools 服务的 ctx */
+  function ctxWithPluginTools(
+    metas: Array<Record<string, unknown>>,
+    executors: Record<string, (input: unknown) => Promise<unknown>>,
+    serviceName = 'weather',
+  ): PluginContext<AgentConfig> {
+    const db = {
+      async all() {
+        return metas
+      },
+      async first() {
+        return null
+      },
+      async run() {
+        return { changes: 0 }
+      },
+      async exec() {},
+      table: (n: string) => `p_agent_${n}`,
+    } as unknown as PluginContext<AgentConfig>['db']
+
+    return {
+      ...fakeCtx(),
+      db,
+      service: ((name: string) => {
+        if (name === serviceName) return executors
+        throw new Error(`没有这个服务：${name}`)
+      }) as unknown as PluginContext<AgentConfig>['service'],
+    } as unknown as PluginContext<AgentConfig>
+  }
+
+  // 注意用**库里的列名**（snake_case）——listPluginTools 读的是 D1 行，
+  // 不是 PluginToolMeta 的 camelCase 形状
+  const meta = {
+    full_name: 'plugin.weather.query',
+    owner: 'weather',
+    name: 'query',
+    description: '查询某个城市当前的天气',
+    input_schema: JSON.stringify({
+      type: 'object',
+      properties: { city: { type: 'string' } },
+      required: ['city'],
+    }),
+    level: 2,
+    side_effect: 'external_write',
+    timeout_ms: 1000,
+    enabled: 1,
+    updated_at: 1,
+  }
+
+  it('注册的工具出现在注册表里', async () => {
+    const ctx = ctxWithPluginTools([meta], { query: async () => ({ temp: 21 }) })
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    const names = registry.list().map((t) => t.definition.name)
+    expect(names).toContain('plugin.weather.query')
+  })
+
+  it('工具能真的执行并返回结果', async () => {
+    const ctx = ctxWithPluginTools([meta], {
+      query: async (input) => ({ city: (input as { city: string }).city, temp: 21 }),
+    })
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    const result = await registry.execute('plugin.weather.query', {
+      db: ctx.db,
+      logger: ctx.logger,
+      conversationId: 'group:g1',
+      actorId: 'u1',
+      actorRole: 'admin',
+      scene: 'group',
+      targetId: 'g1',
+      runId: 'r1',
+      stepId: 's1',
+      toolCallId: 'c1',
+      input: { city: '北京' },
+      timezone: 'Asia/Shanghai',
+    })
+    expect(result.status).toBe('success')
+    expect(result.output).toMatchObject({ city: '北京', temp: 21 })
+  })
+
+  it('提供者没装（服务取不到）时，工具不注册 —— 而不是注册一个必然报错的工具', async () => {
+    const ctx = ctxWithPluginTools([meta], {}, 'other-plugin')
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    expect(registry.list().map((t) => t.definition.name)).not.toContain('plugin.weather.query')
+  })
+
+  it('有元数据但提供者没暴露对应执行函数时，跳过那个工具', async () => {
+    const ctx = ctxWithPluginTools([meta], { 其它工具: async () => null })
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    expect(registry.list().map((t) => t.definition.name)).not.toContain('plugin.weather.query')
+  })
+
+  it('执行函数抛错时返回可读的 failed，不影响整轮对话', async () => {
+    const ctx = ctxWithPluginTools([meta], {
+      query: async () => {
+        throw new Error('上游接口挂了')
+      },
+    })
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    const result = await registry.execute('plugin.weather.query', {
+      db: ctx.db,
+      logger: ctx.logger,
+      conversationId: 'group:g1',
+      actorId: 'u1',
+      actorRole: 'admin',
+      scene: 'group',
+      targetId: 'g1',
+      runId: 'r1',
+      stepId: 's1',
+      toolCallId: 'c1',
+      input: {},
+      timezone: 'Asia/Shanghai',
+    })
+    expect(result.status).toBe('failed')
+    expect(result.error?.message).toContain('上游接口挂了')
+    // 插件内部错误是否可重试我们不知道，保守设为不可重试，避免模型反复重试
+    expect(result.error?.retryable).toBe(false)
+  })
+
+  it('执行超时时返回 timeout，不让坏插件拖死整个 run', async () => {
+    const ctx = ctxWithPluginTools(
+      [{ ...meta, timeout_ms: 1000 }],
+      {
+        query: () =>
+          new Promise(() => {
+            /* 永不 resolve */
+          }),
+      },
+    )
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    const result = await registry.execute('plugin.weather.query', {
+      db: ctx.db,
+      logger: ctx.logger,
+      conversationId: 'group:g1',
+      actorId: 'u1',
+      actorRole: 'admin',
+      scene: 'group',
+      targetId: 'g1',
+      runId: 'r1',
+      stepId: 's1',
+      toolCallId: 'c1',
+      input: {},
+      timezone: 'Asia/Shanghai',
+    })
+    expect(result.status).toBe('timeout')
+  }, 15_000)
+
+  it('插件工具也能被工具栏开关关掉', async () => {
+    const ctx = ctxWithPluginTools([meta], { query: async () => null })
+    const registry = await buildRegistry(
+      ctx,
+      defaultConfig,
+      false,
+      new Set(['plugin.weather.query']),
+    )
+    expect(registry.list().map((t) => t.definition.name)).not.toContain('plugin.weather.query')
+  })
+
+  it('enable_tools 关掉时，插件工具也不注册', async () => {
+    const ctx = ctxWithPluginTools([meta], { query: async () => null })
+    const registry = await buildRegistry(ctx, { ...defaultConfig, enable_tools: false }, false)
+    expect(registry.list()).toHaveLength(0)
   })
 })

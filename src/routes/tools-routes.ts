@@ -21,7 +21,7 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
         const config = await resolveConfig(ctx)
         const settings = await getToolSettings(ctx.db).catch(() => ({ disabled: [], config: {} }))
         const r2Ready = config.enable_tools && config.enable_vfs ? await hasR2(ctx) : false
-        const tools = buildRegistry(ctx, config, r2Ready).list()
+        const tools = (await buildRegistry(ctx, config, r2Ready)).list()
         return Response.json({
           ok: true,
           tools: toToolCatalog(tools, settings),

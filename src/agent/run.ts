@@ -13,7 +13,7 @@ import type { HistoryRow } from '../do/agent-object.js'
 import type { InboundMessage } from '../types.js'
 import type { LLMService } from '../llm/contract.js'
 import type { ToolRegistry } from '../tools/registry.js'
-import type { RegisteredTool } from '../tools/types.js'
+import type { PermissionLevel, RegisteredTool } from '../tools/types.js'
 import { buildMessages } from './context.js'
 import { describeLoopError, runAgentLoop, type LoopResult } from './loop.js'
 import { createToolRegistry } from '../tools/registry.js'
@@ -30,6 +30,12 @@ import { BLOCKED_REPLY, checkContent, parseKeywords } from './safety.js'
 import { getSkill, listSkills, type LoadedSkill, type SkillCatalogItem } from '../skills/store.js'
 import { parseSkillCommand } from '../skills/context.js'
 import { buildFragmentBlock, listActiveFragments } from '../prompt-fragments.js'
+import {
+  listPluginTools,
+  type PluginToolExecutor,
+  type PluginToolMeta,
+  type PluginToolsService,
+} from '../plugin-tools.js'
 
 /** release / retryLater 之后可能返回「队列里下一个已认领的 run」 */
 export interface NextRun {
@@ -131,7 +137,7 @@ async function runLoopOnce(input: {
   // 注意 `allowedTools === undefined` 表示不限（老配置没这个字段），
   // 而 `[]` 表示「什么都不能用」——这两者含义相反，不能糊成一样。
   const disabled = new Set(toolSettings?.disabled ?? [])
-  const registry = buildRegistry(
+  const registry = await buildRegistry(
     ctx,
     config,
     r2Ready,
@@ -509,7 +515,7 @@ export async function hasR2(ctx: PluginContext<AgentConfig>): Promise<boolean> {
  * 分开关关掉时，那组工具**根本不注册**——模型看不到它们，
  * 也就不会尝试调用后被权限拒绝（那样既费 token 又让模型困惑）。
  */
-export function buildRegistry(
+export async function buildRegistry(
   ctx: PluginContext<AgentConfig>,
   config: AgentConfig,
   r2Ready: boolean,
@@ -521,7 +527,7 @@ export function buildRegistry(
   allowedTools?: readonly string[],
   /** 每个工具自己的配置（管理页在工具详情里填的），如 `{ 'search.web': { apiKey } }` */
   toolConfig: Record<string, Record<string, string>> = {},
-): ToolRegistry {
+): Promise<ToolRegistry> {
   if (!config.enable_tools) return createToolRegistry([])
 
   const tools: RegisteredTool[] = [createTimeTool(), createWebTool()]
@@ -561,6 +567,14 @@ export function buildRegistry(
     tools.push(...createVfsTools(ctx.db, r2Ready ? ctx.r2 : undefined))
   }
 
+  // 其他插件提供的工具。
+  //
+  // 分两步：**元数据**从 D1 读（构建注册表时要同步拿到），
+  // **执行函数**从提供者的 `services` 取（函数没法序列化）。
+  // 取不到执行函数的工具**不注册** —— 提供者可能没装或被停用了，
+  // 注册一个每次调用都报错的工具只会让模型反复重试。
+  tools.push(...await loadPluginTools(ctx))
+
   // 两道收窄，都在末尾统一做。**关掉是硬关**：工具根本不注册，
   // 模型看不到就不会尝试调用后被权限拒绝——那样既费 token 又让模型困惑。
   //
@@ -583,6 +597,125 @@ export function buildRegistry(
   return createToolRegistry(enabled)
 }
 
+
+/**
+ * 把其他插件注册的工具变成 RegisteredTool。
+ *
+ * ## 为什么要过 services
+ *
+ * 工具元数据（名字、描述、schema）能存 D1，但**执行函数不能** ——
+ * 函数不是可序列化的值。所以元数据从库里读，函数从提供者的
+ * `services` 运行时取。
+ *
+ * 提供者的服务名约定是 `tools`：它导出一个
+ * `{ [工具短名]: (input) => Promise<unknown> }` 的对象。
+ *
+ * ## 失败处理
+ *
+ * 任何一个提供者出问题都**只影响它自己的工具**：
+ * - 服务取不到（没装/被停用）→ 跳过它的全部工具
+ * - 某个工具没有对应执行函数 → 跳过那个工具
+ * - 每次调用都包了超时，防止一个插件拖死整个 run
+ */
+async function loadPluginTools(ctx: PluginContext<AgentConfig>): Promise<RegisteredTool[]> {
+  let metas: PluginToolMeta[]
+  try {
+    metas = await listPluginTools(ctx.db)
+  } catch {
+    // 建表前/读失败：没有插件工具而已，不该让整轮对话失败
+    return []
+  }
+  if (!metas.length) return []
+
+  // 按提供者分组，每个提供者只取一次服务
+  const byOwner = new Map<string, PluginToolMeta[]>()
+  for (const meta of metas) {
+    const list = byOwner.get(meta.owner) ?? []
+    list.push(meta)
+    byOwner.set(meta.owner, list)
+  }
+
+  const out: RegisteredTool[] = []
+  for (const [owner, items] of byOwner) {
+    let service: PluginToolsService
+    try {
+      service = ctx.service<PluginToolsService>(owner)
+    } catch {
+      // 提供者没装 / 被停用：静默跳过（这条路径每个会话都会走，不能刷日志）
+      continue
+    }
+    if (!service || typeof service !== 'object') continue
+
+    for (const meta of items) {
+      const execute = service[meta.name]
+      if (typeof execute !== 'function') continue
+      out.push(toRegisteredPluginTool(meta, execute))
+    }
+  }
+  return out
+}
+
+/** 把一条元数据 + 执行函数包成 Agent 自己的 RegisteredTool */
+function toRegisteredPluginTool(
+  meta: PluginToolMeta,
+  execute: PluginToolExecutor,
+): RegisteredTool {
+  return {
+    source: { type: 'plugin', id: meta.owner, name: meta.owner },
+    definition: {
+      name: meta.fullName,
+      title: meta.name,
+      description: meta.description,
+      inputSchema: meta.inputSchema,
+      // 权限级别在注册时已经被抬到至少 MIN_PLUGIN_TOOL_LEVEL；
+      // 这里再兜一次，防止有人直接改库把它调低
+      // 用通用 scope `plugin:use`，不用 `plugin:<owner>` ——
+      // 后者不在角色基线里，会让工具的 level 判定形同虚设（永远 permission_denied）。
+      // 各插件的权限差异由 level 表达，不需要每个插件一个 scope。
+      permission: { level: Math.max(2, meta.level) as PermissionLevel, scopes: ['plugin:use'] },
+      sideEffect: meta.sideEffect,
+      timeoutMs: meta.timeoutMs,
+    },
+    execute: async (context) => {
+      try {
+        // 超时兜底：插件工具的实现不受我们控制，可能挂住不返回。
+        // 不 race 掉的话，一个坏插件能把整个 run 拖到事件超时。
+        const output = await withTimeout(execute(context.input), meta.timeoutMs)
+        return { status: 'success', output }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        const timedOut = message.includes('超时')
+        return {
+          status: timedOut ? 'timeout' : 'failed',
+          error: {
+            code: timedOut ? 'plugin_tool_timeout' : 'plugin_tool_failed',
+            message: `插件 ${meta.owner} 的工具 ${meta.name} 失败：${message}`,
+            // 插件内部错误是否可重试我们不知道，保守起见不可重试 ——
+            // 可重试会让模型反复重试同一次失败
+            retryable: false,
+          },
+        }
+      }
+    },
+  }
+}
+
+/** 超时包装。`Promise.race` 不能取消底层 promise，但能让 run 继续往下走 */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`超时（${ms}ms）`)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
+}
 
 async function safeResolveModel(llm: LLMService, model: string, logger: Logger) {
   try {

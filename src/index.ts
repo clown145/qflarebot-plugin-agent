@@ -51,8 +51,15 @@ import {
   removeFragment,
   setFragmentEnabled,
   upsertFragment,
-  type AgentPromptService,
 } from './prompt-fragments.js'
+import {
+  listAllPluginTools,
+  pluginToolFullName,
+  removePluginTool,
+  upsertPluginTool,
+  type PluginToolRegistration,
+} from './plugin-tools.js'
+import type { AgentService } from './agent-service.js'
 import { getSkill, listSkills } from './skills/store.js'
 
 export { Agent }
@@ -128,7 +135,8 @@ export default definePlugin<AgentConfig>({
    * 有长度上限与去重，细节见 `src/prompt-fragments.ts`。
    */
   services: {
-    agent: (ctx): AgentPromptService => ({
+    agent: (ctx): AgentService => ({
+      // ---- 提示词扩展 ----
       async registerPrompt(plugin, fragment, priority) {
         return upsertFragment(ctx.db, { plugin, fragment, priority })
       },
@@ -140,6 +148,21 @@ export default definePlugin<AgentConfig>({
       },
       async listPrompts() {
         return listAllFragments(ctx.db)
+      },
+
+      // ---- 工具扩展 ----
+      async registerTool(plugin, tool) {
+        await upsertPluginTool(ctx.db, plugin, tool)
+      },
+      async unregisterTool(plugin, fullNameOrName) {
+        // 接受短名或全名：提供者手里通常只有短名
+        const fullName = fullNameOrName.includes('.')
+          ? fullNameOrName
+          : pluginToolFullName(plugin, fullNameOrName)
+        await removePluginTool(ctx.db, fullName)
+      },
+      async listTools() {
+        return listAllPluginTools(ctx.db)
       },
     }),
   },

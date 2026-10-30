@@ -70,7 +70,7 @@ export function createPageRoutesPage(): Route<AgentConfig>[] {
         // 不碰网络），r2 探测用 false 代替——页面只需要工具清单与权限级别，
         // 而真实探测一次要多一个 R2 往返。
         const catalogTools = toToolCatalog(
-          buildRegistry(ctx, config, false).list(),
+          (await buildRegistry(ctx, config, false)).list(),
           toolSettings,
         )
 

@@ -70,7 +70,7 @@ describe('resolveDefaultPolicy（照搬原文的角色基线）', () => {
   it('普通成员是 level 2，只能读写工作区', () => {
     const policy = resolveDefaultPolicy(context({ actorRole: 'member' }))
     expect(policy.maxLevel).toBe(2)
-    expect(policy.scopes).toEqual(['workspace:read', 'workspace:write'])
+    expect(policy.scopes).toEqual(['workspace:read', 'workspace:write', 'plugin:use'])
     expect(policy.scopes).not.toContain('http:request')
   })
 
@@ -93,6 +93,7 @@ describe('resolveDefaultPolicy（照搬原文的角色基线）', () => {
       'schedule:read',
       'schedule:write',
       'http:request',
+      'plugin:use',
     ])
   })
 

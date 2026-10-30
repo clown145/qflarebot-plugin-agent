@@ -22,10 +22,14 @@ const OWNER_SCOPES = [
   'http:request',
   'schedule:read',
   'schedule:write',
+  // 插件提供的工具。用**通用 scope** 而不是 `plugin:<名字>`：
+  // 后者不在任何角色基线里，等于插件注册了工具却永远调不到。
+  // 各插件之间的权限差异由工具自己声明的 level 表达，不需要每个插件一个 scope。
+  'plugin:use',
 ]
 
 /** 普通成员：只能读写工作区，不能建定时任务、不能发任意 HTTP */
-const MEMBER_SCOPES = ['workspace:read', 'workspace:write']
+const MEMBER_SCOPES = ['workspace:read', 'workspace:write', 'plugin:use']
 
 /**
  * 单聊（1:1 信道）用户的基线：能读写工作区，也能建定时任务、发 HTTP。
@@ -45,6 +49,7 @@ const DIRECT_CHAT_SCOPES = [
   'schedule:read',
   'schedule:write',
   'http:request',
+  'plugin:use',
 ]
 
 /** 陌生人（群里角色未知）：只读 */

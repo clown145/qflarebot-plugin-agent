@@ -143,4 +143,24 @@ export const SCHEMA_STATEMENTS = [
      updated_at INTEGER NOT NULL,
      PRIMARY KEY (plugin)
    ) WITHOUT ROWID`,
+
+  // 其他插件提供的**工具元数据**（执行函数不在这里，见 plugin-tools.ts 的说明）。
+  //
+  // `full_name` 是暴露给模型的名字 `plugin.<owner>.<name>`，同时作主键：
+  // - 强制带前缀，防止插件注册一个叫 `http.request` 的工具冒充内置工具
+  // - 两个插件撞名时自然被区分开
+  //
+  // `owner` 建索引：管理页要按提供者分组，卸载清理也按它删。
+  `CREATE TABLE IF NOT EXISTS {plugin_tools} (
+     full_name TEXT PRIMARY KEY,
+     owner TEXT NOT NULL,
+     name TEXT NOT NULL,
+     description TEXT NOT NULL,
+     input_schema TEXT NOT NULL,
+     level INTEGER NOT NULL DEFAULT 2,
+     side_effect TEXT NOT NULL DEFAULT 'external_write',
+     timeout_ms INTEGER NOT NULL DEFAULT 10000,
+     enabled INTEGER NOT NULL DEFAULT 1,
+     updated_at INTEGER NOT NULL
+   ) WITHOUT ROWID`,
 ] as const
