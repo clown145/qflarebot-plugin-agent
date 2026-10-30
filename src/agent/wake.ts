@@ -45,7 +45,6 @@
  */
 import type { Session } from '@qqbot/sdk'
 import type { AgentConfig } from '../config/index.js'
-import { isPluginCommand } from './commands.js'
 
 /** 唤醒结果：不唤醒时给出原因，便于日志与排障 */
 export type WakeDecision =
@@ -110,25 +109,22 @@ export function decideWake(session: Session, config: AgentConfig): WakeDecision 
   const matched = prefix ? raw.startsWith(prefix) : false
   const stripped = matched ? raw.slice(prefix.length).trim() : raw.trim()
 
-  // **是命令就不唤醒**，交给 `commands` 那条路径。
+  // **这里不判断「是不是命令」** —— 那是框架的职责。
   //
-  // 这里的注释曾经写错过（以为命令 `block:true` 就不会再分发到 events），
-  // 实际不是：命令和事件是同一个候选列表里的竞争项，`block` 只影响它之后
-  // 的候选。所以 `/reset` 会**同时**命中命令和群消息事件 —— 命令照常执行，
-  // 事件处理器也照样被调用，而唤醒层又把 `/` 当成前缀剥掉送进模型，
-  // 结果就是「执行命令的同时，模型还回一句莫名其妙的话」。
+  // 曾经有过一段「命令黑名单」（`agent/commands.ts` 的 `PLUGIN_COMMANDS`）：
+  // 因为命令和事件当时在同一个候选列表里按 priority+注册顺序竞争，
+  // 一条 `/reset` 会同时命中命令和群消息事件，于是命令执行完、模型又被喂了一句。
   //
-  // 判断依据是**首词是否为本插件的命令**，而不是「以斜杠开头」：
-  // `/你好` 是用户在用前缀聊天，不该被挡。
-  // 带前缀（`/reset`）和 @ 机器人后直接打命令名（`@机器人 reset`）都会被命令路径
-  // 接住，所以两种形状都要挡。前者已经剥了前缀，后者原文就是命令词。
-  if (isPluginCommand(stripped)) {
-    // 只有「带前缀」或「@ 了机器人」时才算命令 —— 群里别人说「help」
-    // 不带前缀也没 @，不该被当成命令吞掉（它本来也不会唤醒，这里只是明确语义）
-    if (matched || session.atMe) {
-      return { wake: false, reason: 'command' }
-    }
-  }
+  // 那个 workaround 必须删掉，理由不止「冗余」：
+  //
+  // 1. **挡不住别的插件**。装了第三方插件后它的 `/weather` 照样进模型 ——
+  //    本插件不可能知道别人注册了什么命令。
+  // 2. **框架已经修了**。现在同 priority 时主动匹配器（命令/正则/按键）
+  //    一定排在事件前面，命令默认 `block: true`，事件根本不会被调用；
+  //    权限不足的命令也算「已消费」，事件同样不接手。
+  //
+  // 所以唤醒层只管「前缀 / @ / 单聊」三种唤醒来源，命令分发交给框架。
+  // 详见 `qqbot-workers/analysis/COMMAND-EVENT-DISPATCH.md`。
 
   // 单聊：没有 @ 的概念，默认全部唤醒
   if (session.scene === 'c2c' || session.scene === 'guild_dm') {

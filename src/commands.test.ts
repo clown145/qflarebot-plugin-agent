@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import plugin from './index.js'
-import { PLUGIN_COMMANDS, PLUGIN_COMMAND_ALIASES, isPluginCommand } from './agent/commands.js'
 
 /**
  * 指令集的一致性契约。
@@ -138,53 +137,5 @@ describe('stop 与 reset 的语义区分', () => {
   it('stop 的说明里明确「保留记忆」（用户要能预期到）', () => {
     const cmd = plugin.commands?.['stop'] as { description?: string } | undefined
     expect(cmd?.description).toContain('保留')
-  })
-})
-
-/**
- * 唤醒层的命令黑名单必须和实际注册的命令同步。
- *
- * ## 为什么需要这条测试
- *
- * 命令(`commands`)和事件(`events`)是两套独立分发：一条 `/reset` 会**同时**
- * 命中两者。命令默认 `block: true` 只阻止它之后的候选，不影响已经排进来的事件。
- * 而唤醒层把 `/` 当前缀剥掉送模型 —— 于是用户会看到「执行了命令 + 模型又回一句」。
- *
- * 修法是唤醒层显式排除本插件的命令（`src/agent/commands.ts` 的
- * `PLUGIN_COMMANDS`）。但那是**手写清单**，和 `index.ts` 的 `commands`
- * 没有任何强关联 —— 加了命令忘了加进去，就又会漏进模型。
- */
-describe('唤醒层的命令黑名单与实际注册一致', () => {
-  it('注册的每个命令都在黑名单里', () => {
-    const registered = Object.keys(plugin.commands ?? {})
-    for (const name of registered) {
-      expect(
-        (PLUGIN_COMMANDS as readonly string[]).includes(name),
-        `命令「${name}」没进 PLUGIN_COMMANDS，/ ${name} 会被当成聊天送进模型`,
-      ).toBe(true)
-    }
-  })
-
-  it('黑名单里没有已经不存在的命令（清理残留）', () => {
-    const registered = new Set(Object.keys(plugin.commands ?? {}))
-    for (const name of PLUGIN_COMMANDS) {
-      expect(registered.has(name), `PLUGIN_COMMANDS 里的「${name}」已不是注册命令`).toBe(true)
-    }
-  })
-
-  it('中文别名也在黑名单里', () => {
-    for (const alias of PLUGIN_COMMAND_ALIASES) {
-      expect(isPluginCommand(alias), `别名「${alias}」没被拦住`).toBe(true)
-    }
-  })
-
-  it('isPluginCommand 只看首词，且不区分大小写', () => {
-    expect(isPluginCommand('reset')).toBe(true)
-    expect(isPluginCommand('RESET')).toBe(true)
-    expect(isPluginCommand('  help  ')).toBe(true)
-    // 不是命令的普通聊天不该被拦
-    expect(isPluginCommand('你好')).toBe(false)
-    expect(isPluginCommand('reset 一下你好')).toBe(true) // 首词是命令就按命令处理
-    expect(isPluginCommand('')).toBe(false)
   })
 })
