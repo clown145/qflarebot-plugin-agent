@@ -21,8 +21,7 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
         const config = await resolveConfig(ctx)
         const settings = await getToolSettings(ctx.db).catch(() => ({ disabled: [], config: {} }))
         const r2Ready = config.enable_tools && config.enable_vfs ? await hasR2(ctx) : false
-        // 同 page-routes：把每工具配置传进去，否则页面显示不出「已配置」
-        const tools = (await buildRegistry(ctx, config, r2Ready, new Set(), undefined, settings.config ?? {})).list()
+        const tools = (await buildRegistry(ctx, config, r2Ready)).list()
         return Response.json({
           ok: true,
           tools: toToolCatalog(tools, settings),
