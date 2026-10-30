@@ -378,3 +378,36 @@ describe('说话人身份与时是否暴露', () => {
     expect(JSON.stringify(a)).toBe(JSON.stringify(b))
   })
 })
+
+describe('summary 模式：摘要在上下文里的位置', () => {
+  const summary = { content: '之前聊过：约定每天九点提醒复盘', generatedAt: 1, coveredMessages: 6 }
+
+  it('不传 summary 时不插任何东西（truncate / off 模式零影响）', () => {
+    const messages = buildMessages(message(), [], baseOptions)
+    expect(messages.some((m) => String(m.content).includes('之前的对话摘要'))).toBe(false)
+  })
+
+  it('摘要插在历史之前、本轮消息之前', () => {
+    const history: HistoryRow[] = [
+      { role: 'user', content: '最近一问', toolCallsJson: null, createdAt: 1 },
+      { role: 'assistant', content: '最近一答', toolCallsJson: null, createdAt: 2 },
+    ]
+    const messages = buildMessages(message({ text: '本轮问题' }), history, { ...baseOptions, summary })
+    const texts = messages.map((m) => String(m.content))
+
+    const summaryAt = texts.findIndex((t) => t.includes('约定每天九点提醒复盘'))
+    const historyAt = texts.findIndex((t) => t.includes('最近一问'))
+    const currentAt = texts.findIndex((t) => t.includes('本轮问题'))
+
+    expect(summaryAt).toBeGreaterThan(-1)
+    expect(summaryAt).toBeLessThan(historyAt)
+    expect(historyAt).toBeLessThan(currentAt)
+  })
+
+  it('摘要是一对 user + assistant（不会被当成待回答的问题）', () => {
+    const messages = buildMessages(message(), [], { ...baseOptions, summary })
+    const idx = messages.findIndex((m) => String(m.content).includes('约定每天九点提醒复盘'))
+    expect(messages[idx]?.role).toBe('user')
+    expect(messages[idx + 1]?.role).toBe('assistant')
+  })
+})

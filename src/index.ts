@@ -33,6 +33,7 @@ import type { LLMService } from './llm/contract.js'
 import { executeRun, replyFromSession, type ReplyFn, type RunDeps } from './agent/run.js'
 import { conversationKey, isTextMessage, toInboundMessage } from './agent/inbound.js'
 import { decideWake } from './agent/wake.js'
+import { summarizeForConversation } from './agent/summarize.js'
 import { resolveConfig } from './effective-config.js'
 import { getPersonaBinding, setPersonaBinding } from './persona.js'
 import { hydrateImageAttachments } from './agent/media.js'
@@ -843,6 +844,36 @@ function tryLLM(ctx: PluginContext<AgentConfig>): LLMService | null {
   }
 }
 
+/**
+ * 给一个会话补摘要（`summary` 模式，跑在 cron 里）。
+ *
+ * 没待摘要内容时只是一次存储读就返回——**不是每分钟都调模型**。
+ * 真正调模型的频率取决于对话有多长（压缩发生得多频繁），
+ * 个人机器人通常一天也就几次。
+ */
+async function maybeSummarize(
+  ctx: PluginContext<AgentConfig>,
+  stub: ReturnType<typeof agentStub>,
+  config: AgentConfig,
+  getLLM: () => LLMService | null,
+): Promise<void> {
+  try {
+    const existing = await stub.summary()
+    const llm = getLLM()
+    if (!llm) return
+    await summarizeForConversation({
+      store: stub,
+      llm,
+      model: config.model,
+      logger: ctx.logger,
+      existing,
+    })
+  } catch (error) {
+    // 摘要失败不能拖累这个会话的滞留 run 恢复
+    ctx.logger.warn('补摘要失败', { error: String(error) })
+  }
+}
+
 
 /**
  * 一次 cron 轮的总时间预算。
@@ -888,6 +919,10 @@ async function serviceConversationObjects(
   // 懒加载：如果一个滞留 run 都没有，这次 cron 就不该多读一次 KV。
   let resumeConfig: AgentConfig | null = null
 
+  // 摘要配置也是全局的，同样懒加载：非 summary 模式下这轮 cron 不该多读一次 KV
+  let summaryConfig: AgentConfig | null = null
+  let summaryConfigChecked = false
+
   for (const conversation of known) {
     // 超预算就放弃剩下的会话，下一轮 cron 接着来——宁可晚 10 分钟恢复，
     // 也不能把同一个 invocation 里别的插件的定时任务拖到超时
@@ -898,6 +933,26 @@ async function serviceConversationObjects(
 
     try {
       const stub = agentStub(ctx, conversation)
+
+      // 摘要优先于「恢复滞留 run」：摘要是**用户可感知的记忆**，
+      // 而滞留 run 通常已经过期（用户多半另发了一条消息）。
+      // 只在 summary 模式下发生；其他模式这里只多一次存储读（没有 pending 就返回）。
+      if (!summaryConfigChecked) {
+        summaryConfigChecked = true
+        const cfg: AgentConfig = resumeConfig ?? (await resolveConfig(ctx))
+        resumeConfig = cfg
+        if (cfg.context_compression === 'summary') summaryConfig = cfg
+      }
+      if (summaryConfig) {
+        await maybeSummarize(ctx, stub, summaryConfig, () => {
+          if (!llmChecked) {
+            llmChecked = true
+            llm = tryLLM(ctx)
+          }
+          return llm
+        })
+      }
+
       // 一次 RPC 同时做「认领滞留 run」与「清理终态 run」
       const picked = await stub.sweep(RUN_RETENTION_MS)
       if (!picked.claimed.acquired || !picked.claimed.runId || !picked.claimed.message) continue

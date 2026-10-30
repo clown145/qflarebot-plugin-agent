@@ -334,7 +334,7 @@ export const PAGE_HTML_BODY = `
               <select class="qb-input" id="contextCompression" style="width: 9rem">
                 <option value="truncate">丢整轮（推荐）</option>
                 <option value="off">不压缩</option>
-                <option value="summary">摘要（暂退化为丢轮）</option>
+                <option value="summary">摘要（多一次模型调用）</option>
               </select>
             </div>
           </div>

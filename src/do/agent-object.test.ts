@@ -508,3 +508,61 @@ describe('stop 与 reset 的语义区分', () => {
     expect(await obj.history(50)).toHaveLength(0)
   })
 })
+
+describe('摘要存储（summary 压缩模式）', () => {
+  it('没有摘要时 summary() 返回 null', async () => {
+    const { obj } = makeObject()
+    expect(await obj.summary()).toBeNull()
+  })
+
+  it('stage 之后 takePending 能取到，且取走即清空', async () => {
+    const { obj } = makeObject()
+    await obj.stageSummary([{ role: 'user', content: '你好' }], 1)
+
+    const first = await obj.takePendingSummary()
+    expect(first?.messages).toHaveLength(1)
+    expect(first?.coveredMessages).toBe(1)
+
+    // 再取一次是空的：防两个执行者同时摘要同一批
+    expect(await obj.takePendingSummary()).toBeNull()
+  })
+
+  it('多次 stage 会合并而不是覆盖，保持时间顺序', async () => {
+    const { obj } = makeObject()
+    await obj.stageSummary([{ role: 'user', content: '第一轮' }], 1)
+    await obj.stageSummary([{ role: 'user', content: '第二轮' }], 1)
+
+    const pending = await obj.takePendingSummary()
+    expect(pending?.messages.map((m) => m.content)).toEqual(['第一轮', '第二轮'])
+    expect(pending?.coveredMessages).toBe(2)
+  })
+
+  it('restorePendingSummary 把失败的内容放回去，且排在更旧的批次之前', async () => {
+    const { obj } = makeObject()
+    await obj.stageSummary([{ role: 'user', content: '较新的' }], 1)
+    await obj.restorePendingSummary({ messages: [{ role: 'user', content: '更旧的' }], coveredMessages: 1 })
+
+    const pending = await obj.takePendingSummary()
+    expect(pending?.messages.map((m) => m.content)).toEqual(['更旧的', '较新的'])
+    expect(pending?.coveredMessages).toBe(2)
+  })
+
+  it('saveSummary 之后再 summary() 能读到', async () => {
+    const { obj } = makeObject()
+    await obj.saveSummary({ content: '摘要正文', generatedAt: 123, coveredMessages: 5 })
+    const stored = await obj.summary()
+    expect(stored?.content).toBe('摘要正文')
+    expect(stored?.coveredMessages).toBe(5)
+  })
+
+  it('reset 连摘要一起清掉（否则「清空记忆」之后还带着旧摘要）', async () => {
+    const { obj } = makeObject()
+    await obj.saveSummary({ content: '旧摘要', generatedAt: 1, coveredMessages: 3 })
+    await obj.stageSummary([{ role: 'user', content: '待摘要' }], 1)
+
+    await obj.reset()
+
+    expect(await obj.summary()).toBeNull()
+    expect(await obj.takePendingSummary()).toBeNull()
+  })
+})

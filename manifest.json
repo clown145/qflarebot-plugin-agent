@@ -373,7 +373,7 @@
           "summary"
         ],
         "title": "上下文压缩",
-        "description": "长会话怎么处理旧记录。`truncate` = 丢掉最老的整轮（零额外模型调用）；`summary` = 让模型摘要旧轮（每次多一次调用）；`off` = 只按历史条数截断",
+        "description": "长会话怎么处理旧记录。`truncate` = 丢掉最老的整轮（零额外模型调用，推荐）；`summary` = 丢掉旧轮的同时让模型生成摘要，跨轮记忆更好，每次压缩会多一次模型调用；`off` = 只按历史条数截断",
         "default": "truncate"
       },
       "max_context_tokens": {

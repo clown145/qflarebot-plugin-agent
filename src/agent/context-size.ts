@@ -205,6 +205,14 @@ export interface CompactResult {
   messages: ModelMessage[]
   /** 被丢掉的轮数。0 表示没压缩 */
   droppedRounds: number
+  /**
+   * 被丢掉的那些轮（按原顺序，展平成消息）。
+   *
+   * `summary` 模式要拿它去生成摘要——**丢弃的内容不该凭空消失**，
+   * 否则会话一旦跨过压缩阈值，之前所有约定都真的没了。
+   * 调用方不需要时忽略即可，不额外拷贝（`kept.slice` 本来就已经分出新数组）。
+   */
+  droppedMessages: ModelMessage[]
   /** 压缩前估算 */
   tokensBefore: number
   /** 压缩后估算 */
@@ -231,15 +239,19 @@ export function compactMessages(
   const tokensBefore = estimateMessagesTokens(messages)
   const totalBefore = tokensBefore + (options.systemTokens ?? 0)
 
-  if (totalBefore <= options.maxTokens) {
-    return { messages, droppedRounds: 0, tokensBefore, tokensAfter: tokensBefore }
-  }
+  const none = (): CompactResult => ({
+    messages,
+    droppedRounds: 0,
+    droppedMessages: [],
+    tokensBefore,
+    tokensAfter: tokensBefore,
+  })
+
+  if (totalBefore <= options.maxTokens) return none()
 
   const rounds = splitIntoRounds(messages)
   // 只有一轮时不能丢——否则等于把本轮问题删了
-  if (rounds.length <= 1) {
-    return { messages, droppedRounds: 0, tokensBefore, tokensAfter: tokensBefore }
-  }
+  if (rounds.length <= 1) return none()
 
   let dropped = 0
   let kept = rounds
@@ -255,15 +267,111 @@ export function compactMessages(
     dropped += 1
   }
 
-  if (dropped === 0) {
-    return { messages, droppedRounds: 0, tokensBefore, tokensAfter: tokensBefore }
-  }
+  if (dropped === 0) return none()
 
+  const droppedMessages = rounds
+    .slice(0, dropped)
+    .flatMap((round) => round.messages)
   const compacted = fixMessages(kept.flatMap((round) => round.messages))
   return {
     messages: compacted,
     droppedRounds: dropped,
+    droppedMessages,
     tokensBefore,
     tokensAfter: estimateMessagesTokens(compacted),
   }
+}
+
+// ---------------------------------------------------------------- 摘要压缩
+
+/** 摘要在 DO 里的存储键 */
+export const SUMMARY_KEY = 'summary'
+
+/** 一条已生成的会话摘要 */
+export interface StoredSummary {
+  /** 摘要正文（模型输出） */
+  content: string
+  /** 这份摘要覆盖到什么时候（毫秒时间戳），用来排障与展示 */
+  generatedAt: number
+  /** 被摘要掉的消息条数，用于日志与「摘要是否划算」的判断 */
+  coveredMessages: number
+}
+
+/**
+ * 摘要在上下文里的位置：紧跟 system 与人格开场白之后、真实历史之前。
+ *
+ * 用 `user` + `assistant` 这一对而不是塞进 system，理由和 AstrBot 一样：
+ * - **system 要保持稳定**，否则前缀缓存每轮失效（摘要变了就整段作废，
+ *   但摘要本身是低频变化，塞 system 反而每次改都击穿缓存）；
+ * - 摘要属于「对历史的重述」，不是人格设定，放 system 会污染人格层。
+ *
+ * `assistant` 的回应是固定的一小句：让模型知道「这段摘要已经被接受了」，
+ * 而不是把它当成本轮待回答的问题。
+ */
+const SUMMARY_ACK = 'Acknowledged the summary of our previous conversation history.'
+
+/** 把摘要包成一对模型消息 */
+export function summaryMessages(summary: StoredSummary): ModelMessage[] {
+  return [
+    {
+      role: 'user',
+      content: `Our previous history conversation summary: ${summary.content}`,
+    },
+    { role: 'assistant', content: SUMMARY_ACK },
+  ]
+}
+
+/**
+ * 生成摘要的提示词。结构参考 AstrBot 的 `LLMSummaryCompressor.instruction_text`，
+ * 但**砍掉了它面向开发场景的部分**（文件路径、材料清单——个人机器人的群聊用不上），
+ * 保留对闲聊同样重要的三条：核心话题与结论、工具用过的结论、用户最初想要什么。
+ */
+export const SUMMARY_INSTRUCTION = [
+  '把下面这段对话历史压缩成一份摘要，供你自己在后续对话里回忆用。要求：',
+  '1. 覆盖提到的主要话题和各自的结论，最新的重点放前面；',
+  '2. 如果用过工具，写出用过什么、拿到了什么关键结果（不要复述工具参数）；',
+  '3. 如果用户提过目标或偏好（称呼、语气、禁忌），明确写出来；',
+  '4. **结尾写明当前进展和下一步该做什么**（如果当时有任务在进行中）；',
+  '5. 用对话原来的语言写，控制在 400 字以内；',
+  '6. 只输出摘要正文，不要任何前缀、解释或格式标记。',
+].join('\n')
+
+/** 把任意消息的正文摊成纯文本（多模态内容取其中的文本段，图片只留占位） */
+function plainText(content: ModelMessage['content'] | undefined): string {
+  if (content === undefined) return ''
+  if (typeof content === 'string') return content
+  return content
+    .map((part) => (part.type === 'text' ? part.text : '[图片]'))
+    .join('')
+}
+
+/**
+ * 把被丢弃的消息拼成一条摘要请求。
+ *
+ * 只发一次模型调用：把历史按 `role: 正文` 摊平成文本，再追加摘要指令。
+ * 不重放原始消息数组，因为被丢弃的轮次里可能带工具配对，直接发容易触发
+ * provider 对序列的严格校验（Gemini 对 functionCall 签名极敏感），
+ * 而摘要根本用不上那层结构 —— 摊平更稳，token 也更省。
+ */
+export function buildSummaryRequest(dropped: ModelMessage[]): ModelMessage[] {
+  const body = dropped
+    .filter((message) => message.role !== 'system')
+    .map((message) => {
+      const text = plainText(message.content)
+      const calls =
+        message.role === 'assistant' && message.toolCalls?.length
+          ? `（调用了工具：${message.toolCalls.map((call) => call.name).join('、')}）`
+          : ''
+      // 工具结果是 JSON，截断一下：摘要不需要逐字复述，只要结论
+      const trimmed = message.role === 'tool' ? text.slice(0, 500) : text
+      return `${message.role}: ${trimmed}${calls}`
+    })
+    .join('\n')
+
+  return [
+    {
+      role: 'user',
+      content: `${SUMMARY_INSTRUCTION}\n\n<conversation_history>\n${body}\n</conversation_history>`,
+    },
+  ]
 }

@@ -20,7 +20,7 @@ import type {
 } from '../types.js'
 import { DEFAULT_SYSTEM_PROMPT } from '../config/index.js'
 import type { BeginDialogTurn } from '../persona.js'
-import { fixMessages } from './context-size.js'
+import { fixMessages, summaryMessages, type StoredSummary } from './context-size.js'
 import { buildActiveSkillPrompt, buildSkillCatalogPrompt } from '../skills/context.js'
 import type { LoadedSkill, SkillCatalogItem } from '../skills/store.js'
 
@@ -52,6 +52,13 @@ export interface ContextOptions {
   timezone: string
   /** 历史条数上限 */
   historyLimit: number
+  /**
+   * 会话摘要（`summary` 压缩模式）。
+   *
+   * 插在历史**之前**、人格开场白**之后**：它重述的是更早的对话，
+   * 逻辑上早于还在历史里的那几轮。没有摘要时不传。
+   */
+  summary?: StoredSummary
   /** 模型是否支持图片输入 */
   supportsVision: boolean
   /**
@@ -106,6 +113,12 @@ export function buildMessages(
   if (catalogPrompt) messages.push({ role: 'system', content: catalogPrompt })
   if (options.activeSkill) {
     messages.push({ role: 'system', content: buildActiveSkillPrompt(options.activeSkill) })
+  }
+
+  // 会话摘要：放在历史之前。它覆盖的是已经被压缩掉的更早内容，
+  // 所以顺序是「摘要（更早）→ 真实历史（更近）→ 本轮消息」。
+  if (options.summary) {
+    messages.push(...summaryMessages(options.summary))
   }
 
   // 历史：只取最近 N 条。条数越多越贵，history_limit 默认 20

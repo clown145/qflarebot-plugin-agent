@@ -34,6 +34,7 @@
 import type { Logger } from '@qqbot/sdk'
 import { callLLM, LLMCallError } from '../llm/client.js'
 import { compactMessages, estimateMessagesTokens } from './context-size.js'
+import type { SummaryInput } from '../do/agent-object.js'
 import type { LLMService } from '../llm/contract.js'
 import type { HistoryToolTrace, ModelMessage } from '../types.js'
 import { executeAgentToolCall } from './tool-executor.js'
@@ -76,6 +77,13 @@ export interface LoopResult {
   usage: { inputTokens: number; outputTokens: number }
   /** 本次 run 里压缩丢掉的轮数（0 = 没压）。排障用 */
   compactedRounds: number
+  /**
+   * 被压缩丢掉的轮次正文（只含 user / assistant，按时间顺序）。
+   *
+   * `summary` 模式拿它生成摘要，由调用方（run.ts）交给 DO 暂存。
+   * `truncate` / `off` 模式下调用方不看它，这里也就不会有内容。
+   */
+  droppedForSummary: SummaryInput[]
   /** 最后一次模型调用后的上下文 token 估算，用于观察长会话是否逼近上限 */
   contextTokens: number
   /**
@@ -142,6 +150,9 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   let inputTokens = 0
   let outputTokens = 0
   let compactedRounds = 0
+  // 被压缩丢掉的轮次（摊平成文本），交给调用方去生成摘要。
+  // 这里只收集不处理：生成摘要要调模型，而 loop 跑在 30 秒事件预算里。
+  const droppedForSummary: SummaryInput[] = []
   let contextTokens = 0
   const toolTraces: HistoryToolTrace[] = []
   const outbound: import('../tools/types.js').OutboundMedia[] = []
@@ -164,6 +175,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       })
       if (compacted.droppedRounds > 0) {
         compactedRounds += compacted.droppedRounds
+        // 只留 user / assistant 的文本：tool 结果可能几十 KB，
+        // 存进 DO 的待摘要槽会白白撑大体积，摘要也不需要逐字复述它。
+        for (const message of compacted.droppedMessages) {
+          if (message.role === 'tool' || message.role === 'system') continue
+          const content = typeof message.content === 'string' ? message.content : ''
+          if (content.trim()) droppedForSummary.push({ role: message.role, content })
+        }
         // 就地替换：保持 system 在前
         messages.length = 0
         messages.push(...systemMessages, ...compacted.messages)
@@ -204,6 +222,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         toolCalls: toolCallLimit.usedToolCalls,
         usage: { inputTokens, outputTokens },
         compactedRounds,
+        droppedForSummary,
         contextTokens,
         toolTraces,
         outbound,

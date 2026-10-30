@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildSummaryRequest,
   compactMessages,
   estimateMessagesTokens,
   estimateTextTokens,
   fixMessages,
   splitIntoRounds,
+  summaryMessages,
 } from './context-size.js'
 import type { ModelMessage } from '../types.js'
 
@@ -280,5 +282,90 @@ describe('compactMessages', () => {
     expect(without.droppedRounds).toBe(0)
     // 只有一轮所以仍然不丢，但这条保证调用方传了 systemTokens 不会报错
     expect(withSystem.droppedRounds).toBe(0)
+  })
+})
+
+describe('compactMessages 交出的丢弃内容（summary 模式用）', () => {
+  it('没压缩时 droppedMessages 是空数组', () => {
+    const messages = [user('短'), assistant('短')]
+    const result = compactMessages(messages, { maxTokens: 100_000 })
+    expect(result.droppedRounds).toBe(0)
+    expect(result.droppedMessages).toEqual([])
+  })
+
+  it('被丢掉的轮次按原顺序交出来，不能凭空消失', () => {
+    const long = '内容'.repeat(400)
+    const messages: ModelMessage[] = []
+    for (let i = 0; i < 6; i += 1) {
+      messages.push(user(`问题${i}${long}`), assistant(`回答${i}${long}`))
+    }
+    const result = compactMessages(messages, { maxTokens: 1 })
+
+    expect(result.droppedRounds).toBeGreaterThan(0)
+    // 丢掉的条数 = 轮数 × 每轮 2 条
+    expect(result.droppedMessages).toHaveLength(result.droppedRounds * 2)
+    // 从最老的开始，顺序保持
+    expect(result.droppedMessages[0]).toMatchObject({ role: 'user' })
+    expect(String(result.droppedMessages[0]?.content)).toContain('问题0')
+    expect(String(result.droppedMessages[1]?.content)).toContain('回答0')
+  })
+
+  it('丢掉的轮次里包含工具调用与结果（摘要不该漏掉用过什么工具）', () => {
+    const long = 'x'.repeat(2000)
+    const messages: ModelMessage[] = [
+      user(`第一问${long}`),
+      assistantWithCalls(['c1']),
+      toolResult('c1', long),
+      assistant(`第一答${long}`),
+      user(`第二问${long}`),
+      assistant(`第二答${long}`),
+      user(`第三问${long}`),
+      assistant(`第三答${long}`),
+    ]
+    const result = compactMessages(messages, { maxTokens: 1 })
+    const roles = result.droppedMessages.map((m) => m.role)
+    expect(roles).toContain('tool')
+    expect(roles).toContain('assistant')
+  })
+})
+
+describe('摘要消息的构造', () => {
+  it('summaryMessages 是 user 摘要 + assistant 确认这一对', () => {
+    const messages = summaryMessages({ content: '之前聊了 A 和 B', generatedAt: 1, coveredMessages: 4 })
+    expect(messages).toHaveLength(2)
+    expect(messages[0]?.role).toBe('user')
+    expect(String(messages[0]?.content)).toContain('之前聊了 A 和 B')
+    expect(messages[1]?.role).toBe('assistant')
+  })
+
+  it('buildSummaryRequest 把消息摊平成文本，且带上摘要指令', () => {
+    const request = buildSummaryRequest([user('我叫小明'), assistant('你好小明')])
+    expect(request).toHaveLength(1)
+    const content = String(request[0]?.content)
+    expect(content).toContain('我叫小明')
+    expect(content).toContain('你好小明')
+    expect(content).toContain('摘要') // 指令正文
+  })
+
+  it('buildSummaryRequest 不含 system 消息（摘要不该把提示词喂回去）', () => {
+    const request = buildSummaryRequest([{ role: 'system', content: '你是助手' }, user('hi')])
+    const content = String(request[0]?.content)
+    expect(content).not.toContain('你是助手')
+  })
+
+  it('多模态内容的图片只留占位，不会把 base64 塞进摘要请求', () => {
+    const request = buildSummaryRequest([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image', data: 'AAAA'.repeat(100) },
+        ],
+      },
+    ])
+    const content = String(request[0]?.content)
+    expect(content).toContain('看图')
+    expect(content).toContain('[图片]')
+    expect(content).not.toContain('AAAAAAAA')
   })
 })

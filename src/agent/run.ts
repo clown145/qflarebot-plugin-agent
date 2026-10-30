@@ -9,13 +9,14 @@
  */
 import type { Logger, PluginContext, ScopedR2 } from '@qqbot/sdk'
 import type { AgentConfig } from '../config/index.js'
-import type { HistoryRow } from '../do/agent-object.js'
+import type { HistoryRow, SummaryInput } from '../do/agent-object.js'
 import type { InboundMessage } from '../types.js'
 import type { LLMService } from '../llm/contract.js'
 import type { ToolRegistry } from '../tools/registry.js'
 import type { PermissionLevel, RegisteredTool } from '../tools/types.js'
 import { buildMessages } from './context.js'
 import { describeLoopError, runAgentLoop, type LoopResult } from './loop.js'
+import type { StoredSummary } from './context-size.js'
 import { createToolRegistry } from '../tools/registry.js'
 import { createTimeTool } from '../tools/time.js'
 import { createHttpTool } from '../tools/http.js'
@@ -51,6 +52,10 @@ export interface AgentStub {
     result: { ok: boolean; error?: string; history?: HistoryRow[] },
   ): Promise<NextRun>
   retryLater(runId: string, reason: string): Promise<NextRun>
+  /** 登记待摘要的轮次（`summary` 模式用；其他模式不调） */
+  stageSummary(messages: SummaryInput[], coveredMessages: number): Promise<void>
+  /** 读取会话摘要（`summary` 模式用） */
+  summary(): Promise<StoredSummary | null>
 }
 
 export interface ReplyFn {
@@ -112,6 +117,12 @@ async function runLoopOnce(input: {
   const { ctx, logger, config, llm, agent, message, runId } = input
 
   const history = await agent.history(config.history_limit)
+  // 摘要只在 summary 模式下读；读失败退回「没有摘要」——
+  // 压缩仍然由 truncate 兜底，不该因为一次 DO 抖动就中断整轮对话
+  const summary =
+    config.context_compression === 'summary'
+      ? await (agent.summary?.() ?? Promise.resolve(null)).catch(() => null)
+      : null
   const modelInfo = await safeResolveModel(llm, config.model, logger)
 
   // 人格：会话绑定 > 配置默认人格 > system_prompt。读失败不该让整轮对话失败
@@ -224,6 +235,8 @@ async function runLoopOnce(input: {
     ...(persona.beginDialogs.length ? { beginDialogs: persona.beginDialogs } : {}),
     ...(skillCatalog.length ? { skillCatalog } : {}),
     ...(activeSkill ? { activeSkill } : {}),
+    // 摘要只在 summary 模式下带：truncate / off 的用户不该多花一次 DO 读
+    ...(summary ? { summary } : {}),
   })
 
   return runAgentLoop({
@@ -236,8 +249,11 @@ async function runLoopOnce(input: {
     maxToolCalls: config.max_tool_calls,
     requestTimeoutMs: config.request_timeout_ms,
     // 压缩在 loop 内部每步前执行（工具结果会不断堆进 messages）。
-    // `summary` 模式在 loop 里等价于 `truncate`：循环内不可能插一次额外模型调用
-    // 去摘要而不超预算。summary 的价值主要在「跨轮记忆」，这里退化为 truncate。
+    //
+    // **loop 里一律用 truncate**，包括 summary 模式：循环内不可能再插一次模型调用
+    // 去摘要而不超事件预算。summary 的差异体现在两处：
+    // 1. 装配上下文时多带一份已有摘要（见 runLoopOnce 里的 summary 读取）；
+    // 2. 压缩丢掉的内容由 `stageSummary` 登记，交给 cron 异步生成摘要。
     compaction:
       config.context_compression === 'off'
         ? { mode: 'off' as const, maxTokens: config.max_context_tokens }
@@ -426,6 +442,21 @@ export async function executeRun(
       })
     }
     const next = await agent.release(runId, { ok: true, history: historyRows })
+
+    // 5b. summary 模式：把这次压缩丢掉的内容登记进 DO，等 cron 生成摘要。
+    //
+    // **不在这里生成摘要**：生成要调一次模型，而 executeRun 跑在事件处理器的
+    // 30 秒预算里（群聊被动回复窗口也就 5 分钟）。一次摘要调用几百毫秒到几十秒，
+    // 插在这里很可能让用户什么都收不到。cron 没有事件预算，是更合适的位置。
+    //
+    // 登记失败不能影响这一轮对话：摘要只是增强，truncate 仍然保底。
+    if (config.context_compression === 'summary' && result.droppedForSummary.length > 0) {
+      await agent
+        .stageSummary(result.droppedForSummary, result.droppedForSummary.length)
+        .catch((error: unknown) => {
+          logger.warn('登记待摘要内容失败，本轮不影响', { error: String(error) })
+        })
+    }
 
     // 6. 统计（一天一行，不随消息数线性增长）
     await bumpDailyStats(ctx.db, dayKey(config.timezone), {

@@ -32,7 +32,20 @@
  */
 
 import { PluginDurableObject } from '@qqbot/sdk'
+import type { StoredSummary } from '../agent/context-size.js'
 import type { InboundMessage, RunRecord } from '../types.js'
+
+/**
+ * 待摘要的一条消息。
+ *
+ * 不用 `ModelMessage`：那个类型来自 Worker 侧的 agent 模块，DO 只该存纯数据，
+ * 而且 `ModelContent` 的联合类型（含图片 base64）塞进 DO storage 会白白撑大体积。
+ * 摘要只需要 role 与文本。
+ */
+export interface SummaryInput {
+  role: 'user' | 'assistant'
+  content: string
+}
 
 /** 租约时长。执行者挂了之后，租约到期可以被别人接管 */
 export const LEASE_MS = 90_000
@@ -387,6 +400,69 @@ export class Agent extends PluginDurableObject {
     // 3) 删历史
     const all = await this.ctx.storage.list({ prefix: 'msg:' })
     if (all.size) await this.ctx.storage.delete([...all.keys()])
+
+    // 4) 摘要也一起清。不清的话 `/reset` 之后第一句话就带着旧记忆，
+    //    比完全不支持摘要更糟——用户以为清空、实际没清。
+    await this.ctx.storage.delete('summary')
+    await this.ctx.storage.delete('summary:pending')
+  }
+
+  // ------------------------------------------------------------ 摘要（summary 压缩模式）
+
+  /**
+   * 取会话摘要。没有就返回 null。
+   *
+   * 单独一个键而不是塞进历史：摘要是**低频变化、每轮都要读**的数据，
+   * 和历史行的生命周期不同（历史会被 `history_limit` 截断，摘要不该跟着被截）。
+   */
+  async summary(): Promise<StoredSummary | null> {
+    return (await this.ctx.storage.get<StoredSummary>('summary')) ?? null
+  }
+
+  /**
+   * 登记「这批轮次被丢掉了，等摘要」。
+   *
+   * 由 loop 在压缩发生后调用。**只登记、不生成**——生成摘要要调模型，
+   * 而 loop 跑在 30 秒事件预算里，插一次模型调用很可能把预算吃光，
+   * 用户就什么都收不到了。所以真正的生成交给 cron（没有事件预算）。
+   *
+   * 合并而非覆盖：同一会话可能在摘要生成前又压缩了两次，
+   * 把待摘要的旧轮**接在前面**，保证时间顺序不乱。
+   */
+  async stageSummary(messages: SummaryInput[], coveredMessages: number): Promise<void> {
+    if (messages.length === 0) return
+    const existing = await this.ctx.storage.get<{ messages: SummaryInput[]; coveredMessages: number }>('summary:pending')
+    const merged = existing ? [...existing.messages, ...messages] : messages
+    await this.ctx.storage.put('summary:pending', {
+      messages: merged,
+      coveredMessages: (existing?.coveredMessages ?? 0) + coveredMessages,
+    })
+  }
+
+  /**
+   * 取走待摘要的数据。**取走即清空**，避免两个执行者同时摘要同一批内容
+   * （cron 是每分钟一次，理论上不会重叠；但 isolate 可能被并发唤醒）。
+   */
+  async takePendingSummary(): Promise<{ messages: SummaryInput[]; coveredMessages: number } | null> {
+    const pending = await this.ctx.storage.get<{ messages: SummaryInput[]; coveredMessages: number }>('summary:pending')
+    if (!pending) return null
+    await this.ctx.storage.delete('summary:pending')
+    return pending
+  }
+
+  /** 写入生成好的摘要 */
+  async saveSummary(summary: StoredSummary): Promise<void> {
+    await this.ctx.storage.put('summary', summary)
+  }
+
+  /** 摘要生成失败：把待摘要内容放回去，下次 cron 再试 */
+  async restorePendingSummary(pending: { messages: SummaryInput[]; coveredMessages: number }): Promise<void> {
+    const existing = await this.ctx.storage.get<{ messages: SummaryInput[]; coveredMessages: number }>('summary:pending')
+    // 放回时排在**最前面**：这批更旧，应该先被摘要
+    await this.ctx.storage.put('summary:pending', {
+      messages: existing ? [...pending.messages, ...existing.messages] : pending.messages,
+      coveredMessages: (existing?.coveredMessages ?? 0) + pending.coveredMessages,
+    })
   }
 
   /** 会话概览，管理页展示用 */
