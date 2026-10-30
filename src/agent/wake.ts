@@ -124,7 +124,8 @@ export function decideWake(session: Session, config: AgentConfig): WakeDecision 
   //    权限不足的命令也算「已消费」，事件同样不接手。
   //
   // 所以唤醒层只管「前缀 / @ / 单聊」三种唤醒来源，命令分发交给框架。
-  // 详见 `qqbot-workers/analysis/COMMAND-EVENT-DISPATCH.md`。
+  // 这条语义要求 QFlareBot 0.7.0+（见 README 与 docs/quickstart.md 的版本要求）；
+  // 框架侧的说明在 QFlareBot 仓库 `docs/plugin-guide.md` 第 3 节的「语义变更记录」。
 
   // 单聊：没有 @ 的概念，默认全部唤醒
   if (session.scene === 'c2c' || session.scene === 'guild_dm') {
