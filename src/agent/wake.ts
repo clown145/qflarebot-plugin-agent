@@ -45,6 +45,7 @@
  */
 import type { Session } from '@qqbot/sdk'
 import type { AgentConfig } from '../config/index.js'
+import { isPluginCommand } from './commands.js'
 
 /** 唤醒结果：不唤醒时给出原因，便于日志与排障 */
 export type WakeDecision =
@@ -109,15 +110,25 @@ export function decideWake(session: Session, config: AgentConfig): WakeDecision 
   const matched = prefix ? raw.startsWith(prefix) : false
   const stripped = matched ? raw.slice(prefix.length).trim() : raw.trim()
 
-  // **不再在这里排除「指令前缀」**。
+  // **是命令就不唤醒**，交给 `commands` 那条路径。
   //
-  // 两个理由：
-  // 1. 指令前缀是**宿主管的**（框架的 commands 匹配器负责，面板可改），
-  //    插件再配一份就是两个真相，必然对不上。命令默认 `block: true`，
-  //    命中后同一事件不会再分发到 events，所以「是指令」与「进模型」天然互斥。
-  // 2. 原先在这里排除，导致唤醒前缀与指令前缀都是 `/` 时，`/agent` 这类消息
-  //    既不算唤醒也走不到模型；把前缀改成多字符（如 `bot`）后更是直接失效。
-  //    AstrBot 也没有这一步：唤醒前缀命中就算唤醒，之后才由指令匹配决定。
+  // 这里的注释曾经写错过（以为命令 `block:true` 就不会再分发到 events），
+  // 实际不是：命令和事件是同一个候选列表里的竞争项，`block` 只影响它之后
+  // 的候选。所以 `/reset` 会**同时**命中命令和群消息事件 —— 命令照常执行，
+  // 事件处理器也照样被调用，而唤醒层又把 `/` 当成前缀剥掉送进模型，
+  // 结果就是「执行命令的同时，模型还回一句莫名其妙的话」。
+  //
+  // 判断依据是**首词是否为本插件的命令**，而不是「以斜杠开头」：
+  // `/你好` 是用户在用前缀聊天，不该被挡。
+  // 带前缀（`/reset`）和 @ 机器人后直接打命令名（`@机器人 reset`）都会被命令路径
+  // 接住，所以两种形状都要挡。前者已经剥了前缀，后者原文就是命令词。
+  if (isPluginCommand(stripped)) {
+    // 只有「带前缀」或「@ 了机器人」时才算命令 —— 群里别人说「help」
+    // 不带前缀也没 @，不该被当成命令吞掉（它本来也不会唤醒，这里只是明确语义）
+    if (matched || session.atMe) {
+      return { wake: false, reason: 'command' }
+    }
+  }
 
   // 单聊：没有 @ 的概念，默认全部唤醒
   if (session.scene === 'c2c' || session.scene === 'guild_dm') {

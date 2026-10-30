@@ -195,10 +195,12 @@ describe('技能激活必须先于指令前缀判定', () => {
     expect(decision.wake && decision.text).toBe('/skill report 写周报')
   })
 
-  it('光一个 /skill 不当作激活（按普通唤醒前缀处理）', () => {
+  it('光一个 /skill 是命令，不唤醒（命令路径会回用法提示）', () => {
+    // /skill 本身是注册过的命令：它的 handler 负责回「用法：/skill <id> <任务>」。
+    // 若这里也判成唤醒，用户会同时收到用法提示和模型的一句话。
     const decision = decideWake(session({ content: '/skill' }), config())
-    expect(decision.wake).toBe(true)
-    expect(decision.wake && decision.reason).toBe('prefix')
+    expect(decision.wake).toBe(false)
+    expect(!decision.wake && decision.reason).toBe('command')
   })
 
   it('/skillx 之类不是技能激活，按普通唤醒前缀处理', () => {
