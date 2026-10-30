@@ -39,18 +39,8 @@
 - **长会话**超阈值时按「轮」压缩，工具调用和结果永远成对，**不消耗任何 D1/KV 额度**。
 - **被频率限制**时回一句提示，不静默丢弃。
 
-## 与 AstrBot / serverless-agent 的关系
+## 来源与许可
 
-- **[serverless-agent](https://github.com/clown145/serverless-agent)**：本插件的 agent loop、
-  权限层、VFS、调度、上下文装配都参考了它的结构（三个文件原样复制，见
-  [开发指南 · 来源与许可证](./development.md#来源与许可证)）。
-- **[AstrBot](https://github.com/AstrBotDevs/AstrBot)**：唤醒判定、人格、`begin_dialogs`、
-  上下文压缩（按轮丢弃 + 工具配对修复）、内容安全的双插入点，都对齐了它的语义。
-
-两者都是各自形态下的正确设计，直接照搬会水土不服 —— 具体哪里不能搬、为什么，
-写在各自章节里。
-
-## 许可证
-
-本插件是 **MIT**。但它原样复制了三个来自 serverless-agent 的 GPL-3.0-or-later 文件，
-**这在许可证上是有冲突的**，详见[来源与许可证](./development.md#来源与许可证)。
+本插件参考了 [serverless-agent](https://github.com/clown145/serverless-agent) 的结构，
+其中三个零依赖的纯函数文件是原样复制的 —— **存在 GPL 与 MIT 的许可证冲突**，
+详见[开发指南 · 来源与许可证](./development.md#来源与许可证)。

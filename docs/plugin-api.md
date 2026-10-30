@@ -5,11 +5,6 @@
 1. **提示词**：往 system prompt 里插一段话
 2. **工具**：把自己的函数交给模型调用
 
-两者都对标 AstrBot（`OnLLMRequestEvent` 和插件的 `llm_tool`）。
-
-对标 AstrBot 的 `OnLLMRequestEvent`（插件能在每次 LLM 请求前修改请求）。
-QFlareBot 没有钩子机制，所以做成服务。
-
 ## 用法
 
 ### 1. 在调用方插件的 manifest 里声明依赖
@@ -27,7 +22,6 @@ import type { AgentPromptService } from 'qflarebot-plugin-agent/src/prompt-fragm
 
 export default definePlugin({
   name: 'weather',
-  async hooks() { /* ... */ },
   commands: {
     setup: {
       async handler({ ctx }) {
@@ -87,8 +81,7 @@ system 前缀就抖了，缓存全废。
 
 ## 实测
 
-- 529 个测试通过
-- 跨时间、跨用户、跨会话时 system prompt **100% 相同**
+- 跨时间、跨用户、跨会话时 system prompt **100% 相同**（有测试锁住）
 
 ---
 

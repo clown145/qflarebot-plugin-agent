@@ -139,7 +139,7 @@ npx vitest run src/agent/context-size.test.ts   # 单个文件
 npm run typecheck
 ```
 
-239 → 306 个测试的分布大致是：agent loop / 上下文 / 权限 / DO 队列 / D1 访问 /
+616 个测试分布在 36 个文件里，大致是：agent loop / 上下文 / 权限 / DO 队列 / D1 访问 /
 唤醒回归 / 管理页结构 / cron / 压缩 / 内容安全 / 搜索。
 
 **写测试时的约定**：
