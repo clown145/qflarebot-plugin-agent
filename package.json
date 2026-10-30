@@ -1,6 +1,6 @@
 {
   "name": "qflarebot-plugin-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "QFlareBot 的 Agent 插件：带工具调用的多轮对话、会话记忆与可选的动态定时任务",
   "license": "MIT",
   "type": "module",
