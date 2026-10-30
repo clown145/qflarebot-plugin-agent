@@ -190,17 +190,17 @@ export default definePlugin<AgentConfig>({
   },
 
   commands: {
-    agent: {
+    ask: {
       description: '问 Agent 一个问题',
-      usage: '/agent <问题>',
+      usage: '/ask <问题>',
       async handler({ session, ctx, argText }) {
-        if (!argText.trim()) return '用法：/agent <你的问题>'
+        if (!argText.trim()) return '用法：/ask <你的问题>'
         await handleMessage(session, ctx, argText)
         return undefined
       },
     },
 
-    'agent reset': {
+    reset: {
       description: '清空当前会话的记忆',
       // **破坏性操作，必须有门槛**：不声明就是 `member`，群里任何人
       // 都能把整个群的记忆清掉。清空是单会话范围内不可逆的。
@@ -223,8 +223,8 @@ export default definePlugin<AgentConfig>({
      *
      * 之前只有 reset，用户想打断一句回答只能连记忆一起丢掉。
      */
-    'agent stop': {
-      aliases: ['agent 停', 'agent 别说了'],
+    stop: {
+      aliases: ['停', '别说了'],
       description: '打断正在进行的回答（保留记忆）',
       async handler({ session, ctx }) {
         const cfg = await resolveConfig(ctx)
@@ -247,8 +247,8 @@ export default definePlugin<AgentConfig>({
      * 如果正在跑，reset 会打断它 —— 这是必要的，否则那次回答的产物
      * 会写进「已经清空」的历史里，用户会看到记忆又冒出来。
      */
-    'agent new': {
-      aliases: ['agent 新对话'],
+    new: {
+      aliases: ['新对话'],
       description: '开始新对话（清空本次记忆）',
       // 和 reset 同档：清空是单会话范围内不可逆的
       permission: 'group_admin',
@@ -271,8 +271,8 @@ export default definePlugin<AgentConfig>({
      * 没有按会话分——所以这里分开报：会话维度报条数，全局维度报 token，
      * 而不是假装能给出「本会话的 token」。
      */
-    'agent stats': {
-      aliases: ['agent 用量'],
+    stats: {
+      aliases: ['用量'],
       description: '查看本会话的记忆规模与今日用量',
       async handler({ session, ctx }) {
         const cfgForKey = await resolveConfig(ctx)
@@ -316,8 +316,8 @@ export default definePlugin<AgentConfig>({
      * `commands.test.ts` 会比对这里列出的每一项和实际注册的命令，
      * 少一个、多一个都会失败。这样「加了命令忘了更新帮助」不会发生。
      */
-    'agent help': {
-      aliases: ['agent 帮助', 'agent 菜单'],
+    help: {
+      aliases: ['帮助', '菜单'],
       description: '列出所有可用命令',
       async handler({ ctx }) {
         const cfg = await resolveConfig(ctx)
@@ -329,36 +329,36 @@ export default definePlugin<AgentConfig>({
         const hasSkills = skillCount > 0
         const lines = [
           'Agent 命令：',
-          '/agent <问题> — 问 Agent 一个问题',
-          '/agent reset — 清空本会话记忆（群管理员）',
-          '/agent new — 开始新对话（群管理员）',
-          '/agent stop — 打断正在进行的回答',
-          '/agent stats — 查看记忆规模与今日用量',
-          '/agent schedule [cancel <id>] — 查看/取消定时任务',
-          '/agent persona [名字|off] — 查看/切换人格（群管理员）',
-          '/agent status — 查看模型与工具状态',
-          '/agent help — 就是这张清单',
+          '/ask <问题> — 问 Agent 一个问题',
+          '/reset — 清空本会话记忆（群管理员）',
+          '/new — 开始新对话（群管理员）',
+          '/stop — 打断正在进行的回答',
+          '/stats — 查看记忆规模与今日用量',
+          '/schedule [cancel <id>] — 查看/取消定时任务',
+          '/persona [名字|off] — 查看/切换人格（群管理员）',
+          '/status — 查看模型与工具状态',
+          '/help — 就是这张清单',
         ]
         if (hasSkills) {
-          lines.push('/agent skill [<id> [任务]] — 查看或激活技能')
+          lines.push('/skill [<id> [任务]] — 查看或激活技能')
         }
-        lines.push('', '别名：/agent 停、/agent 帮助、/agent 用量 等短名也认。')
+        lines.push('', '中文别名也认：/停、/帮助、/用量、/新对话、/菜单。')
         return lines.join('\n')
       },
     },
 
-    'agent schedule': {
+    schedule: {
       description: '查看本会话的定时任务',
-      usage: '/agent schedule [cancel <id>]',
+      usage: '/schedule [cancel <id>]',
       async handler({ session, ctx, argText }) {
         const cfgForKey = await resolveConfig(ctx)
         const conversation = conversationKey(session, cfgForKey.isolate_sessions)
         const arg = argText.trim()
 
-        // /agent schedule cancel <id>
+        // /schedule cancel <id>
         if (arg.startsWith('cancel ')) {
           const id = arg.slice('cancel '.length).trim()
-          if (!id) return '用法：/agent schedule cancel <任务 id>'
+          if (!id) return '用法：/schedule cancel <任务 id>'
           const cancelled = await cancelSchedule(ctx.db, id, conversation)
           return cancelled ? `已取消任务 ${id}。` : '没有找到这个任务，或者它不在本会话。'
         }
@@ -374,17 +374,17 @@ export default definePlugin<AgentConfig>({
             : '（一次性）'
           return `${when}${repeat}：${row.prompt}\n  id: ${row.id}`
         })
-        return ['本会话的定时任务：', ...lines, '', '取消用 /agent schedule cancel <id>'].join('\n')
+        return ['本会话的定时任务：', ...lines, '', '取消用 /schedule cancel <id>'].join('\n')
       },
     },
 
-    'agent persona': {
+    persona: {
       // 人格是**整群共享**的（绑定在 conversation 上），改它会影响群里所有人，
       // 所以和 reset 一样限群管理员。查询（不带参数）其实人人无害，
       // 但一条命令只有一个门槛，用「能改」的那档更安全。
       permission: 'group_admin',
       description: '查看或切换本会话的人格',
-      usage: '/agent persona [名字]',
+      usage: '/persona [名字]',
       async handler({ session, ctx, argText }) {
         const cfgForKey = await resolveConfig(ctx)
         const conversation = conversationKey(session, cfgForKey.isolate_sessions)
@@ -400,7 +400,7 @@ export default definePlugin<AgentConfig>({
             `当前人格：${active}`,
             available.length ? `可选：${available.join('、')}` : '还没有配置任何人格（插件设置 → 人格）',
             '',
-            '切换用 /agent persona <名字>，清除用 /agent persona off',
+            '切换用 /persona <名字>，清除用 /persona off',
           ].join('\n')
         }
 
@@ -423,7 +423,7 @@ export default definePlugin<AgentConfig>({
       },
     },
 
-    'agent status': {
+    status: {
       description: '查看 Agent 状态',
       async handler({ ctx }) {
         // `ctx.service()` 在提供者被停用/卸载时会抛错。这里必须兜住：
@@ -463,9 +463,9 @@ export default definePlugin<AgentConfig>({
      * 这条命令负责「列」和「看」，以及在不带任务时给出用法提示——
      * 因为走命令路径时那句话不会再进模型，光靠 runLoopOnce 是触发不到的。
      */
-    'agent skill': {
+    skill: {
       description: '查看可用技能，或激活一个技能',
-      usage: '/agent skill [<id> [任务]]',
+      usage: '/skill [<id> [任务]]',
       async handler({ ctx, argText }) {
         if (!(await resolveConfig(ctx)).enable_skills) {
           return '技能功能没开。请先在插件配置里打开「启用技能」。'

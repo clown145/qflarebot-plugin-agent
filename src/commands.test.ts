@@ -17,7 +17,7 @@ function registeredCommands(): string[] {
 
 describe('命令清单', () => {
   it('help 列出的命令都真实存在', async (ctx) => {
-    const help = plugin.commands?.['agent help']
+    const help = plugin.commands?.['help']
     expect(help).toBeTruthy()
 
     // 调真的 handler，拿它实际输出
@@ -42,7 +42,7 @@ describe('命令清单', () => {
     )
 
     // 从输出里抓所有 /agent xxx
-    const listed = [...output.matchAll(/\/agent ([a-z]+)/g)].map((m) => 'agent ' + m[1])
+    const listed = [...output.matchAll(/^\/([a-z]+)/gm)].map((m) => m[1] ?? '')
     const registered = registeredCommands()
 
     for (const name of listed) {
@@ -51,7 +51,7 @@ describe('命令清单', () => {
   })
 
   it('注册的每个命令都出现在 help 里（除了 help 自己）', async () => {
-    const help = plugin.commands?.['agent help']
+    const help = plugin.commands?.['help']
     const output = String(
       await (help as { handler: (a: unknown) => Promise<unknown> }).handler({
         ctx: {
@@ -75,10 +75,7 @@ describe('命令清单', () => {
     )
 
     for (const name of registeredCommands()) {
-      // 用法行是 `/agent <问题>`，从输出里找不到这种占位形式，跳过主入口
-      if (name === 'agent') continue
-      const short = name.replace(/^agent /, '')
-      expect(output, `命令「${name}」没写进 help`).toContain(short)
+      expect(output, `命令「${name}」没写进 help`).toContain(name)
     }
   })
 })
@@ -86,19 +83,19 @@ describe('命令清单', () => {
 describe('命令的权限门槛', () => {
   it('破坏性命令都要求群管理员', () => {
     // 清空记忆是不可逆的：群里任何人能做就会出事
-    for (const name of ['agent reset', 'agent new']) {
+    for (const name of ['reset', 'new']) {
       const cmd = plugin.commands?.[name] as { permission?: string } | undefined
       expect(cmd?.permission, `${name} 必须有权限门槛`).toBe('group_admin')
     }
   })
 
   it('改人格要求群管理员（人格是整群共享的）', () => {
-    const cmd = plugin.commands?.['agent persona'] as { permission?: string } | undefined
+    const cmd = plugin.commands?.['persona'] as { permission?: string } | undefined
     expect(cmd?.permission).toBe('group_admin')
   })
 
   it('只读命令不设门槛（人人可用）', () => {
-    for (const name of ['agent stats', 'agent help', 'agent status', 'agent stop']) {
+    for (const name of ['stats', 'help', 'status', 'stop']) {
       const cmd = plugin.commands?.[name] as { permission?: string } | undefined
       expect(cmd?.permission, `${name} 是只读/无害操作，不该设门槛`).toBeUndefined()
     }
@@ -108,10 +105,10 @@ describe('命令的权限门槛', () => {
 describe('别名', () => {
   it('常用命令有中文别名（QQ 里打中文比打英文自然）', () => {
     const cases: Array<[string, string]> = [
-      ['agent stop', 'agent 停'],
-      ['agent help', 'agent 帮助'],
-      ['agent stats', 'agent 用量'],
-      ['agent new', 'agent 新对话'],
+      ['stop', '停'],
+      ['help', '帮助'],
+      ['stats', '用量'],
+      ['new', '新对话'],
     ]
     for (const [name, alias] of cases) {
       const cmd = plugin.commands?.[name] as { aliases?: string[] } | undefined
@@ -133,12 +130,12 @@ describe('别名', () => {
 describe('stop 与 reset 的语义区分', () => {
   it('stop 不清历史，reset 清 —— 两者是不同命令', () => {
     // AstrBot: /stop 只打断当前回答，/reset 连记忆一起清
-    expect(registeredCommands()).toContain('agent stop')
-    expect(registeredCommands()).toContain('agent reset')
+    expect(registeredCommands()).toContain('stop')
+    expect(registeredCommands()).toContain('reset')
   })
 
   it('stop 的说明里明确「保留记忆」（用户要能预期到）', () => {
-    const cmd = plugin.commands?.['agent stop'] as { description?: string } | undefined
+    const cmd = plugin.commands?.['stop'] as { description?: string } | undefined
     expect(cmd?.description).toContain('保留')
   })
 })

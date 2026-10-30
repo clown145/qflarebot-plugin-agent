@@ -15,65 +15,65 @@
   "conflicts": [],
   "commands": [
     {
-      "name": "agent",
+      "name": "ask",
       "description": "问 Agent 一个问题",
-      "usage": "/agent <问题>"
+      "usage": "/ask <问题>"
     },
     {
-      "name": "agent reset",
+      "name": "reset",
       "description": "清空当前会话的记忆",
       "permission": "group_admin"
     },
     {
-      "name": "agent stop",
+      "name": "stop",
       "aliases": [
-        "agent 停",
-        "agent 别说了"
+        "停",
+        "别说了"
       ],
       "description": "打断正在进行的回答（保留记忆）"
     },
     {
-      "name": "agent new",
+      "name": "new",
       "aliases": [
-        "agent 新对话"
+        "新对话"
       ],
       "description": "开始新对话（清空本次记忆）",
       "permission": "group_admin"
     },
     {
-      "name": "agent stats",
+      "name": "stats",
       "aliases": [
-        "agent 用量"
+        "用量"
       ],
       "description": "查看本会话的记忆规模与今日用量"
     },
     {
-      "name": "agent help",
+      "name": "help",
       "aliases": [
-        "agent 帮助",
-        "agent 菜单"
+        "帮助",
+        "菜单"
       ],
       "description": "列出所有可用命令"
     },
     {
-      "name": "agent schedule",
+      "name": "schedule",
       "description": "查看本会话的定时任务",
-      "usage": "/agent schedule [cancel <id>]"
+      "usage": "/schedule [cancel <id>]"
     },
     {
-      "name": "agent persona",
+      "name": "persona",
       "permission": "group_admin",
       "description": "查看或切换本会话的人格",
-      "usage": "/agent persona [名字]"
+      "usage": "/persona [名字]"
     },
     {
-      "name": "agent status",
+      "name": "status",
       "description": "查看 Agent 状态"
     },
     {
-      "name": "agent skill",
+      "name": "skill",
       "description": "查看可用技能，或激活一个技能",
-      "usage": "/agent skill [<id> [任务]]"
+      "usage": "/skill [<id> [任务]]"
     }
   ],
   "regex": [],
