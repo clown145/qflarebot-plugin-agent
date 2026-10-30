@@ -131,6 +131,25 @@ export interface AgentConfig {
   /** 回复里是否附带"思考中"提示（单聊可用 typing） */
   show_typing: boolean
 
+  /**
+   * 是否让模型知道**说话人的 openid**。
+   *
+   * 默认关。开启后提示词里会带一行 `User ID: <openid>`，模型可以据此
+   * 「记住这个人」「区分群里不同的人」。
+   *
+   * **注意这不是 QQ 号**：QQ 官方机器人接口只给 openid（按机器人隔离的
+   * 匿名标识），拿不到真实 QQ 号。openid 同一个用户在同一台机器人下稳定，
+   * 但换一台机器人就不同，所以不能拿去跨机器人识别。
+   *
+   * 默认关的理由：多数对话不需要它，而它每轮都进上下文；更重要的是
+   * 一旦进了上下文，模型可能把它念出来 —— 那是用户看不见的标识符，
+   * 泄露到群里没有意义。
+   */
+  expose_sender_id: boolean
+
+  /** 是否把当前时间告诉模型。默认开：模型没有时钟，不给就会瞎猜日期 */
+  expose_datetime: boolean
+
   /** 时区，用于 time 工具与提示词 */
   timezone: string
 
@@ -189,6 +208,8 @@ export const defaultConfig: AgentConfig = {
   enable_skills: false,
   enable_audit: false,
   show_typing: true,
+  expose_sender_id: false,
+  expose_datetime: true,
   timezone: 'Asia/Shanghai',
   context_compression: 'truncate',
   max_context_tokens: 12000,
@@ -280,6 +301,23 @@ export const configSchema = {
       title: '回复前显示"正在输入"',
       description: '仅单聊有效',
       default: defaultConfig.show_typing,
+    },
+    expose_sender_id: {
+      type: 'boolean',
+      title: '让模型知道说话人 ID',
+      description:
+        '提示词里带上说话人的 openid（不是 QQ 号，QQ 机器人接口拿不到真实 QQ 号）。' +
+        '同一用户在同一台机器人下稳定，换机器人就不同，不能跨机器人识别。' +
+        '开了模型才能区分群里不同的人、记住谁说过什么',
+      default: defaultConfig.expose_sender_id,
+    },
+    expose_datetime: {
+      type: 'boolean',
+      title: '让模型知道当前时间',
+      description:
+        '模型没有时钟，关掉后它只能凭记忆猜日期。' +
+        '注意这条不影响缓存——时间放在本轮用户消息里，不在系统提示词里',
+      default: defaultConfig.expose_datetime,
     },
     personas: {
       type: 'array',

@@ -283,3 +283,79 @@ describe('插件提示词片段注入', () => {
     )
   })
 })
+
+/**
+ * 说话人身份与时是否暴露给模型。
+ *
+ * 对标 AstrBot 的 `identifier` / `datetime_system_prompt` 开关
+ * （`astr_main_agent.py:968-997` 的 `_append_system_reminders`）。
+ *
+ * **关键区别：我们给的是 openid，不是 QQ 号。**
+ * QQ 官方机器人接口只提供按机器人隔离的 openid，拿不到真实 QQ 号 ——
+ * 所以配置项和提示词里都写 openid，不写「QQ 号」，免得工具作者误解。
+ */
+describe('说话人身份与时是否暴露', () => {
+  /** 取本轮 user 消息的文本内容 */
+  function userText(messages: ReturnType<typeof buildMessages>): string {
+    const last = messages.at(-1)
+    if (!last) return ''
+    const content = 'content' in last ? last.content : ''
+    if (typeof content === 'string') return content
+    if (!content) return ''
+    return content.map((part) => ('text' in part ? part.text : '')).join('')
+  }
+
+  it('默认不给 ID（只给昵称）', () => {
+    const messages = buildMessages(message({ userName: '小明', userId: 'openid-123' }), [], baseOptions)
+    const text = userText(messages)
+    expect(text).toContain('小明')
+    expect(text).not.toContain('openid-123')
+    expect(text).not.toContain('openid:')
+  })
+
+  it('打开后给出 openid，措辞是 openid 而不是 QQ 号', () => {
+    const messages = buildMessages(message({ userName: '小明', userId: 'openid-123' }), [], {
+      ...baseOptions,
+      exposeSenderId: true,
+    })
+    const text = userText(messages)
+    expect(text).toContain('openid-123')
+    expect(text).toContain('openid')
+    // 不能让人误会成 QQ 号
+    expect(text).not.toContain('QQ 号')
+  })
+
+  it('没有昵称时给了 ID 也能认出是谁', () => {
+    const messages = buildMessages(message({ userName: '', userId: 'openid-abc' }), [], {
+      ...baseOptions,
+      exposeSenderId: true,
+    })
+    expect(userText(messages)).toContain('openid-abc')
+  })
+
+  it('关掉时间后提示词里没有日期', () => {
+    const messages = buildMessages(message(), [], { ...baseOptions, exposeDatetime: false })
+    const text = userText(messages)
+    expect(text).not.toContain('现在时间')
+    // 但会话类型还在（这是基本语境，不受这个开关影响）
+    expect(text).toContain('当前会话')
+  })
+
+  it('时间默认是开的（模型没有时钟）', () => {
+    const messages = buildMessages(message(), [], baseOptions)
+    expect(userText(messages)).toContain('现在时间')
+  })
+
+  it('这两个开关不影响 system 的稳定性（缓存）', () => {
+    // 身份与时间都在 user 消息里，system 必须跨轮一致
+    const a = buildMessages(message({ userName: '小明', userId: 'u1' }), [], {
+      ...baseOptions,
+      exposeSenderId: true,
+    })[0]
+    const b = buildMessages(message({ userName: '小红', userId: 'u2' }), [], {
+      ...baseOptions,
+      exposeSenderId: true,
+    })[0]
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b))
+  })
+})

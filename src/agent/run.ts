@@ -219,6 +219,8 @@ async function runLoopOnce(input: {
     supportsVision: modelInfo?.capabilities.includes('image') ?? false,
     toolNames: registry.list().map((tool) => tool.definition.name),
     ...(fragmentBlock ? { pluginPrompts: [fragmentBlock] } : {}),
+    exposeSenderId: config.expose_sender_id,
+    exposeDatetime: config.expose_datetime,
     ...(persona.beginDialogs.length ? { beginDialogs: persona.beginDialogs } : {}),
     ...(skillCatalog.length ? { skillCatalog } : {}),
     ...(activeSkill ? { activeSkill } : {}),

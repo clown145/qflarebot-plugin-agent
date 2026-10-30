@@ -214,6 +214,31 @@ export const PAGE_HTML_BODY = `
               </button>
             </div>
           </div>
+          <div class="setting-row">
+            <div class="setting-text">
+              <p class="setting-label">让模型知道说话人 ID</p>
+              <p class="setting-hint">
+                提示词里带上说话人的 openid。开了模型才能区分群里不同的人；关掉时只给昵称。
+                注意这不是 QQ 号——官方接口只给 openid，且按机器人隔离。
+              </p>
+            </div>
+            <div class="setting-control">
+              <button class="switch" data-flag="expose_sender_id" role="switch" aria-checked="false" aria-label="让模型知道说话人 ID" type="button">
+                <span class="switch-track"><span class="switch-knob"></span></span>
+              </button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-text">
+              <p class="setting-label">让模型知道当前时间</p>
+              <p class="setting-hint">模型没有时钟。关掉后它只能凭记忆猜日期。时间放在本轮消息里，不影响缓存。</p>
+            </div>
+            <div class="setting-control">
+              <button class="switch" data-flag="expose_datetime" role="switch" aria-checked="false" aria-label="让模型知道当前时间" type="button">
+                <span class="switch-track"><span class="switch-knob"></span></span>
+              </button>
+            </div>
+          </div>
         </div>
       </section>
 

@@ -254,6 +254,18 @@
         "description": "仅单聊有效",
         "default": true
       },
+      "expose_sender_id": {
+        "type": "boolean",
+        "title": "让模型知道说话人 ID",
+        "description": "提示词里带上说话人的 openid（不是 QQ 号，QQ 机器人接口拿不到真实 QQ 号）。同一用户在同一台机器人下稳定，换机器人就不同，不能跨机器人识别。开了模型才能区分群里不同的人、记住谁说过什么",
+        "default": false
+      },
+      "expose_datetime": {
+        "type": "boolean",
+        "title": "让模型知道当前时间",
+        "description": "模型没有时钟，关掉后它只能凭记忆猜日期。注意这条不影响缓存——时间放在本轮用户消息里，不在系统提示词里",
+        "default": true
+      },
       "personas": {
         "type": "array",
         "title": "人格",
@@ -383,6 +395,8 @@
     "enable_skills": false,
     "enable_audit": false,
     "show_typing": true,
+    "expose_sender_id": false,
+    "expose_datetime": true,
     "timezone": "Asia/Shanghai",
     "context_compression": "truncate",
     "max_context_tokens": 12000,

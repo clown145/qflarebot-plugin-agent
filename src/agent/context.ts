@@ -34,6 +34,15 @@ export interface ContextOptions {
   /** 本轮给模型开放了哪些工具（只用于拼「工具使用规范」，见 TOOL_USE_GUIDE） */
   toolNames?: string[]
   /**
+   * 是否把说话人的 openid 告诉模型（配置项 `expose_sender_id`）。
+   *
+   * 单独一个选项而不是整包传配置：这块只关心「给不给身份」和「给不给时间」，
+   * 传整个 AgentConfig 会让这个纯函数依赖配置结构，测试也得造一大堆无关字段。
+   */
+  exposeSenderId?: boolean
+  /** 是否把当前时间告诉模型（配置项 `expose_datetime`） */
+  exposeDatetime?: boolean
+  /**
    * 其他插件注册的提示词片段（`ctx.service('agent').registerPrompt`）。
    *
    * 拼在 system prompt **末尾**：属于稳定内容的一部分，只要插件不改它，
@@ -111,7 +120,10 @@ export function buildMessages(
     role: 'user',
     content: withReminder(
       buildUserContent(message, options.supportsVision),
-      buildSystemReminder(message, options.timezone),
+      buildSystemReminder(message, options.timezone, {
+        senderId: options.exposeSenderId ?? false,
+        datetime: options.exposeDatetime ?? true,
+      }),
     ),
   })
 
@@ -202,30 +214,52 @@ function buildSystemPrompt(
  * 用 `<system_reminder>` 包起来是沿用 AstrBot 的标记，模型能理解这是
  * 系统给的即时上下文，而不是用户在说话。
  */
-function buildSystemReminder(message: InboundMessage, timezone: string): string {
-  const now = new Date()
+function buildSystemReminder(
+  message: InboundMessage,
+  timezone: string,
+  expose: { senderId: boolean; datetime: boolean } = {
+    senderId: false,
+    datetime: true,
+  },
+): string {
+  const lines: string[] = []
 
-  // 模型没有时钟，把当前时间告诉它，比让它每轮调 time.now 便宜
-  let localTime = now.toISOString()
-  try {
-    localTime = new Intl.DateTimeFormat('zh-CN', {
-      timeZone: timezone,
-      dateStyle: 'full',
-      timeStyle: 'short',
-    }).format(now)
-  } catch {
-    // 时区配错时退回 ISO，不影响对话
+  if (expose.datetime) {
+    const now = new Date()
+    let localTime = now.toISOString()
+    try {
+      localTime = new Intl.DateTimeFormat('zh-CN', {
+        timeZone: timezone,
+        dateStyle: 'full',
+        timeStyle: 'short',
+      }).format(now)
+    } catch {
+      // 时区配错时退回 ISO，不影响对话
+    }
+    // 模型没有时钟，把当前时间告诉它，比让它每轮调 time.now 便宜
+    lines.push(`- 现在时间：${localTime}（时区 ${timezone}）`)
   }
 
-  return [
-    '<system_reminder>',
-    `- 现在时间：${localTime}（时区 ${timezone}）`,
-    `- 当前会话：${message.scene === 'c2c' ? '单聊' : '群聊'}`,
-    message.userName ? `- 正在和你说话的人：${message.userName}` : '',
-    '</system_reminder>',
-  ]
-    .filter(Boolean)
-    .join('\n')
+  lines.push(`- 当前会话：${message.scene === 'c2c' ? '单聊' : '群聊'}`)
+
+  // 说话人：**昵称总是给**（没有昵称模型没法自然称呼对方），openid 受开关控制。
+  //
+  // 为什么 ID 要单独开关：它是按机器人隔离的匿名标识，用户自己看不见、
+  // 跨机器人也不通用。默认开着每轮都占上下文，还可能被模型念到群里去。
+  // 但关掉它，模型在群里就分不清哪句话是谁说的 —— 需要「记住某个人」
+  // 或者「按人区分」时才该打开。
+  //
+  // 注意这里给的**不是 QQ 号**：QQ 官方机器人接口只提供 openid。
+  if (expose.senderId && message.userId) {
+    lines.push(
+      `- 正在和你说话的人：${message.userName || '(无昵称)'}（openid: ${message.userId}）`,
+    )
+  } else if (message.userName) {
+    lines.push(`- 正在和你说话的人：${message.userName}`)
+  }
+
+  if (!lines.length) return ''
+  return ['<system_reminder>', ...lines, '</system_reminder>'].join('\n')
 }
 
 function toModelMessage(row: HistoryRow): ModelMessage {
