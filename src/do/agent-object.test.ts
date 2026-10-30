@@ -445,3 +445,66 @@ describe('Agent.reset', () => {
     expect(await obj.history(10)).toEqual([])
   })
 })
+
+/**
+ * stop：只打断当前回答，不清历史。
+ *
+ * 对标 AstrBot 的 `/stop`（`active_event_registry.stop_all()`）。
+ * 与 `reset()` 的区别是**记忆保不保留** —— 用户说「别说了」时
+ * 不该被迫丢掉之前聊的全部内容。
+ */
+describe('stop 与 reset 的语义区分', () => {
+  it('没有正在跑的 run 时 stop 返回 false（不报错）', async () => {
+    const { obj } = makeObject()
+    expect(await obj.stop()).toEqual({ stopped: false })
+  })
+
+  it('stop 打断 run 但不删历史', async () => {
+    const { obj } = makeObject()
+    // 先跑一轮，留下历史
+    const first = await obj.submit(message())
+    await obj.release(first.runId!, {
+      ok: true,
+      history: [
+        { role: 'user', content: '第一句', createdAt: Date.now(), toolCallsJson: null },
+        { role: 'assistant', content: '第一答', createdAt: Date.now(), toolCallsJson: null },
+      ],
+    })
+    const before = await obj.history(50)
+    expect(before.length).toBeGreaterThan(0)
+
+    // 再提交一个，然后 stop
+    const second = await obj.submit(message())
+    expect(second.acquired).toBe(true)
+    const result = await obj.stop()
+    expect(result.stopped).toBe(true)
+
+    // 历史还在（这是 stop 与 reset 的核心区别）
+    expect((await obj.history(50)).length).toBe(before.length)
+  })
+
+  it('reset 会清历史（对比 stop）', async () => {
+    const { obj } = makeObject()
+    const run = await obj.submit(message())
+    await obj.release(run.runId!, {
+      ok: true,
+      history: [{ role: 'user', content: 'x', createdAt: Date.now(), toolCallsJson: null }],
+    })
+    expect((await obj.history(50)).length).toBeGreaterThan(0)
+
+    await obj.reset()
+    expect((await obj.history(50)).length).toBe(0)
+  })
+
+  it('被打断的 run 不写历史（cancelled 的 release 被跳过）', async () => {
+    const { obj } = makeObject()
+    const run = await obj.submit(message())
+    await obj.stop()
+    // 模拟 run 跑完后才调 release —— 它应该看到 cancelled 而不写历史
+    await obj.release(run.runId!, {
+      ok: true,
+      history: [{ role: 'user', content: '不该被记住', createdAt: Date.now(), toolCallsJson: null }],
+    })
+    expect(await obj.history(50)).toHaveLength(0)
+  })
+})

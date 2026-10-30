@@ -42,6 +42,7 @@ import {
   advanceSchedule,
   cancelSchedule,
   listDueSchedules,
+  listDailyStats,
   listSchedules,
   pruneToolAudit,
 } from './store/d1.js'
@@ -207,6 +208,137 @@ export default definePlugin<AgentConfig>({
         const stub = agentStub(ctx, conversationKey(session))
         await stub.reset()
         return '这个会话的记忆已经清空了。'
+      },
+    },
+
+    /**
+     * 只打断当前这次回答，**不清记忆**。
+     *
+     * 对标 AstrBot 的 `/stop`（`conversation.py` 的 `stop()` 走
+     * `active_event_registry.stop_all()`）。它和 `/agent reset` 是两件事：
+     * - 用户说「别说了」→ `/agent stop`，记忆还在
+     * - 用户说「忘掉之前聊的」→ `/agent reset`，清历史
+     *
+     * 之前只有 reset，用户想打断一句回答只能连记忆一起丢掉。
+     */
+    'agent stop': {
+      aliases: ['agent 停', 'agent 别说了'],
+      description: '打断正在进行的回答（保留记忆）',
+      async handler({ session, ctx }) {
+        const stub = agentStub(ctx, conversationKey(session))
+        const result = await stub.stop()
+        return result.stopped
+          ? '好，这次回答停下了。之前的对话记忆还在。'
+          : '现在没有正在进行的回答。'
+      },
+    },
+
+    /**
+     * 开一段新对话：清空历史，但**不中断**正在跑的回答。
+     *
+     * 与 reset 的区别和 AstrBot 一致（`/new` vs `/reset`）：
+     * - `reset` 会先打断再清（因为正在跑的回答还在往旧历史里写，不清干净会串味）
+     * - `new` 是「这轮答完，下一句重新开始」——对用户来说更温和
+     *
+     * 实现上两者都落到 DO 的 reset：历史只有一份，区别在语义与提示语。
+     * 如果正在跑，reset 会打断它 —— 这是必要的，否则那次回答的产物
+     * 会写进「已经清空」的历史里，用户会看到记忆又冒出来。
+     */
+    'agent new': {
+      aliases: ['agent 新对话'],
+      description: '开始新对话（清空本次记忆）',
+      // 和 reset 同档：清空是单会话范围内不可逆的
+      permission: 'group_admin',
+      async handler({ session, ctx }) {
+        const stub = agentStub(ctx, conversationKey(session))
+        await stub.reset()
+        return '好，重新开始。之前的对话我已经不记得了。'
+      },
+    },
+
+    /**
+     * 看这个会话的规模与额度使用情况。
+     *
+     * 对标 AstrBot 的 `/stats`（它报 token 用量）。这里报的是**我们真有的数据**：
+     * 历史条数、排队数、是否在跑，以及今天的全局用量。
+     *
+     * AstrBot 的 token 统计来自 `ProviderStat` 表（按 conversation 聚合）；
+     * 我们的 token 记在 `{daily_stats}` 里但是**全局按天**的，
+     * 没有按会话分——所以这里分开报：会话维度报条数，全局维度报 token，
+     * 而不是假装能给出「本会话的 token」。
+     */
+    'agent stats': {
+      aliases: ['agent 用量'],
+      description: '查看本会话的记忆规模与今日用量',
+      async handler({ session, ctx }) {
+        const conversation = conversationKey(session)
+        const stub = agentStub(ctx, conversation)
+        const [size, recent] = await Promise.all([
+          stub.stats().catch(() => ({ history: 0, pending: 0, locked: false })),
+          listDailyStats(ctx.db, 1).catch(() => []),
+        ])
+        // listDailyStats 按 day 倒序，第一条就是今天（如果今天有记录）
+        const today = recent[0]
+
+        const lines = [
+          '本会话：',
+          `- 记忆：${size.history} 条`,
+          `- 排队中：${size.pending} 条`,
+          `- 正在回答：${size.locked ? '是' : '否'}`,
+        ]
+        if (today) {
+          lines.push(
+            '',
+            '今天（所有会话合计）：',
+            `- 回答次数：${today.runs}`,
+            `- 工具调用：${today.tool_calls}`,
+            `- 输入 token：${today.input_tokens}`,
+            `- 输出 token：${today.output_tokens}`,
+          )
+        } else {
+          lines.push('', '今天还没有用量记录。')
+        }
+        return lines.join('\n')
+      },
+    },
+
+    /**
+     * 列出所有可用命令。
+     *
+     * 对标 AstrBot 的 `/help`。它那边会从**实时指令配置**生成清单
+     * （支持重命名、禁用、子命令分组），我们这边没有指令管理，
+     * 所以是手写清单 —— 但**自带一致性检查测试**：
+     * `commands.test.ts` 会比对这里列出的每一项和实际注册的命令，
+     * 少一个、多一个都会失败。这样「加了命令忘了更新帮助」不会发生。
+     */
+    'agent help': {
+      aliases: ['agent 帮助', 'agent 菜单'],
+      description: '列出所有可用命令',
+      async handler({ ctx }) {
+        const cfg = await resolveConfig(ctx)
+        // 只在真有技能时列出技能命令，避免列出一个「现在用不了」的入口。
+        // 技能存在 D1（页面里加的），不在插件配置里 —— 读到失败就当作没有。
+        const skillCount = cfg.enable_skills
+          ? (await listSkills(ctx.db).catch(() => [])).length
+          : 0
+        const hasSkills = skillCount > 0
+        const lines = [
+          'Agent 命令：',
+          '/agent <问题> — 问 Agent 一个问题',
+          '/agent reset — 清空本会话记忆（群管理员）',
+          '/agent new — 开始新对话（群管理员）',
+          '/agent stop — 打断正在进行的回答',
+          '/agent stats — 查看记忆规模与今日用量',
+          '/agent schedule [cancel <id>] — 查看/取消定时任务',
+          '/agent persona [名字|off] — 查看/切换人格（群管理员）',
+          '/agent status — 查看模型与工具状态',
+          '/agent help — 就是这张清单',
+        ]
+        if (hasSkills) {
+          lines.push('/agent skill [<id> [任务]] — 查看或激活技能')
+        }
+        lines.push('', '别名：/agent 停、/agent 帮助、/agent 用量 等短名也认。')
+        return lines.join('\n')
       },
     },
 
@@ -899,6 +1031,10 @@ type AgentStub = {
   release(runId: string, result: { ok: boolean; error?: string; history?: HistoryRow[] }): Promise<void>
   retryLater(runId: string, reason: string): Promise<void>
   reset(): Promise<void>
+  /** 只打断正在跑的 run，不清历史（/stop 用） */
+  stop(): Promise<{ stopped: boolean }>
+  /** 会话规模：历史条数、队列长度、是否正在跑（/stats 与状态查看用） */
+  stats(): Promise<{ history: number; pending: number; locked: boolean }>
   /** 一次 RPC 同时做「认领滞留 run」与「清理终态 run」，cron 的 10 分钟清理轮用 */
   sweep(olderThanMs: number): Promise<{
     claimed: { acquired: boolean; runId?: string; message?: InboundMessage; retryAfterMs?: number }

@@ -25,6 +25,37 @@
       "permission": "group_admin"
     },
     {
+      "name": "agent stop",
+      "aliases": [
+        "agent 停",
+        "agent 别说了"
+      ],
+      "description": "打断正在进行的回答（保留记忆）"
+    },
+    {
+      "name": "agent new",
+      "aliases": [
+        "agent 新对话"
+      ],
+      "description": "开始新对话（清空本次记忆）",
+      "permission": "group_admin"
+    },
+    {
+      "name": "agent stats",
+      "aliases": [
+        "agent 用量"
+      ],
+      "description": "查看本会话的记忆规模与今日用量"
+    },
+    {
+      "name": "agent help",
+      "aliases": [
+        "agent 帮助",
+        "agent 菜单"
+      ],
+      "description": "列出所有可用命令"
+    },
+    {
       "name": "agent schedule",
       "description": "查看本会话的定时任务",
       "usage": "/agent schedule [cancel <id>]"

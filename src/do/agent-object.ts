@@ -390,6 +390,35 @@ export class Agent extends PluginDurableObject {
   }
 
   /** 会话概览，管理页展示用 */
+  /**
+   * 只打断正在跑的 run，**不清历史**。
+   *
+   * 与 `reset()` 的区别：
+   * - `reset()`：打断 + 清空历史 + 清队列（「重新开始」）
+   * - `stop()`：只打断当前这次回答（「别说了」），记忆保留
+   *
+   * AstrBot 的 `/stop` 就是这个语义（`active_event_registry.stop_all()`），
+   * 它和 `/reset` 是两个命令 —— 用户想「打断这句」时不该被迫丢掉全部记忆。
+   *
+   * 实现上只把 run 标成 cancelled：`release()` 见到 cancelled 就跳过写历史，
+   * 所以被打断的那次回答不会污染记忆。
+   */
+  async stop(): Promise<{ stopped: boolean }> {
+    const lock = await this.ctx.storage.get<{ runId: string }>('lock')
+    if (!lock) return { stopped: false }
+
+    const key = `run:${lock.runId}`
+    const run = await this.ctx.storage.get<RunRecord>(key)
+    if (!run || run.status !== 'running') return { stopped: false }
+
+    await this.ctx.storage.put(key, {
+      ...run,
+      status: 'cancelled',
+      updatedAt: Date.now(),
+    })
+    return { stopped: true }
+  }
+
   async stats(): Promise<{ history: number; pending: number; locked: boolean }> {
     const [history, pending, lock] = await Promise.all([
       this.ctx.storage.list({ prefix: 'msg:' }),

@@ -1,0 +1,144 @@
+import { describe, expect, it } from 'vitest'
+import plugin from './index.js'
+
+/**
+ * 指令集的一致性契约。
+ *
+ * 对标 AstrBot 的 `/help`：它从**实时指令配置**生成清单，天然不会和实际
+ * 注册的命令脱节。我们没有指令管理，help 是手写清单 —— 所以用测试守住
+ * 「清单和实际注册的命令一致」这件事，否则加了命令忘了更新帮助，
+ * 用户就永远不知道有那个命令。
+ */
+
+/** 实际注册的命令名（不含别名） */
+function registeredCommands(): string[] {
+  return Object.keys(plugin.commands ?? {})
+}
+
+describe('命令清单', () => {
+  it('help 列出的命令都真实存在', async (ctx) => {
+    const help = plugin.commands?.['agent help']
+    expect(help).toBeTruthy()
+
+    // 调真的 handler，拿它实际输出
+    const output = String(
+      await (help as { handler: (a: unknown) => Promise<unknown> }).handler({
+        ctx: {
+          db: {
+            async all() {
+              return []
+            },
+          },
+          kv: { get: async () => null, getJSON: async () => null, put: async () => undefined },
+          config: plugin.defaultConfig,
+          logger: { debug() {}, info() {}, warn() {}, error() {} },
+          service: () => {
+            throw new Error('no llm')
+          },
+        },
+        session: {},
+        argText: '',
+      }),
+    )
+
+    // 从输出里抓所有 /agent xxx
+    const listed = [...output.matchAll(/\/agent ([a-z]+)/g)].map((m) => 'agent ' + m[1])
+    const registered = registeredCommands()
+
+    for (const name of listed) {
+      expect(registered, `help 列了「${name}」但它没被注册`).toContain(name)
+    }
+  })
+
+  it('注册的每个命令都出现在 help 里（除了 help 自己）', async () => {
+    const help = plugin.commands?.['agent help']
+    const output = String(
+      await (help as { handler: (a: unknown) => Promise<unknown> }).handler({
+        ctx: {
+          // 造一条技能，让 `agent skill` 进入清单（没技能时它被有意隐藏）
+          db: {
+            async all() {
+              return [{ id: 'x', name: 'x', description: 'd', body: 'b', updated_at: 1 }]
+            },
+          },
+          kv: { get: async () => null, getJSON: async () => null, put: async () => undefined },
+          // 打开技能开关，让 `agent skill` 进入清单
+          config: { ...plugin.defaultConfig, enable_skills: true },
+          logger: { debug() {}, info() {}, warn() {}, error() {} },
+          service: () => {
+            throw new Error('no llm')
+          },
+        },
+        session: {},
+        argText: '',
+      }),
+    )
+
+    for (const name of registeredCommands()) {
+      // 用法行是 `/agent <问题>`，从输出里找不到这种占位形式，跳过主入口
+      if (name === 'agent') continue
+      const short = name.replace(/^agent /, '')
+      expect(output, `命令「${name}」没写进 help`).toContain(short)
+    }
+  })
+})
+
+describe('命令的权限门槛', () => {
+  it('破坏性命令都要求群管理员', () => {
+    // 清空记忆是不可逆的：群里任何人能做就会出事
+    for (const name of ['agent reset', 'agent new']) {
+      const cmd = plugin.commands?.[name] as { permission?: string } | undefined
+      expect(cmd?.permission, `${name} 必须有权限门槛`).toBe('group_admin')
+    }
+  })
+
+  it('改人格要求群管理员（人格是整群共享的）', () => {
+    const cmd = plugin.commands?.['agent persona'] as { permission?: string } | undefined
+    expect(cmd?.permission).toBe('group_admin')
+  })
+
+  it('只读命令不设门槛（人人可用）', () => {
+    for (const name of ['agent stats', 'agent help', 'agent status', 'agent stop']) {
+      const cmd = plugin.commands?.[name] as { permission?: string } | undefined
+      expect(cmd?.permission, `${name} 是只读/无害操作，不该设门槛`).toBeUndefined()
+    }
+  })
+})
+
+describe('别名', () => {
+  it('常用命令有中文别名（QQ 里打中文比打英文自然）', () => {
+    const cases: Array<[string, string]> = [
+      ['agent stop', 'agent 停'],
+      ['agent help', 'agent 帮助'],
+      ['agent stats', 'agent 用量'],
+      ['agent new', 'agent 新对话'],
+    ]
+    for (const [name, alias] of cases) {
+      const cmd = plugin.commands?.[name] as { aliases?: string[] } | undefined
+      expect(cmd?.aliases, `${name} 缺少别名 ${alias}`).toContain(alias)
+    }
+  })
+
+  it('别名不重复占用已有命令名', () => {
+    const registered = new Set(registeredCommands())
+    for (const [name, cmd] of Object.entries(plugin.commands ?? {})) {
+      const aliases = (cmd as { aliases?: string[] }).aliases ?? []
+      for (const alias of aliases) {
+        expect(registered.has(alias), `${name} 的别名 ${alias} 撞了已有命令`).toBe(false)
+      }
+    }
+  })
+})
+
+describe('stop 与 reset 的语义区分', () => {
+  it('stop 不清历史，reset 清 —— 两者是不同命令', () => {
+    // AstrBot: /stop 只打断当前回答，/reset 连记忆一起清
+    expect(registeredCommands()).toContain('agent stop')
+    expect(registeredCommands()).toContain('agent reset')
+  })
+
+  it('stop 的说明里明确「保留记忆」（用户要能预期到）', () => {
+    const cmd = plugin.commands?.['agent stop'] as { description?: string } | undefined
+    expect(cmd?.description).toContain('保留')
+  })
+})
