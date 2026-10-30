@@ -12,6 +12,7 @@
 | `vfs.search` | 1 | 无 | 同上 |
 | `vfs.write_file` | 2 | 工作区写 | 同上 |
 | `vfs.mkdir` | 2 | 工作区写 | 同上 |
+| `vfs.move` | 2 | 工作区写 | 同上。改名/移动，目标已存在时失败而不是覆盖 |
 | `vfs.delete` | 3 | 工作区写 | 同上 |
 | `http.request` | 3 | 外部写 | — |
 | `schedule.create` | 3 | 工作区写 | `enable_schedule` |

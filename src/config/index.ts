@@ -83,20 +83,13 @@ export interface AgentConfig {
    * 唤醒前缀（对标 AstrBot 的 `wake_prefix`，默认 `/`）。
    *
    * 群聊里以此开头的消息会唤醒 Agent，并剥掉前缀再交给模型。
-   * 与 `command_prefixes` 是**两件事**：那个是「交给指令、不进模型」的排除列表。
+   * 指令前缀由宿主框架管理（命令命中后不再进模型），这里不必再配一份。
    */
   wake_prefix: string
 
   /** 单聊没有 @ 的概念：关掉时私聊任何消息都触发，打开后需要前缀（对应 AstrBot 的 friend_message_needs_wake_prefix） */
   friend_needs_wake_prefix: boolean
 
-  /**
-   * 已发出的回复里带这些前缀时视为「聊天」，不触发 Agent。
-   *
-   * 用于避免插件与指令互相打架：`/agent` 这类显式指令应当由命令路径处理，
-   * 不该再进模型（否则同一句话会既执行指令又产生一次模型调用）。
-   */
-  command_prefixes: string
 
   /** 一次 run 内最多几步模型调用。失控的 loop 会烧光 DO 时长与 token，默认 8 */
   max_model_steps: number
@@ -113,7 +106,12 @@ export interface AgentConfig {
   /** 工具调用总开关 */
   enable_tools: boolean
 
-  /** 虚拟工作区（吃 R2，默认关） */
+  /**
+   * 虚拟工作区。默认**开**。
+   *
+   * 没绑 R2 也能用（轻量模式：D1 存 ≤8KB 文本）；绑了 R2 才支持大文件。
+   * 以前默认关且必须有 R2，导致「有工作区」这件事在多数部署里等于不存在。
+   */
   enable_vfs: boolean
 
   /** 动态定时任务（LLM 可自己建提醒） */
@@ -158,14 +156,6 @@ export interface AgentConfig {
   /** 每个会话每分钟最多触发几次 run（0 = 不限）。防单人刷屏烧 token */
   rate_limit_per_minute: number
 
-  /**
-   * Tavily 搜索 API Key。留空时 `search.web` 仍然注册，但会返回
-   * 「未配置搜索」的可读错误——模型不会反复重试，用户也能看懂要配什么。
-   *
-   * 为什么不做成明文外的别的形式：插件没有 secret 存储，面板配置是唯一入口。
-   * 这个 key 只用于搜索，泄露影响面有限；真要更严可以改成只读别的插件提供的服务。
-   */
-  search_api_key: string
 
   /**
    * 纯文本关键词内容安全（逗号分隔）。
@@ -189,13 +179,12 @@ export const defaultConfig: AgentConfig = {
   default_persona: '',
   wake_prefix: '/',
   friend_needs_wake_prefix: false,
-  command_prefixes: '/',
   max_model_steps: 8,
   max_tool_calls: 12,
   history_limit: 20,
   request_timeout_ms: 20000,
   enable_tools: true,
-  enable_vfs: false,
+  enable_vfs: true,
   enable_schedule: false,
   enable_skills: false,
   enable_audit: false,
@@ -204,7 +193,6 @@ export const defaultConfig: AgentConfig = {
   context_compression: 'truncate',
   max_context_tokens: 12000,
   rate_limit_per_minute: 10,
-  search_api_key: '',
   content_filter_keywords: '',
 }
 
@@ -264,7 +252,8 @@ export const configSchema = {
     enable_vfs: {
       type: 'boolean',
       title: '启用虚拟工作区',
-      description: '模型可以读写工作区文件。小文本存 D1，超过 8KB 的存 R2（需要绑定 R2）',
+      description:
+        '模型可以读写工作区文件。默认开：不绑 R2 也能存 8KB 以内的文本；绑了 R2 才支持大文件',
       default: defaultConfig.enable_vfs,
     },
     enable_schedule: {
@@ -363,13 +352,6 @@ export const configSchema = {
       description: '关掉时私聊任何消息都会触发 Agent；打开后私聊也要带唤醒前缀',
       default: defaultConfig.friend_needs_wake_prefix,
     },
-    command_prefixes: {
-      type: 'string',
-      title: '机器人自身的指令前缀',
-      description:
-        '以此开头的消息交给指令处理，不再触发 Agent。多个用逗号分隔，默认 `/`',
-      default: defaultConfig.command_prefixes,
-    },
     timezone: {
       type: 'string',
       title: '时区',
@@ -406,13 +388,6 @@ export const configSchema = {
       description:
         '命中即拒绝、不发模型（逗号分隔）。留空 = 关闭。零外部依赖，只做纯文本匹配',
       default: defaultConfig.content_filter_keywords,
-    },
-    search_api_key: {
-      type: 'string',
-      title: '联网搜索 API Key（Tavily）',
-      description:
-        '留空时搜索工具仍然存在，但会告诉用户「还没配置搜索」。填了之后模型才能真的联网查资料',
-      default: defaultConfig.search_api_key,
     },
   },
 } as const

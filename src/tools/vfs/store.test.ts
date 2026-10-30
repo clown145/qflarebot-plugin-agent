@@ -21,6 +21,31 @@ function memoryDb(): PluginDB {
         }
         return { changes: 1 }
       }
+      if (sql.includes('UPDATE {vfs_entries}')) {
+        // 两种更新：改单条（SET path/name/r2_key/updated_at WHERE path = ?）
+        // 和后代的路径前缀（SET path/r2_key WHERE path = ?）
+        if (sql.includes('SET path = ?, name = ?')) {
+          const [newPath, newName, newR2Key, updatedAt, oldPath] = params as [
+            string, string, string | null, number, string,
+          ]
+          const row = rows.get(oldPath)
+          if (!row) return { changes: 0 }
+          rows.delete(oldPath)
+          const parent = newPath.slice(0, newPath.lastIndexOf('/')) || '/'
+          rows.set(newPath, { ...row, path: newPath, name: newName, parent, r2_key: newR2Key, updated_at: updatedAt })
+          return { changes: 1 }
+        }
+        if (sql.includes('SET path = ?, r2_key = ?')) {
+          const [newPath, newR2Key, updatedAt, oldPath] = params as [string, string | null, number, string]
+          const row = rows.get(oldPath)
+          if (!row) return { changes: 0 }
+          rows.delete(oldPath)
+          const parent = newPath.slice(0, newPath.lastIndexOf('/')) || '/'
+          rows.set(newPath, { ...row, path: newPath, parent, r2_key: newR2Key, updated_at: updatedAt })
+          return { changes: 1 }
+        }
+        return { changes: 0 }
+      }
       if (sql.includes('DELETE FROM {vfs_entries}')) {
         const [path, like] = params as [string, string]
         // `%` 是 LIKE 的通配符，转成前缀比较；replaceAll 而不是 replace
@@ -203,5 +228,91 @@ describe('VFS 工作区', () => {
   it('搜索空串返回空数组，不扫全表', async () => {
     const ws = createVfsWorkspace(memoryDb(), memoryR2())
     expect(await ws.search('   ')).toEqual([])
+  })
+})
+
+/**
+ * vfs.move：改名 / 移动。
+ *
+ * 这个工具是 serverless-agent 有而插件之前缺的。没有它，模型只能
+ * 「读 → 写新路径 → 删旧的」三步模拟，既费 token 又可能中途失败留下两份。
+ */
+describe('vfs.move', () => {
+  it('重命名文件，内容跟着走', async () => {
+    const ws = createVfsWorkspace(memoryDb(), memoryR2())
+    await ws.writeFile('/note.md', '内容')
+    await ws.move('/note.md', '/todo.md')
+    expect(await ws.readFile('/todo.md')).toMatchObject({ content: '内容' })
+    await expect(ws.readFile('/note.md')).rejects.toThrow()
+  })
+
+  it('移动到子目录', async () => {
+    const ws = createVfsWorkspace(memoryDb(), memoryR2())
+    await ws.writeFile('/a.md', 'x')
+    await ws.move('/a.md', '/archive/a.md')
+    expect(await ws.readFile('/archive/a.md')).toMatchObject({ content: 'x' })
+  })
+
+  it('目录连同后代一起移动', async () => {
+    const ws = createVfsWorkspace(memoryDb(), memoryR2())
+    await ws.writeFile('/dir/a.md', 'a')
+    await ws.writeFile('/dir/b.md', 'b')
+    await ws.move('/dir', '/moved')
+    expect(await ws.readFile('/moved/a.md')).toMatchObject({ content: 'a' })
+    expect(await ws.readFile('/moved/b.md')).toMatchObject({ content: 'b' })
+    expect(await ws.listDir('/dir')).toEqual([])
+  })
+
+  it('目标已存在时拒绝，不覆盖用户数据', async () => {
+    const ws = createVfsWorkspace(memoryDb(), memoryR2())
+    await ws.writeFile('/a.md', 'a')
+    await ws.writeFile('/b.md', 'b')
+    await expect(ws.move('/a.md', '/b.md')).rejects.toThrow('已存在')
+    // 两份内容都还在
+    expect(await ws.readFile('/a.md')).toMatchObject({ content: 'a' })
+    expect(await ws.readFile('/b.md')).toMatchObject({ content: 'b' })
+  })
+
+  it('不能把目录移到它自己里面（会造成无限嵌套）', async () => {
+    const ws = createVfsWorkspace(memoryDb(), memoryR2())
+    await ws.writeFile('/dir/a.md', 'a')
+    await expect(ws.move('/dir', '/dir/sub')).rejects.toThrow()
+  })
+
+  it('源不存在时报错', async () => {
+    const ws = createVfsWorkspace(memoryDb(), memoryR2())
+    await expect(ws.move('/nope.md', '/x.md')).rejects.toThrow()
+  })
+
+  it('不能移动根目录', async () => {
+    const ws = createVfsWorkspace(memoryDb(), memoryR2())
+    await expect(ws.move('/', '/x')).rejects.toThrow('根目录')
+  })
+})
+
+/**
+ * 轻量模式：不传 R2 也能用（只用 D1 存 ≤8KB 文本）。
+ *
+ * 这是本轮的关键改动：以前「没绑 R2 就整组 vfs 不可用」，
+ * 等于把「记个笔记」这种最常见的用途绑死在重型基础设施上。
+ */
+describe('轻量模式（没有 R2）', () => {
+  it('小文本可以正常读写，不需要 R2', async () => {
+    const ws = createVfsWorkspace(memoryDb())
+    await ws.writeFile('/note.md', '记一笔')
+    expect(await ws.readFile('/note.md')).toMatchObject({ content: '记一笔' })
+  })
+
+  it('超过 8KB 时给出可读错误，而不是让工具整体失效', async () => {
+    const ws = createVfsWorkspace(memoryDb())
+    const big = 'x'.repeat(9 * 1024)
+    await expect(ws.writeFile('/big.md', big)).rejects.toThrow('R2')
+  })
+
+  it('列表与搜索照常可用', async () => {
+    const ws = createVfsWorkspace(memoryDb())
+    await ws.writeFile('/a.md', '关键词在这里')
+    expect(await ws.search('关键词')).toHaveLength(1)
+    expect(await ws.listDir('/')).toHaveLength(1)
   })
 })

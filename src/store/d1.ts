@@ -254,6 +254,19 @@ export async function pruneToolAudit(db: PluginDB, olderThan: number): Promise<n
 const TOOL_SETTINGS_ID = 'default'
 
 /**
+ * 把库里存的 TEXT 安全解析成对象。坏数据返回 `{}`——
+ * 手工改库或老版本写坏的值不该让整轮对话失败（读设置抛错会直接断掉 run）。
+ */
+function safeJsonObject(raw: string): unknown {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
  * 读工具开关。
  *
  * **没有行就返回全开，且不建行**：读一次算 1 行查询（读额度是写的 50 倍），
@@ -264,12 +277,16 @@ const TOOL_SETTINGS_ID = 'default'
  * 手工改库、老版本写坏的数据都不该让整轮对话失败（读设置就抛错会直接断掉 run）。
  */
 export async function getToolSettings(db: PluginDB): Promise<ToolSettings> {
-  const row = await db.first<{ disabled_json: string }>(
-    `SELECT disabled_json FROM {tool_settings} WHERE id = ?`,
+  const row = await db.first<{ disabled_json: string; config_json: string }>(
+    `SELECT disabled_json, config_json FROM {tool_settings} WHERE id = ?`,
     TOOL_SETTINGS_ID,
   )
-  if (!row) return { disabled: [] }
-  return normalizeToolSettings(row.disabled_json)
+  if (!row) return { disabled: [], config: {} }
+  // 两列分别解析后合成一个对象：normalizeToolSettings 两种形状都吃，
+  // 这里显式拼清楚，避免「以为它自己会读第二列」
+  const base = normalizeToolSettings(row.disabled_json)
+  const configPart = normalizeToolSettings({ config: safeJsonObject(row.config_json) })
+  return { disabled: base.disabled, config: configPart.config ?? {} }
 }
 
 /**
@@ -286,13 +303,15 @@ export async function getToolSettings(db: PluginDB): Promise<ToolSettings> {
 export async function setToolSettings(db: PluginDB, settings: ToolSettings): Promise<void> {
   const normalized = normalizeToolSettings(settings)
   await db.run(
-    `INSERT INTO {tool_settings} (id, disabled_json, updated_at)
-     VALUES (?, ?, ?)
+    `INSERT INTO {tool_settings} (id, disabled_json, config_json, updated_at)
+     VALUES (?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        disabled_json = excluded.disabled_json,
+       config_json = excluded.config_json,
        updated_at = excluded.updated_at`,
     TOOL_SETTINGS_ID,
     JSON.stringify(normalized.disabled),
+    JSON.stringify(normalized.config ?? {}),
     Date.now(),
   )
 }

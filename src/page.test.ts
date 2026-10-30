@@ -2,306 +2,252 @@ import { describe, expect, it } from 'vitest'
 import { PAGE_HTML } from './page.js'
 
 /**
- * 页面是内联 HTML 字符串，没法在 Node 里真渲染。
- * 这里验证「结构与接口契约对得上」——上一版就是因为
- * overview 返回了 schedules 但页面根本不渲染，才白查了数据。
+ * 管理页的结构契约。
+ *
+ * 页面是内联 HTML 字符串，没有浏览器就没法测真实布局。这里守的是
+ * **规范层面的硬要求**——每一条都对应一次真实的踩坑，不是形式主义。
  */
-describe('管理页', () => {
+
+describe('基本结构', () => {
   it('是完整的 HTML 文档', () => {
     expect(PAGE_HTML.startsWith('<!doctype html>')).toBe(true)
     expect(PAGE_HTML).toContain('</html>')
   })
 
   it('脚本样式全部内联（桥接令牌只在第一个请求里，外链会 401）', () => {
-    // 除了 /bridge.js 与 /tokens.css 这两个宿主提供的资源，不应有其他外链
     const externalScripts = [...PAGE_HTML.matchAll(/<script[^>]+src=/g)]
     expect(externalScripts).toHaveLength(0)
     const externalStyles = [...PAGE_HTML.matchAll(/<link[^>]+href="(?!\/tokens\.css)[^"]*"/g)]
     expect(externalStyles).toHaveLength(0)
   })
 
-  it('调用的接口都在 routes 里提供', () => {
-    expect(PAGE_HTML).toContain("'/api/overview'")
-    expect(PAGE_HTML).toContain("'/api/test'")
+  it('引宿主的 tokens.css 与 bridge.js', () => {
+    expect(PAGE_HTML).toContain('href="/tokens.css"')
+    expect(PAGE_HTML).toContain("import('/bridge.js')")
   })
 
-  /**
-   * 「所有能搬的操作都搬到 WebUI」——每个配置项都要在页面上有对应控件。
-   * 这条测试把它变成契约：以后新增配置项忘了加控件，这里就会失败。
-   */
-  it('所有配置项都有对应控件（不再需要去面板填表单）', () => {
-    for (const id of [
-      // 模型
-      'modelPicker', 'modelTrigger', 'modelCurrent', 'modelMenu', 'modelSearch', 'modelOptions',
-      // 人格（增删改 + 默认人格）
-      'personaList', 'personaCount', 'addPersona', 'savePersonaList', 'defaultPersona',
-      // 提示词
-      'promptBox', 'savePrompt', 'resetPrompt', 'promptState',
-      // 唤醒
-      'wakePrefix', 'friendPrefix', 'commandPrefixes',
-      // 能力开关
-      'enableTools', 'enableVfs', 'enableSchedule', 'enableAudit', 'showTyping',
-      // 限额
-      'maxSteps', 'maxToolCalls', 'historyLimit', 'timeoutMs', 'timezone',
-      // 会话
-      'convSearch', 'convRows',
-      // 恢复
-      'resetAll', 'overrideState',
-      // 三张表
-      'scheduleRows', 'auditRows', 'stats',
-      // 工具栏（单工具开关）
-      'toolList', 'toolCount',
-      // 技能（列表 + 编辑器）
-      'skillList', 'skillCount', 'addSkill', 'skillEditor', 'skillId', 'skillBody', 'saveSkill', 'cancelSkill',
-    ]) {
-      expect(PAGE_HTML).toContain(`id="${id}"`)
-    }
+  it('body 用宿主的 .qb-page 基线类', () => {
+    // 规范：引 /tokens.css 即拿到同一组变量，.qb-page/.qb-card/.qb-btn/.qb-input 是最小基线
+    expect(PAGE_HTML).toContain('<body class="qb-page">')
   })
 
-  it('调用的接口都在 routes 里提供（含本轮新增的设置与会话端点）', () => {
-    for (const path of ['/api/overview', '/api/test', '/api/settings', '/api/persona', '/api/tools']) {
-      expect(PAGE_HTML).toContain(`'${path}'`)
-    }
-  })
-
-  /**
-   * 工具栏与技能是本轮新增的两块管理面。它们必须是**可操作的控件**，
-   * 不是只读展示——这两个功能的 API 早就有了，但页面上没控件，
-   * 使用门槛等于「手写 curl」。
-   */
-  it('工具栏：每个工具一个开关，且走事件委托（列表是渲染出来的）', () => {
-    expect(PAGE_HTML).toContain('renderTools(')
-    expect(PAGE_HTML).toContain('tool-toggle')
-    expect(PAGE_HTML).toContain("postJson('/api/tools'")
-    // 列表每次 load() 都重建，直接绑 id 会漏绑，所以必须委托到容器
-    expect(PAGE_HTML).toContain("$('toolList').addEventListener('change'")
-  })
-
-  it('工具关掉后整行压暗，让「哪些没开」一眼可见', () => {
-    expect(PAGE_HTML).toContain("' off'")
-    expect(PAGE_HTML).toContain('.tool-row.off')
-  })
-
-  it('技能：列表 + 新增/编辑/删除，且编辑器接的是原始 SKILL.md', () => {
-    expect(PAGE_HTML).toContain('renderSkills(')
-    expect(PAGE_HTML).toContain("postJson('/api/skills'")
-    // 编辑要拿原文，不能拿解析后的字段自己拼 frontmatter
-    expect(PAGE_HTML).toContain('data?.content')
-    expect(PAGE_HTML).not.toContain('data?.skill?.content')
-  })
-
-  it('技能列表只取目录，正文按需单独取（避免一次拖下所有 SKILL.md）', () => {
-    expect(PAGE_HTML).toContain("'/api/skills/'")
-    expect(PAGE_HTML).toContain('encodeURIComponent')
-  })
-
-  it('删除技能要二次确认（不可逆操作）', () => {
-    expect(PAGE_HTML).toContain('confirm(')
-  })
-
-  /**
-   * 本轮的核心诉求：「选可用模型别名居然要去配置里手填」。
-   * 页面必须把别名做成可点选项，而不是让用户输入。
-   */
-  it('模型别名是可选列表，不是文本输入框', () => {
-    expect(PAGE_HTML).toContain('modelStatus.models')
-    expect(PAGE_HTML).toContain('/api/settings')
-    // 下拉列表的搜索与勾选态
-    expect(PAGE_HTML).toContain('modelSearch')
-    expect(PAGE_HTML).toContain("class=\"check\"")
-    // 不允许再用「手填别名」的输入框
-    expect(PAGE_HTML).not.toContain('placeholder=\"模型别名')
-  })
-
-  it('保存失败时提示并把界面刷回真实值，不静默吞掉', () => {
-    expect(PAGE_HTML).toContain("notify('保存失败：'")
-    // 失败后要重新拉一次状态，否则控件会和实际配置不一致
-    expect(PAGE_HTML).toContain('await load()')
-  })
-
-  it('用 bridge.toast 给反馈；独立打开时退化为页面内提示', () => {
-    expect(PAGE_HTML).toContain('bridge?.toast')
-    expect(PAGE_HTML).toContain('toast-wrap')
-  })
-
-  it('渲染 schedules 与 audits —— 上一版这两个数据取回来就丢了', () => {
-    expect(PAGE_HTML).toContain('data.schedules')
-    expect(PAGE_HTML).toContain('data.audits')
-    expect(PAGE_HTML).toContain('renderSchedules(')
-    expect(PAGE_HTML).toContain('renderAudits(')
-  })
-
-  it('用户数据一律转义（公开页 XSS 能读到面板令牌，auth 页能读到桥接令牌）', () => {
-    // 所有插值都应经过 esc()，不应出现裸的字符串拼接进 innerHTML
-    expect(PAGE_HTML).toContain('const esc = (s) =>')
-    expect(PAGE_HTML).toContain('esc(s.prompt')
-    expect(PAGE_HTML).toContain('esc(a.toolName)')
-  })
-
-  it('审计未开启时给出提示，而不是显示空白表', () => {
-    expect(PAGE_HTML).toContain('未开启审计')
-  })
-
-  it('定时任务为空时显示可读文案，不是空表', () => {
-    expect(PAGE_HTML).toContain('没有待触发的定时任务')
-  })
-
-  it('长文本截断，避免撑破表格', () => {
-    expect(PAGE_HTML).toContain('s.prompt.slice(0, 40)')
-  })
-
-  it('会话 id 缩写显示（openid 很长）', () => {
-    expect(PAGE_HTML).toContain('shortConversation')
+  it('卡片和按钮用宿主类，不自己实现', () => {
+    expect(PAGE_HTML).toContain('class="qb-card"')
+    expect(PAGE_HTML).toContain('class="qb-btn')
+    expect(PAGE_HTML).toContain('class="qb-input"')
   })
 })
 
-/**
- * 布局：侧边栏 + 分面板（对标 serverless-agent 的 admin-web）。
- *
- * 上一版把 13 张卡片堆在单页里，要滚很久才能找到东西，且「配置」与「统计表」
- * 混在一起。这些用例锁住新结构：一屏只做一件事。
- */
-describe('布局：侧边栏 + 分面板', () => {
-  it('有侧边栏导航', () => {
-    expect(PAGE_HTML).toContain('class="nav-list"')
-    expect(PAGE_HTML).toContain('data-view="model"')
+describe('iframe 约束（这是「页面显示不全」的根因）', () => {
+  it('不用 100vh —— iframe 高度由 bridge.resize 决定，100vh 会互相拉扯', () => {
+    // 允许注释里提到，但不允许出现在 CSS 声明中
+    const css = PAGE_HTML.slice(PAGE_HTML.indexOf('<style>'), PAGE_HTML.indexOf('</style>'))
+    expect(css).not.toMatch(/height:\s*100vh/)
+    expect(css).not.toMatch(/min-height:\s*100vh/)
   })
 
-  it('六个面板都在，且只有一个默认激活', () => {
-    const panels = [...PAGE_HTML.matchAll(/data-panel="(\w+)"/g)].map((m) => m[1])
-    expect(panels.sort()).toEqual(['chat', 'data', 'model', 'skills', 'stats', 'tools'])
+  it('不用粘性/固定高度侧栏（会造成双层滚动）', () => {
+    const css = PAGE_HTML.slice(PAGE_HTML.indexOf('<style>'), PAGE_HTML.indexOf('</style>'))
+    expect(css).not.toMatch(/position:\s*sticky/)
+    expect(css).not.toMatch(/height:\s*100dvh/)
   })
 
-  it('默认只激活第一个面板（其余 hidden）', () => {
-    // 只应有一个 panel 同时带 active
-    const active = [...PAGE_HTML.matchAll(/class="panel active"/g)]
-    expect(active).toHaveLength(1)
+  it('内容高度变化后调用 resize', () => {
+    expect(PAGE_HTML).toContain('function notifyResize')
+    expect(PAGE_HTML).toContain('bridge?.resize?.()')
+    // 切标签和加载数据后都要调
+    expect(PAGE_HTML).toContain('notifyResize()')
   })
 
-  it('导航项与面板一一对应（点得到、切得过去）', () => {
-    const navViews = new Set(
-      [...PAGE_HTML.matchAll(/data-view="(\w+)"/g)].map((m) => m[1]),
-    )
-    const panels = new Set([...PAGE_HTML.matchAll(/data-panel="(\w+)"/g)].map((m) => m[1]))
-    expect([...navViews].sort()).toEqual([...panels].sort())
+  it('内容区居中且限宽（规范：最宽 1152px）', () => {
+    expect(PAGE_HTML).toContain('max-width: 1152px')
+    expect(PAGE_HTML).toContain('margin-inline: auto')
+  })
+})
+
+describe('交互结构：页内标签而不是侧边导航', () => {
+  it('用页内标签（对标 QSegmented），不重复面板侧栏', () => {
+    expect(PAGE_HTML).toContain('class="segmented"')
+    expect(PAGE_HTML).toContain('id="segThumb"')
+    // 不应该再有侧边栏
+    expect(PAGE_HTML).not.toContain('<aside')
   })
 
-  it('有面板标题栏（切换时更新标题）', () => {
-    expect(PAGE_HTML).toContain('id="viewTitle"')
-    expect(PAGE_HTML).toContain('id="viewKicker"')
+  it('五个标签一一对应面板', () => {
+    const tabs = [...PAGE_HTML.matchAll(/data-tab="(\w+)"/g)].map((m) => m[1]).sort()
+    const panels = [...PAGE_HTML.matchAll(/data-panel="(\w+)"/g)].map((m) => m[1]).sort()
+    expect(tabs).toEqual(['behavior', 'data', 'model', 'skills', 'tools'])
+    expect(panels).toEqual(tabs)
   })
 
-  it('切换逻辑存在，且记住当前面板（刷新不跳回第一个）', () => {
-    expect(PAGE_HTML).toContain('function applyView')
-    expect(PAGE_HTML).toContain('function initNavigation')
+  it('标签记在地址里，刷新不跳回第一个', () => {
     expect(PAGE_HTML).toContain('location.hash')
-    // 启动时必须调用，否则导航是死的
-    expect(PAGE_HTML).toContain('initNavigation()')
+    expect(PAGE_HTML).toContain('history.replaceState')
   })
 
-  it('窄屏下侧边栏变横排（不是直接消失）', () => {
-    expect(PAGE_HTML).toContain('@media (max-width: 860px)')
-  })
-})
-
-/**
- * 结构完整性：标签必须配平。
- *
- * 页面是手写模板字符串，少一个 `</div>` 浏览器会「自动修正」——
- * 但修正的结果往往是整块内容跑到错误的位置，而字符串断言完全看不出来。
- */
-describe('结构完整性', () => {
-  const count = (tag: string) => {
-    const open = [...PAGE_HTML.matchAll(new RegExp(`<${tag}\\b`, 'g'))].length
-    const close = [...PAGE_HTML.matchAll(new RegExp(`</${tag}>`, 'g'))].length
-    return { open, close }
-  }
-
-  it.each(['div', 'section', 'aside', 'main', 'header', 'body', 'html', 'table', 'tbody', 'thead', 'tr', 'nav', 'button'])(
-    '<%s> 开闭配平',
-    (tag) => {
-      const { open, close } = count(tag)
-      expect(open, `${tag} 标签数量`).toBe(close)
-      expect(open).toBeGreaterThan(0)
-    },
-  )
-
-  it('aside/main 包在 app-shell 里，面板包在 main 里', () => {
-    const shell = PAGE_HTML.indexOf('class="app-shell"')
-    const aside = PAGE_HTML.indexOf('<aside')
-    const main = PAGE_HTML.indexOf('<main')
-    const firstPanel = PAGE_HTML.indexOf('data-panel=')
-    expect(shell).toBeGreaterThan(-1)
-    expect(aside).toBeGreaterThan(shell)
-    expect(main).toBeGreaterThan(aside)
-    expect(firstPanel).toBeGreaterThan(main)
+  it('标签有 ARIA 角色（屏幕阅读器可用）', () => {
+    expect(PAGE_HTML).toContain('role="tablist"')
+    expect(PAGE_HTML).toContain('role="tab"')
+    expect(PAGE_HTML).toContain('role="tabpanel"')
+    expect(PAGE_HTML).toContain('aria-selected')
   })
 })
 
-/**
- * 面板归属：每张卡片必须在**语义正确**的面板里。
- *
- * 这不是吹毛求疵——上一版把「限额」漏在了技能面板里，用户想调步数上限
- * 会去「对话行为」里找，找不到。这类错误靠"页面能打开"是发现不了的。
- */
-describe('卡片归属正确', () => {
-  /** 从 HTML 里切出每个面板的内容，断言每张卡片落在哪个面板 */
+describe('组件对齐面板的设计语言', () => {
+  it('开关是 44px 热区的 role=switch，不是裸 checkbox', () => {
+    expect(PAGE_HTML).toContain('role="switch"')
+    expect(PAGE_HTML).toContain('aria-checked')
+    expect(PAGE_HTML).toContain('.switch')
+  })
+
+  it('确认用自绘对话框，不用浏览器 confirm', () => {
+    expect(PAGE_HTML).toContain('function confirmAction')
+    expect(PAGE_HTML).not.toContain('window.confirm')
+    // Esc 可关、默认聚焦取消
+    expect(PAGE_HTML).toContain("e.key === 'Escape'")
+    expect(PAGE_HTML).toContain('[data-act="cancel"]')
+  })
+
+  it('列表值用逐条输入的 chip，不用「一行一个」的文本框', () => {
+    expect(PAGE_HTML).toContain('function createListInput')
+    expect(PAGE_HTML).toContain('.chip')
+  })
+
+  it('加载用骨架屏，不是一行「加载中…」', () => {
+    expect(PAGE_HTML).toContain('function skeletonHtml')
+    expect(PAGE_HTML).toContain('.sk-line')
+  })
+
+  it('空状态有标题和下一步说明（对标 QEmpty）', () => {
+    expect(PAGE_HTML).toContain('empty-title')
+    expect(PAGE_HTML).toContain('empty-desc')
+  })
+
+  it('有动效，且遵守 prefers-reduced-motion', () => {
+    expect(PAGE_HTML).toContain('--qb-duration')
+    expect(PAGE_HTML).toContain('prefers-reduced-motion')
+  })
+})
+
+describe('信息架构：每块内容在正确的标签里', () => {
   function panelContent(name: string): string {
     const start = PAGE_HTML.indexOf(`data-panel="${name}"`)
-    const next = PAGE_HTML.indexOf('<section class="panel', start + 1)
+    const next = PAGE_HTML.indexOf('<section class="panel"', start + 1)
     return PAGE_HTML.slice(start, next === -1 ? undefined : next)
   }
 
-  const expectations: Array<[string, string[]]> = [
+  it.each([
     ['model', ['模型', '人格']],
-    ['chat', ['系统提示词', '群聊唤醒', '能力开关', '限额']],
+    ['behavior', ['系统提示词', '群聊唤醒', '能力开关', '限额']],
     ['tools', ['工具']],
     ['skills', ['技能']],
-    ['data', ['会话', '定时任务', '工具调用']],
-    ['stats', ['最近 14 天']],
-  ]
-
-  it.each(expectations)('%s 面板包含约定的区块', (panel, sections) => {
+    ['data', ['会话', '定时任务', '工具调用', '最近 14 天']],
+  ])('%s 标签包含约定的卡片', (panel, titles) => {
     const content = panelContent(panel)
-    for (const section of sections) {
-      expect(content, `${panel} 面板应包含「${section}」`).toContain(`<h2>${section}`)
+    for (const title of titles) {
+      expect(content, `${panel} 应包含「${title}」`).toContain(`<h2 class="card-title">${title}`)
     }
   })
 
-  it('「限额」不能落在技能面板（曾经落错过）', () => {
-    expect(panelContent('skills')).not.toContain('<h2>限额')
-    expect(panelContent('chat')).toContain('<h2>限额')
+  it('「限额」不在技能面板里（曾经放错过）', () => {
+    expect(panelContent('skills')).not.toContain('限额')
+    expect(panelContent('behavior')).toContain('限额')
   })
 })
 
+describe('安全：用户数据不进 innerHTML', () => {
+  it('有 esc() 供无法避免的模板拼接使用', () => {
+    expect(PAGE_HTML).toContain('const esc =')
+    expect(PAGE_HTML).toContain('esc(title)')
+  })
+
+  it('列表与表格用 createElement + textContent，而不是拼 innerHTML', () => {
+    // 这是更强的保证：textContent 天然不解析标签，比事后 esc 更难写错
+    expect(PAGE_HTML).toContain('textContent = tool.name')
+    expect(PAGE_HTML).toContain('textContent = skill.name')
+    expect(PAGE_HTML).toContain('textContent = value')
+  })
+
+  it('确认框与技能名等动态文本走 textContent 或 esc', () => {
+    // 确认框正文用 esc 包过
+    expect(PAGE_HTML).toMatch(/esc\(text\)/)
+  })
+})
+
+describe('标签配平（手写模板最容易漏）', () => {
+  const count = (tag: string) => ({
+    open: [...PAGE_HTML.matchAll(new RegExp(`<${tag}\\b`, 'g'))].length,
+    close: [...PAGE_HTML.matchAll(new RegExp(`</${tag}>`, 'g'))].length,
+  })
+
+  it.each(['div', 'section', 'main', 'body', 'html', 'table', 'tbody', 'thead', 'tr', 'button', 'nav'])(
+    '<%s> 开闭配平',
+    (tag) => {
+      const { open, close } = count(tag)
+      expect(open, tag).toBe(close)
+    },
+  )
+})
+
 /**
- * 响应式：窄屏不许把内容顶出屏幕。
+ * 本轮（v0.1.1）的可用性修复。
  *
- * 这类问题只能靠要素层面的规则来守（没有浏览器就没法测真实布局）：
- * - `grid-template-columns: 1fr` 的最小值是 `auto`，内容会撑破列 → 必须用 `minmax(0,1fr)`
- * - 长工具名/长 URL 不会自动断行 → 必须声明 `overflow-wrap`
- * - 兜底 `overflow-x: hidden`，避免任何情况整页横滚
+ * 每一条都对应一个「用户看到才发现」的真实问题，不是形式主义。
  */
-describe('响应式布局', () => {
-  it('窄屏用 minmax(0, 1fr) 而不是 1fr（否则长内容会撑破列）', () => {
-    expect(PAGE_HTML).toContain('minmax(0, 1fr)')
+describe('可用性：不要让人手打机器该给的东西', () => {
+  it('开场对话是成对输入，不是让人手打 user: 前缀', () => {
+    expect(PAGE_HTML).toContain('function createDialogPairs')
+    expect(PAGE_HTML).toContain('parseDialogText')
+    expect(PAGE_HTML).toContain('serializeDialogPairs')
+    // 存储格式仍然兼容（老配置原样读得出来）
+    expect(PAGE_HTML).toContain('user: ')
   })
 
-  it('有 overflow-x 兜底，任何情况都不整页横向滚动', () => {
-    expect(PAGE_HTML).toContain('overflow-x: hidden')
+  it('开场对话一行用户一行角色（不是挤在同一行导致标签重叠）', () => {
+    // 用纵向堆叠而不是 grid 单行多列：窄屏下 auto 列会被压缩，
+    // 标签会溢出到前一个输入框的边框上，看着像重叠
+    const fn = PAGE_HTML.slice(PAGE_HTML.indexOf('function createDialogPairs'))
+    const body = fn.slice(0, fn.indexOf('\nfunction createCheckList'))
+    expect(body).toContain("line('用户'")
+    expect(body).toContain("line('角色'")
+    // 不应该再有「一行塞两列输入」的 grid 模板
+    expect(body).not.toContain('gridTemplateColumns = \'auto 1fr auto 1fr auto\'')
   })
 
-  it('长标识符能断行（工具名/技能 id/表格单元格）', () => {
-    expect(PAGE_HTML).toContain('overflow-wrap: anywhere')
+  it('工具与技能是勾选清单，不是手打名字', () => {
+    expect(PAGE_HTML).toContain('function createCheckList')
+    // 选项来自实际注册的工具/已配置的技能
+    expect(PAGE_HTML).toContain('state.tools?.list')
+    expect(PAGE_HTML).toContain('state.skills')
   })
 
-  it('窄屏下侧边栏变成横向导航而不是消失', () => {
-    // 不能 display:none 掉导航——那样窄屏就没法切面板了
-    expect(PAGE_HTML).toContain('.nav-list {')
-    expect(PAGE_HTML).toContain('overflow-x: auto')
+  it('指令前缀不再让用户配（由宿主统一管理）', () => {
+    expect(PAGE_HTML).not.toContain('id="commandPrefixes"')
+    expect(PAGE_HTML).toContain('跟随面板')
   })
 
-  it('窄屏下卡片/输入框取消固定最大宽度', () => {
-    expect(PAGE_HTML).toContain('.card { max-width: 100%')
+  it('工具的配置在自己的弹窗里，不在通用设置里', () => {
+    // api key 这类属于单个工具，页面按工具声明的 configFields 生成表单
+    expect(PAGE_HTML).toContain('function openToolConfig')
+    expect(PAGE_HTML).toContain('tool.configFields')
+    expect(PAGE_HTML).toContain("'/api/tools/config'")
+    // 插件通用设置里不该再有搜索 key
+    expect(PAGE_HTML).not.toContain('id="searchApiKey"')
+  })
+
+  it('默认人格改名后会重刷下拉（否则保存时会写丢）', () => {
+    expect(PAGE_HTML).toContain('function renderDefaultPersonaSelect')
+    // 改名回调里要重刷
+    expect(PAGE_HTML).toContain('renderDefaultPersonaSelect(draftPersonas)')
+  })
+
+  it('人格卡片上标出哪套是默认', () => {
+    expect(PAGE_HTML).toContain('badge--accent">默认')
+  })
+
+  it('说明文字不写废话（不解释「点选即可」这种显然的事）', () => {
+    expect(PAGE_HTML).not.toContain('点选即可')
+    expect(PAGE_HTML).not.toContain('不用手打')
+    expect(PAGE_HTML).not.toContain('不需要回面板填表单')
   })
 })

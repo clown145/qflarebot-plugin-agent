@@ -45,7 +45,7 @@ describe('群聊：只认 @机器人 与 唤醒前缀', () => {
 
   it('以唤醒前缀开头 → 唤醒并剥掉前缀', () => {
     expect(
-      decideWake(session({ atMe: false, content: '!你好' }), config({ wake_prefix: '!', command_prefixes: '#' })),
+      decideWake(session({ atMe: false, content: '!你好' }), config({ wake_prefix: '!' })),
     ).toMatchObject({ wake: true, reason: 'prefix', text: '你好' })
   })
 
@@ -54,13 +54,18 @@ describe('群聊：只认 @机器人 与 唤醒前缀', () => {
    * 上一版把两者拼进同一个列表 → 任何 `/xxx` 既被判成「指令」又被判成「唤醒」。
    * 现在 `command_prefixes` 只用于排除。
    */
-  it('指令前缀的消息交给指令路径，不当作聊天（哪怕它同时是唤醒前缀）', () => {
-    const cfg = config({ wake_prefix: '/', command_prefixes: '/' })
+  /**
+   * 指令路由**不归 wake 层管**（2026-10 重构）。
+   *
+   * 指令前缀是宿主框架的职责：命令默认 `block: true`，命中后同一事件不会再分发给
+   * events，所以「是指令」与「进模型」天然互斥。插件在这里再排除一遍会造成
+   * 两个真相：唤醒前缀与指令前缀默认都是 `/` 时，`/agent` 既不算唤醒也进不了模型；
+   * 把唤醒前缀改成多字符（如 `bot`）后更会直接失效。
+   */
+  it('/agent 这类指令以唤醒前缀开头时，wake 层按唤醒处理（拦截交给宿主的 block）', () => {
+    const cfg = config({ wake_prefix: '/' })
     expect(decideWake(session({ content: '/agent status', atMe: false }), cfg)).toMatchObject({
-      wake: false, reason: 'command',
-    })
-    expect(decideWake(session({ content: '/agent status', atMe: true }), cfg)).toMatchObject({
-      wake: false, reason: 'command',
+      wake: true, reason: 'prefix',
     })
   })
 
@@ -102,7 +107,7 @@ describe('群聊：唤醒前缀可自定义', () => {
 
   it('前缀为空时不把任何消息当前缀唤醒', () => {
     expect(
-      decideWake(session({ content: '/你好', atMe: false }), config({ wake_prefix: '', command_prefixes: '#' })),
+      decideWake(session({ content: '/你好', atMe: false }), config({ wake_prefix: '' })),
     ).toMatchObject({ wake: false, reason: 'not-mentioned' })
   })
 })
@@ -124,7 +129,7 @@ describe('单聊', () => {
     expect(
       decideWake(
         session({ scene: 'c2c', event: 'qq.c2c.message', content: '!在吗' }),
-        config({ friend_needs_wake_prefix: true, wake_prefix: '!', command_prefixes: '#' }),
+        config({ friend_needs_wake_prefix: true, wake_prefix: '!' }),
       ),
     ).toMatchObject({ wake: true, reason: 'prefix', text: '在吗' })
   })
@@ -147,17 +152,17 @@ describe('不该唤醒的情况', () => {
  * 上一次就是这一类消息全部进了 AI。用真实 Session 形状扫一批典型内容。
  */
 describe('守卫：群聊未 @ 未带前缀的消息全都不唤醒', () => {
-  const contents = ['你好', '今天吃啥', '哈哈哈哈', '?', '在吗在吗', '这个怎么弄', '111', '/agent status', '/unknown', '我同意']
+  // 注意：以唤醒前缀（默认 `/`）开头的消息**会**唤醒——指令的拦截由宿主 block 负责，
+  // 这里只验证「既没 @ 也没前缀」的普通聊天不唤醒
+  const contents = ['你好', '今天吃啥', '哈哈哈哈', '?', '在吗在吗', '这个怎么弄', '111', '我同意']
 
   it.each(contents)('内容 %s 不唤醒', (content) => {
     expect(decideWake(session({ content, atMe: false }), config()).wake).toBe(false)
   })
 
-  it('同一批内容，只要 @ 了机器人就唤醒（带指令前缀的除外）', () => {
+  it('同一批内容，只要 @ 了机器人就唤醒', () => {
     for (const content of contents) {
-      const decision = decideWake(session({ content, atMe: true }), config())
-      if (content.startsWith('/')) expect(decision.wake).toBe(false)
-      else expect(decision.wake).toBe(true)
+      expect(decideWake(session({ content, atMe: true }), config()).wake).toBe(true)
     }
   })
 })
@@ -190,20 +195,45 @@ describe('技能激活必须先于指令前缀判定', () => {
     expect(decision.wake && decision.text).toBe('/skill report 写周报')
   })
 
-  it('光一个 /skill 不当作激活（交给 agent skill 命令去列目录）', () => {
+  it('光一个 /skill 不当作激活（按普通唤醒前缀处理）', () => {
     const decision = decideWake(session({ content: '/skill' }), config())
-    expect(decision.wake).toBe(false)
+    expect(decision.wake).toBe(true)
+    expect(decision.wake && decision.reason).toBe('prefix')
   })
 
-  it('/skillx 之类不是技能激活，仍按指令前缀处理', () => {
+  it('/skillx 之类不是技能激活，按普通唤醒前缀处理', () => {
     const decision = decideWake(session({ content: '/skillx foo' }), config())
-    expect(decision.wake).toBe(false)
-    expect(!decision.wake && decision.reason).toBe('command')
+    expect(decision.wake).toBe(true)
+    expect(decision.wake && decision.reason).toBe('prefix')
   })
 
-  it('其他 /agent 指令仍然不进模型', () => {
+  it('其他 /agent 指令在 wake 层仍算唤醒（实际拦截由宿主命令 block 完成）', () => {
     for (const content of ['/agent status', '/agent reset', '/agent skill']) {
-      expect(decideWake(session({ content, atMe: true }), config()).wake).toBe(false)
+      // @ 了机器人时 reason 是 at、否则是 prefix，两者都算唤醒——
+      // 关键是 wake 层不再把指令前缀当成「不唤醒」
+      expect(decideWake(session({ content, atMe: true }), config()).wake).toBe(true)
+      expect(decideWake(session({ content, atMe: false }), config()).wake).toBe(true)
     }
+  })
+})
+
+/**
+ * 指令前缀不再由插件排除（2026-10 重构）。
+ *
+ * 指令前缀是**宿主管的**：框架的 commands 匹配器负责，命令默认 `block: true`，
+ * 命中后同一事件不会再分发到 events。插件再判断一遍会造成两个真相——
+ * 唤醒前缀与指令前缀默认都是 `/` 时，`/agent` 既不算唤醒也进不了模型；
+ * 把唤醒前缀改成多字符（如 `bot`）后更会直接失效。
+ */
+describe('唤醒层不负责指令路由', () => {
+  it('唤醒前缀改成多字符后仍然能唤醒', () => {
+    const decision = decideWake(session({ content: 'bot 你好' }), config({ wake_prefix: 'bot' }))
+    expect(decision.wake).toBe(true)
+    expect(decision.wake && decision.text).toBe('你好')
+  })
+
+  it('不再提供 command_prefixes 这个配置项', () => {
+    // 配置里存在但默认为空 = 跟随唤醒前缀；页面也不再暴露输入框
+    expect('command_prefixes' in defaultConfig).toBe(false)
   })
 })

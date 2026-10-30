@@ -88,6 +88,13 @@ export interface LoopResult {
    * 完整结果（可能几十 KB）会把配额吃光。
    */
   toolTraces: HistoryToolTrace[]
+  /**
+   * 本次 run 里工具产出的、要发给用户的富媒体。
+   *
+   * 收集起来由调用方（run.ts）在回复阶段发出：工具自己拿不到 session，
+   * 而「发消息」这件事属于回复通道的职责。
+   */
+  outbound: import('../tools/types.js').OutboundMedia[]
 }
 
 /** 步数或工具数用尽。照搬原文的 LoopLimitError 语义 */
@@ -137,6 +144,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   let compactedRounds = 0
   let contextTokens = 0
   const toolTraces: HistoryToolTrace[] = []
+  const outbound: import('../tools/types.js').OutboundMedia[] = []
 
   for (let index = 0; index < maxModelSteps; index += 1) {
     steps = index + 1
@@ -198,6 +206,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         compactedRounds,
         contextTokens,
         toolTraces,
+        outbound,
       }
     }
 
@@ -224,6 +233,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       })
 
       repliedByTool = repliedByTool || execution.sentMessage
+
+      // 工具产出要发给用户的富媒体（图片/文件），收集起来交给回复通道
+      if (execution.result.outbound) {
+        outbound.push(execution.result.outbound)
+        // 已经发了媒体，就不再补一条纯文本回复
+        repliedByTool = true
+      }
 
       // 记一条摘要进历史（截断，避免把 DO storage 配额吃光）
       toolTraces.push(toToolTrace(toolCall.name, toolCall.arguments, execution.result))

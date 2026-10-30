@@ -30,7 +30,7 @@ import { Agent } from './do/agent-object.js'
 import type { HistoryRow } from './do/agent-object.js'
 import type { InboundMessage } from './types.js'
 import type { LLMService } from './llm/contract.js'
-import { executeRun, replyFromSession, type RunDeps } from './agent/run.js'
+import { executeRun, replyFromSession, type ReplyFn, type RunDeps } from './agent/run.js'
 import { conversationKey, isTextMessage, toInboundMessage } from './agent/inbound.js'
 import { decideWake } from './agent/wake.js'
 import { resolveConfig } from './effective-config.js'
@@ -407,18 +407,25 @@ async function onChatMessage({
   await handleMessage(session, ctx, decision.text, config)
 }
 
-async function handleMessage(
+/**
+ * 入站守卫：内容安全 + 依赖可用性。
+ *
+ * 抽出来是因为这两件事都属于「这条消息该不该继续处理」，
+ * 和后面「怎么把它跑完」是两回事。混在一个 130 行的函数里时，
+ * 改动投递逻辑得先读完整段守卫才敢动手。
+ *
+ * 返回 false = 已经处理完（拒绝并回复了），调用方直接 return。
+ */
+async function admitInbound(
   session: Session,
   ctx: PluginContext<AgentConfig>,
+  config: AgentConfig,
   text: string,
-  resolvedConfig?: AgentConfig,
-): Promise<void> {
+): Promise<boolean> {
   const logger = ctx.logger
-  const config = resolvedConfig ?? (await resolveConfig(ctx))
 
   // 内容安全（入站）。放在最前面：命中的消息不该花掉一次 LLM 调用，
   // 也不该进队列占住会话。对标 AstrBot 的 ContentSafetyCheckStage。
-  //
   // 这是**零成本**护栏：纯文本匹配，没有额外请求、没有额外存储。
   const keywords = parseKeywords(config.content_filter_keywords)
   if (keywords.length > 0) {
@@ -430,30 +437,49 @@ async function handleMessage(
         matched: check.matched,
       })
       await session.reply(BLOCKED_REPLY).catch(() => false)
-      return
+      return false
     }
   }
+  return true
+}
 
-  // 依赖没满足时给用户一句能看懂的话，而不是让框架抛 "没有在 depends 中声明" 这类内部错误。
-  // 正常情况下安装时就被拦下了（depends: { llm: '*' }），但提供者可能事后被停用或卸载
-  let llm: LLMService
+/**
+ * 解析 llm 服务。取不到时给用户一句能看懂的话，并返回 null。
+ *
+ * 不能让它抛：`ctx.service()` 在提供者被停用/卸载时抛错，直接抛就变成
+ * 「用户发了消息、什么都没收到」。
+ */
+async function resolveLlmOrExplain(
+  session: Session,
+  ctx: PluginContext<AgentConfig>,
+): Promise<LLMService | null> {
   try {
-    llm = ctx.service<LLMService>('llm')
+    return ctx.service<LLMService>('llm')
   } catch {
     await session
       .reply('Agent 需要的「LLM 接口」插件没有启用。请在面板的插件页启用它，或者先安装。')
       .catch(() => false)
-    logger.error('llm 服务不可用，无法处理消息', { conversation: conversationKey(session) })
-    return
+    ctx.logger.error('llm 服务不可用，无法处理消息', {
+      conversation: conversationKey(session),
+    })
+    return null
   }
+}
 
+/**
+ * 把 QQ 的入站消息准备成内部形状。
+ *
+ * 图片必须**在入站时**取回来：QQ 的图片 URL 带签名且有效期很短，
+ * 等 cron 段（最坏 5 分钟后）再取可能已经 403。
+ */
+async function prepareInbound(session: Session, text: string): Promise<InboundMessage> {
   const message = toInboundMessage(session)
+
   // 事件里拿到的正文可能带 /agent 前缀，剥掉
   const cleaned = text.replace(/^\/agent\s*/i, '').trim()
   if (cleaned) message.text = cleaned
 
-  // 图片要在入站时取回来：QQ 的图片 URL 带签名且有效期很短，
-  // 等 cron 段再取可能已经 403。取不到就把说明拼进正文，别让整条消息失败
+  // 取不到图片就把说明拼进正文，别让整条消息失败
   if (message.attachments.some((a) => a.type === 'image')) {
     const hydrated = await hydrateImageAttachments(message.attachments)
     message.attachments = hydrated.attachments
@@ -462,7 +488,30 @@ async function handleMessage(
       message.displayText = message.text
     }
   }
+  return message
+}
 
+/**
+ * 聊天消息入口。
+ *
+ * 只做编排，三块细节各自独立（见上面的函数）：
+ * 守卫 → 准备消息 → 投递到队列并尽量当场跑完。
+ */
+async function handleMessage(
+  session: Session,
+  ctx: PluginContext<AgentConfig>,
+  text: string,
+  resolvedConfig?: AgentConfig,
+): Promise<void> {
+  const logger = ctx.logger
+  const config = resolvedConfig ?? (await resolveConfig(ctx))
+
+  if (!(await admitInbound(session, ctx, config, text))) return
+
+  const llm = await resolveLlmOrExplain(session, ctx)
+  if (!llm) return
+
+  const message = await prepareInbound(session, text)
   const stub = agentStub(ctx, message.conversation)
   const reply = replyFromSession(session)
 
@@ -836,23 +885,58 @@ async function rememberConversation(
 function makeApiReply(
   ctx: PluginContext<AgentConfig>,
   message: InboundMessage,
-): (text: string) => Promise<boolean> {
-  return async (text: string) => {
-    const target = { scene: message.scene, id: message.targetId } as Parameters<
-      typeof ctx.api.sendMessage
-    >[0]
+): ReplyFn {
+  const target = { scene: message.scene, id: message.targetId } as Parameters<
+    typeof ctx.api.sendMessage
+  >[0]
 
-    const result = await ctx.api.sendMessage(
-      target,
-      { text },
-      message.passiveMessageId ? { messageId: message.passiveMessageId, msgSeq: 2 } : {},
-    )
+  // 一次 run 里回复可能被拆成多条（媒体 + 文本），msg_seq 必须递增，
+  // 否则平台会把后一条当成重复消息丢掉
+  let seq = 2
+  const nextOptions = () =>
+    message.passiveMessageId ? { messageId: message.passiveMessageId, msgSeq: seq++ } : {}
 
+  const reply = (async (text: string) => {
+    const result = await ctx.api.sendMessage(target, { text }, nextOptions())
     if (!result.ok) {
       ctx.logger.warn('主动回复失败', { conversation: message.conversation, error: result.error })
     }
     return result.ok
+  }) as ReplyFn
+
+  reply.media = async (item: import('./tools/types.js').OutboundMedia) => {
+    // 拆成平台认识的形状：图片用 `image` 简写，其余走 `media`
+    const payload =
+      item.type === 'image'
+        ? {
+            ...(item.caption ? { text: item.caption } : {}),
+            image: { ...(item.url ? { url: item.url } : {}), ...(item.base64 ? { base64: item.base64 } : {}) },
+          }
+        : {
+            ...(item.caption ? { text: item.caption } : {}),
+            media: {
+              type: item.type,
+              ...(item.url ? { url: item.url } : {}),
+              ...(item.base64 ? { base64: item.base64 } : {}),
+              ...(item.filename ? { filename: item.filename } : {}),
+            },
+          }
+
+    const result = await ctx.api.sendMessage(target, payload, nextOptions())
+    if (!result.ok) {
+      // 媒体发送失败（URL 过期、格式不支持、超限）是常见情况，
+      // 退化成把链接放进正文，至少用户还能自己点开
+      ctx.logger.warn('媒体回复失败', {
+        conversation: message.conversation,
+        type: item.type,
+        error: result.error,
+      })
+      if (item.url) return reply(`${item.caption ?? ''} ${item.url}`.trim() || item.url)
+    }
+    return result.ok
   }
+
+  return reply
 }
 
 /** 把时间戳格式化成配置时区的短格式。时区写错时退回 ISO */

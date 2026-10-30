@@ -160,58 +160,58 @@ describe('applyToolSettings 过滤', () => {
 
 describe('normalizeToolSettings 容错', () => {
   it('合法输入原样返回', () => {
-    expect(normalizeToolSettings({ disabled: ['a', 'b'] })).toEqual({ disabled: ['a', 'b'] })
+    expect(normalizeToolSettings({ disabled: ['a', 'b'] })).toMatchObject({ disabled: ['a', 'b'] })
   })
 
   it('D1 的 disabled_json 是名字数组本身，解析出来就是 disabled', () => {
-    expect(normalizeToolSettings('["http.request"]')).toEqual({ disabled: ['http.request'] })
-    expect(normalizeToolSettings('[]')).toEqual({ disabled: [] })
+    expect(normalizeToolSettings('["http.request"]')).toMatchObject({ disabled: ['http.request'] })
+    expect(normalizeToolSettings('[]')).toMatchObject({ disabled: [] })
     // 未解包的数组也认（调用方可能已经 JSON.parse 过）
-    expect(normalizeToolSettings(['a'])).toEqual({ disabled: ['a'] })
+    expect(normalizeToolSettings(['a'])).toMatchObject({ disabled: ['a'] })
   })
 
   it('页面 POST 上来的接口形状也认', () => {
-    expect(normalizeToolSettings({ disabled: ['http.request'] })).toEqual({
+    expect(normalizeToolSettings({ disabled: ['http.request'] })).toMatchObject({
       disabled: ['http.request'],
     })
-    expect(normalizeToolSettings('{"disabled":["http.request"]}')).toEqual({
+    expect(normalizeToolSettings('{"disabled":["http.request"]}')).toMatchObject({
       disabled: ['http.request'],
     })
   })
 
   it('null / 非数组一律当成全开', () => {
-    expect(normalizeToolSettings(null)).toEqual({ disabled: [] })
-    expect(normalizeToolSettings(undefined)).toEqual({ disabled: [] })
-    expect(normalizeToolSettings(42)).toEqual({ disabled: [] })
-    expect(normalizeToolSettings('"oops"')).toEqual({ disabled: [] })
-    expect(normalizeToolSettings({})).toEqual({ disabled: [] })
+    expect(normalizeToolSettings(null)).toMatchObject({ disabled: [] })
+    expect(normalizeToolSettings(undefined)).toMatchObject({ disabled: [] })
+    expect(normalizeToolSettings(42)).toMatchObject({ disabled: [] })
+    expect(normalizeToolSettings('"oops"')).toMatchObject({ disabled: [] })
+    expect(normalizeToolSettings({})).toMatchObject({ disabled: [] })
   })
 
   it('数组里全是数字时也当成全开（不是有效的工具名列表）', () => {
-    expect(normalizeToolSettings([1, 2, 3])).toEqual({ disabled: [] })
-    expect(normalizeToolSettings('[7,8]')).toEqual({ disabled: [] })
+    expect(normalizeToolSettings([1, 2, 3])).toMatchObject({ disabled: [] })
+    expect(normalizeToolSettings('[7,8]')).toMatchObject({ disabled: [] })
   })
 
   it('disabled 不是数组时当成全开（手改库写错字段名是常见情况）', () => {
-    expect(normalizeToolSettings({ disabled: 'a' })).toEqual({ disabled: [] })
-    expect(normalizeToolSettings({ enabled: ['a'] })).toEqual({ disabled: [] })
+    expect(normalizeToolSettings({ disabled: 'a' })).toMatchObject({ disabled: [] })
+    expect(normalizeToolSettings({ enabled: ['a'] })).toMatchObject({ disabled: [] })
   })
 
   it('数组里混着数字 / null / 对象时只留字符串', () => {
-    expect(normalizeToolSettings({ disabled: [1, null, { name: 'x' }, 'a', true] })).toEqual({
-      disabled: ['a'],
-    })
-    expect(normalizeToolSettings([1, null, { name: 'x' }, 'a', true])).toEqual({ disabled: ['a'] })
+    expect(
+      normalizeToolSettings({ disabled: [1, null, { name: 'x' }, 'a', true] }),
+    ).toMatchObject({ disabled: ['a'] })
+    expect(normalizeToolSettings([1, null, { name: 'x' }, 'a', true])).toMatchObject({ disabled: ['a'] })
   })
 
   it('去空白、去空串、去重——重复项会让面板画两行勾选框', () => {
-    expect(normalizeToolSettings({ disabled: [' a ', 'a', '', '   ', 'b'] })).toEqual({
-      disabled: ['a', 'b'],
-    })
+    expect(
+      normalizeToolSettings({ disabled: [' a ', 'a', '', '   ', 'b'] }),
+    ).toMatchObject({ disabled: ['a', 'b'] })
   })
 
   it('坏 JSON / 抛错的 getter 都不抛异常', () => {
-    expect(normalizeToolSettings('{not json')).toEqual({ disabled: [] })
+    expect(normalizeToolSettings('{not json')).toMatchObject({ disabled: [] })
     const hostile = {
       get disabled(): unknown {
         throw new Error('库里读出来的奇怪结构')
@@ -219,7 +219,7 @@ describe('normalizeToolSettings 容错', () => {
     }
     // 读设置抛错会直接断掉整轮对话，这里必须兜住
     expect(() => normalizeToolSettings(hostile)).not.toThrow()
-    expect(normalizeToolSettings(hostile)).toEqual({ disabled: [] })
+    expect(normalizeToolSettings(hostile)).toMatchObject({ disabled: [] })
   })
 })
 
@@ -234,7 +234,7 @@ function fakeToolDb(): {
   writes: number
 } {
   const calls: Array<{ sql: string; params: unknown[] }> = []
-  const rows = new Map<string, { disabled_json: string; updated_at: number }>()
+  const rows = new Map<string, { disabled_json: string; config_json?: string; updated_at: number }>()
   let writes = 0
 
   const db = {
@@ -257,7 +257,8 @@ function fakeToolDb(): {
       calls.push({ sql, params })
       if (!sql.includes('{tool_settings}')) return null
       const row = rows.get(String(params[0]))
-      return row ? { disabled_json: row.disabled_json } : null
+      if (!row) return null
+      return { disabled_json: row.disabled_json, config_json: row.config_json ?? '{}' }
     },
     async exec() {},
     table: (name: string) => `p_agent_${name}`,
@@ -271,29 +272,29 @@ describe('D1 工具开关', () => {
     const { db, calls, writes } = fakeToolDb()
     const settings = await getToolSettings(db)
 
-    expect(settings).toEqual({ disabled: [] })
+    expect(settings).toMatchObject({ disabled: [] })
     expect(writes).toBe(0)
     // 只按主键查一行，没有二级索引可走
-    expect(calls[0]?.sql).toContain('SELECT disabled_json FROM {tool_settings} WHERE id = ?')
+    expect(calls[0]?.sql).toContain('SELECT disabled_json, config_json FROM {tool_settings}')
     expect(calls[0]?.params).toEqual(['default'])
   })
 
   it('有行时解析出 disabled', async () => {
     const { db, rows } = fakeToolDb()
     rows.set('default', { disabled_json: '["http.request"]', updated_at: 1 })
-    expect(await getToolSettings(db)).toEqual({ disabled: ['http.request'] })
+    expect(await getToolSettings(db)).toMatchObject({ disabled: ['http.request'] })
   })
 
   it('库里是坏 JSON 时返回全开而不是抛错', async () => {
     const { db, rows } = fakeToolDb()
     rows.set('default', { disabled_json: '{"disabled":', updated_at: 1 })
-    expect(await getToolSettings(db)).toEqual({ disabled: [] })
+    expect(await getToolSettings(db)).toMatchObject({ disabled: [] })
   })
 
   it('库里存的是旧版对象形状时也读得出来（不用写迁移）', async () => {
     const { db, rows } = fakeToolDb()
     rows.set('default', { disabled_json: '{"disabled":["http.request"]}', updated_at: 1 })
-    expect(await getToolSettings(db)).toEqual({ disabled: ['http.request'] })
+    expect(await getToolSettings(db)).toMatchObject({ disabled: ['http.request'] })
   })
 
   it('set 是单行 UPSERT，不是 INSERT OR REPLACE', async () => {
@@ -305,13 +306,15 @@ describe('D1 工具开关', () => {
     expect(calls[0]?.sql).toContain('ON CONFLICT(id) DO UPDATE')
     expect(calls[0]?.params[0]).toBe('default')
     expect(calls[0]?.params[1]).toBe('["http.request"]')
-    expect(typeof calls[0]?.params[2]).toBe('number')
+    // 第三列是每工具配置（JSON），第四列才是时间戳
+    expect(calls[0]?.params[2]).toBe('{}')
+    expect(typeof calls[0]?.params[3]).toBe('number')
   })
 
   it('set → get 往返一致', async () => {
     const { db } = fakeToolDb()
     await setToolSettings(db, { disabled: ['vfs.delete', 'vfs.write_file'] })
-    expect(await getToolSettings(db)).toEqual({ disabled: ['vfs.delete', 'vfs.write_file'] })
+    expect(await getToolSettings(db)).toMatchObject({ disabled: ['vfs.delete', 'vfs.write_file'] })
   })
 
   it('set 前先归一化：脏值不会落库', async () => {
@@ -327,7 +330,7 @@ describe('D1 工具开关', () => {
     await setToolSettings(db, { disabled: ['b'] })
 
     expect(rows.size).toBe(1)
-    expect(await getToolSettings(db)).toEqual({ disabled: ['b'] })
+    expect(await getToolSettings(db)).toMatchObject({ disabled: ['b'] })
   })
 })
 

@@ -74,20 +74,11 @@ function isBotSelf(session: Session): boolean {
   return session.userId === session.botId
 }
 
-/** 解析「以此开头的消息交给指令」的前缀列表（逗号分隔，默认 `/`） */
-function commandPrefixes(config: AgentConfig): string[] {
-  return (config.command_prefixes ?? '/')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean)
-}
-
 /**
  * 唤醒前缀。默认 `/`。
  *
- * **注意不要与 `command_prefixes` 混用**：上一版把两者拼进同一个列表，导致
- * 「带指令前缀的消息」既被排除、又被当成唤醒前缀匹配——默认值都是 `/`，
- * 结果任何以 `/` 开头的消息都唤醒了 Agent。
+ * 这是**唯一**的前缀：指令前缀由宿主框架管理（命令命中后不再进模型），
+ * 插件不再单独配一份——两个真相必然对不上。
  */
 function wakePrefix(config: AgentConfig): string {
   return (config.wake_prefix ?? '/').trim()
@@ -107,27 +98,26 @@ export function decideWake(session: Session, config: AgentConfig): WakeDecision 
   // 技能激活是一条**特殊情况**：`/skill <id> <任务>` 必须进模型，
   // 因为技能正文只有模型才能用上。
   //
-  // 但它的开头又是 `/`，会先被下面的「指令前缀」判定拦下（`command_prefixes` 默认就是 `/`）。
-  // 所以这里必须先放行它，否则 `/skill` 永远走不到模型，技能功能等于不存在。
-  //
-  // 为什么单独判，而不是把 `/skill` 从指令前缀里删掉：用户可能把
-  // command_prefixes 改成别的（比如 `!`），那时 `/skill` 不是指令前缀了，
-  // 但激活语义仍然要生效。所以判的是「这条消息是一次技能激活」，
-  // 而不是「它碰巧以某个前缀开头」。
+  // 它必须比普通唤醒更早判定：普通消息只剥前缀，而技能激活要**剥掉整段命令**
+  // 换成任务正文（见 run.ts 的 parseSkillCommand）。
   const skillText = stripSkillPrefix(raw)
   if (skillText !== undefined) {
     return { wake: true, reason: 'skill', text: skillText }
   }
 
-  // 带指令前缀的消息交给指令路径。即便没命中任何命令（`/unknowncmd`），
-  // 也不该把带前缀的原文丢给模型——模型会答非所问。
-  if (commandPrefixes(config).some((prefix) => raw.startsWith(prefix))) {
-    return { wake: false, reason: 'command' }
-  }
-
   const prefix = wakePrefix(config)
   const matched = prefix ? raw.startsWith(prefix) : false
   const stripped = matched ? raw.slice(prefix.length).trim() : raw.trim()
+
+  // **不再在这里排除「指令前缀」**。
+  //
+  // 两个理由：
+  // 1. 指令前缀是**宿主管的**（框架的 commands 匹配器负责，面板可改），
+  //    插件再配一份就是两个真相，必然对不上。命令默认 `block: true`，
+  //    命中后同一事件不会再分发到 events，所以「是指令」与「进模型」天然互斥。
+  // 2. 原先在这里排除，导致唤醒前缀与指令前缀都是 `/` 时，`/agent` 这类消息
+  //    既不算唤醒也走不到模型；把前缀改成多字符（如 `bot`）后更是直接失效。
+  //    AstrBot 也没有这一步：唤醒前缀命中就算唤醒，之后才由指令匹配决定。
 
   // 单聊：没有 @ 的概念，默认全部唤醒
   if (session.scene === 'c2c' || session.scene === 'guild_dm') {

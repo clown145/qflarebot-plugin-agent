@@ -107,6 +107,11 @@
       "auth": "admin"
     },
     {
+      "method": "POST",
+      "path": "/api/tools/config",
+      "auth": "admin"
+    },
+    {
       "method": "GET",
       "path": "/api/skills",
       "auth": "admin"
@@ -189,8 +194,8 @@
       "enable_vfs": {
         "type": "boolean",
         "title": "启用虚拟工作区",
-        "description": "模型可以读写工作区文件。小文本存 D1，超过 8KB 的存 R2（需要绑定 R2）",
-        "default": false
+        "description": "模型可以读写工作区文件。默认开：不绑 R2 也能存 8KB 以内的文本；绑了 R2 才支持大文件",
+        "default": true
       },
       "enable_schedule": {
         "type": "boolean",
@@ -288,12 +293,6 @@
         "description": "关掉时私聊任何消息都会触发 Agent；打开后私聊也要带唤醒前缀",
         "default": false
       },
-      "command_prefixes": {
-        "type": "string",
-        "title": "机器人自身的指令前缀",
-        "description": "以此开头的消息交给指令处理，不再触发 Agent。多个用逗号分隔，默认 `/`",
-        "default": "/"
-      },
       "timezone": {
         "type": "string",
         "title": "时区",
@@ -331,12 +330,6 @@
         "title": "内容安全关键词",
         "description": "命中即拒绝、不发模型（逗号分隔）。留空 = 关闭。零外部依赖，只做纯文本匹配",
         "default": ""
-      },
-      "search_api_key": {
-        "type": "string",
-        "title": "联网搜索 API Key（Tavily）",
-        "description": "留空时搜索工具仍然存在，但会告诉用户「还没配置搜索」。填了之后模型才能真的联网查资料",
-        "default": ""
       }
     }
   },
@@ -347,13 +340,12 @@
     "default_persona": "",
     "wake_prefix": "/",
     "friend_needs_wake_prefix": false,
-    "command_prefixes": "/",
     "max_model_steps": 8,
     "max_tool_calls": 12,
     "history_limit": 20,
     "request_timeout_ms": 20000,
     "enable_tools": true,
-    "enable_vfs": false,
+    "enable_vfs": true,
     "enable_schedule": false,
     "enable_skills": false,
     "enable_audit": false,
@@ -362,7 +354,6 @@
     "context_compression": "truncate",
     "max_context_tokens": 12000,
     "rate_limit_per_minute": 10,
-    "search_api_key": "",
     "content_filter_keywords": ""
   },
   "ui": {

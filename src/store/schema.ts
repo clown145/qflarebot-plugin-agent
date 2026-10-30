@@ -104,9 +104,13 @@ export const SCHEMA_STATEMENTS = [
   // 于是「点一下开关」的代价是 1 行，而点开关这件事一天可能都发生不了一次，
   // 与消息数完全脱钩——真正的设计约束是别在每条消息的路径上读写它：
   // 运行时每次 run 读一次（读 50 万行/天才等价于写的额度），写只发生在管理页。
+  // `config_json` 存每个工具自己的配置（如 `{"search.web":{"apiKey":"…"}}`）。
+  // 加列而不是另起一张表：settings 永远只有一行，多一张表就多一次查询/写入。
+  // 用 `DEFAULT '{}'` 让老库升级时不必回填——SQLite 的 ADD COLUMN 带默认值是 O(1)。
   `CREATE TABLE IF NOT EXISTS {tool_settings} (
      id TEXT PRIMARY KEY,
      disabled_json TEXT NOT NULL,
+     config_json TEXT NOT NULL DEFAULT '{}',
      updated_at INTEGER NOT NULL
    ) WITHOUT ROWID`,
 

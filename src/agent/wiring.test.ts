@@ -9,7 +9,7 @@
  * 开关从来没生效」——正是这次审计在 `allowDangerous` 上发现过的失效模式。
  */
 import { describe, expect, it } from 'vitest'
-import { buildRegistry } from './run.js'
+import { buildRegistry, replyFromSession } from './run.js'
 import { buildMessages } from './context.js'
 import { applyToolSettings } from '../tools/catalog.js'
 import { createToolRegistry } from '../tools/registry.js'
@@ -92,7 +92,7 @@ describe('工具栏接通 buildRegistry', () => {
 describe('applyToolSettings 与 buildRegistry 的一致性', () => {
   it('两者过滤结果相同（防止接线时用了不同的过滤逻辑）', () => {
     const ctx = fakeCtx()
-    const settings = { disabled: ['web.fetch_page'] }
+    const settings = { disabled: ['web.fetch_page'], config: {} }
     const viaRegistry = buildRegistry(ctx, defaultConfig, false, new Set(settings.disabled))
       .list()
       .map((t) => t.definition.name)
@@ -342,5 +342,53 @@ describe('人格技能白名单的语义', () => {
     const allowed: string[] = []
     const visible = catalog.filter((s) => allowed.includes(s.id))
     expect(visible).toHaveLength(0)
+  })
+})
+
+/**
+ * 富媒体回复链路。
+ *
+ * 这轮补上的真实缺口：宿主 `session.reply` 支持 `{ image }` / `{ media }`，
+ * 但插件一直只发纯文本 —— 模型抓到图片只能把 URL 塞进正文让用户自己点。
+ * 现在工具可以带 `outbound`，由回复通道发出去。
+ */
+describe('富媒体回复链路', () => {
+  it('ReplyFn 支持 media 方法', () => {
+    const reply = replyFromSession({ reply: async () => ({ ok: true }) })
+    expect(typeof reply).toBe('function')
+    expect(typeof reply.media).toBe('function')
+  })
+
+  it('媒体会转成宿主认识的 image 形状（不是塞进 text）', async () => {
+    const sent: unknown[] = []
+    const reply = replyFromSession({
+      reply: async (message) => {
+        sent.push(message)
+        return { ok: true }
+      },
+    })
+
+    await reply.media?.({ type: 'image', url: 'https://x/a.png', caption: '这是图' })
+
+    expect(sent).toHaveLength(1)
+    const payload = sent[0] as { image?: { url?: string }; text?: string }
+    expect(payload.image?.url).toBe('https://x/a.png')
+    expect(payload.text).toBe('这是图')
+  })
+
+  it('file 类型走 media 形状并带文件名', async () => {
+    const sent: unknown[] = []
+    const reply = replyFromSession({
+      reply: async (message) => {
+        sent.push(message)
+        return { ok: true }
+      },
+    })
+
+    await reply.media?.({ type: 'file', url: 'https://x/a.pdf', filename: '报告.pdf' })
+
+    const payload = sent[0] as { media?: { type?: string; filename?: string } }
+    expect(payload.media?.type).toBe('file')
+    expect(payload.media?.filename).toBe('报告.pdf')
   })
 })

@@ -23,6 +23,7 @@
  * 也把顺序固定下来——不排序的话每次刷新工具顺序都可能变，看着像在闪。
  */
 import type {
+  ToolConfigField,
   PermissionLevel,
   RegisteredTool,
   ToolAnnotations,
@@ -38,6 +39,14 @@ import type {
  */
 export interface ToolSettings {
   disabled: string[]
+  /**
+   * 每个工具自己的配置，如 `{ 'search.web': { apiKey: 'tvly-…' } }`。
+   *
+   * 为什么放在工具设置里而不是插件配置：**api key 是单个工具的事**。
+   * 放在插件顶层会让「对话行为」页出现一个和限流、时区混在一起的神秘输入框，
+   * 用户根本不知道它属于哪个工具。工具自己声明要什么配置、在自己的详情里填。
+   */
+  config?: Record<string, Record<string, string>>
 }
 
 /**
@@ -58,6 +67,12 @@ export interface ToolCatalogItem {
   timeoutMs: number
   annotations: ToolAnnotations
   enabled: boolean
+  /** 这个工具需要填哪些配置（空/不传 = 不需要配置，页面不显示「配置」按钮） */
+  configFields?: ToolConfigField[]
+  /** 已经填好的值。`secret` 类型的值**不回显**，只标 `configured: true` */
+  config?: Record<string, string>
+  /** `config` 里哪些键已经有值（secret 类型靠它显示「已设置」） */
+  configuredKeys?: string[]
 }
 
 /**
@@ -74,9 +89,27 @@ export function toToolCatalog(
   tools: RegisteredTool[],
   settings?: ToolSettings,
 ): ToolCatalogItem[] {
-  const disabled = new Set(normalizeToolSettings(settings).disabled)
+  const normalized = normalizeToolSettings(settings)
+  const disabled = new Set(normalized.disabled)
   return tools
-    .map((tool) => toToolCatalogItem(tool, !disabled.has(tool.definition.name)))
+    .map((tool) => {
+      const item = toToolCatalogItem(tool, !disabled.has(tool.definition.name))
+      const fields = tool.definition.configFields
+      if (!fields?.length) return item
+
+      const stored = normalized.config?.[tool.definition.name] ?? {}
+      // **secret 不回显**：页面只该知道「有没有填」，不该把 key 明文写进
+      // 一个之后可能被截图、被 devtools 翻出来的响应体里
+      const shown: Record<string, string> = {}
+      const configuredKeys: string[] = []
+      for (const field of fields) {
+        const value = stored[field.key] ?? ''
+        if (!value) continue
+        configuredKeys.push(field.key)
+        if (field.type !== 'secret') shown[field.key] = value
+      }
+      return { ...item, configFields: fields, config: shown, configuredKeys }
+    })
     .sort(compareToolCatalogItems)
 }
 
@@ -143,20 +176,48 @@ export function applyToolSettings(
  */
 export function normalizeToolSettings(raw: unknown): ToolSettings {
   const value = typeof raw === 'string' ? parseJsonOrNull(raw) : raw
-  // 裸数组 = 库里的存储形状；对象 = 接口形状
+  // 裸数组 = 库里的存储形状（老版本只存 disabled）；对象 = 接口形状
   const list = Array.isArray(value) ? value : readDisabledField(value)
-  if (!Array.isArray(list)) return { disabled: [] }
+  const disabled = Array.isArray(list) ? readStringList(list) : []
+  return { disabled, config: readConfigMap(value) }
+}
 
-  const disabled: string[] = []
+function readStringList(list: unknown[]): string[] {
+  const out: string[] = []
   const seen = new Set<string>()
   for (const item of list) {
     if (typeof item !== 'string') continue
     const name = item.trim()
     if (!name || seen.has(name)) continue
     seen.add(name)
-    disabled.push(name)
+    out.push(name)
   }
-  return { disabled }
+  return out
+}
+
+/**
+ * 解析每工具配置。形状必须是 `{ <工具名>: { <键>: <字符串> } }`。
+ *
+ * 逐层校验而不是整体 `as`：这份数据会被直接拼进工具构造参数（比如 api key），
+ * 一个多余的嵌套层级或非字符串值都应该被丢掉，而不是传到下游去炸。
+ */
+function readConfigMap(value: unknown): Record<string, Record<string, string>> {
+  const out: Record<string, Record<string, string>> = {}
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out
+
+  const raw = (value as Record<string, unknown>)['config']
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+
+  for (const [toolName, toolConfig] of Object.entries(raw as Record<string, unknown>)) {
+    if (!toolName.trim()) continue
+    if (!toolConfig || typeof toolConfig !== 'object' || Array.isArray(toolConfig)) continue
+    const fields: Record<string, string> = {}
+    for (const [key, val] of Object.entries(toolConfig as Record<string, unknown>)) {
+      if (typeof val === 'string' && key.trim()) fields[key.trim()] = val
+    }
+    if (Object.keys(fields).length) out[toolName.trim()] = fields
+  }
+  return out
 }
 
 function readDisabledField(value: unknown): unknown {

@@ -48,6 +48,13 @@ export interface AgentStub {
 
 export interface ReplyFn {
   (text: string): Promise<boolean>
+  /**
+   * 发一条富媒体（图片/文件）。
+   *
+   * 单独一个方法而不是给 `text` 加重载：调用点一眼能看出「这条是在发图」，
+   * 而且媒体失败时的降级策略与纯文本不同（见 replyWithMedia 的实现）。
+   */
+  media?(item: import('../tools/types.js').OutboundMedia): Promise<boolean>
 }
 
 export interface RunDeps {
@@ -123,7 +130,14 @@ async function runLoopOnce(input: {
   // 注意 `allowedTools === undefined` 表示不限（老配置没这个字段），
   // 而 `[]` 表示「什么都不能用」——这两者含义相反，不能糊成一样。
   const disabled = new Set(toolSettings?.disabled ?? [])
-  const registry = buildRegistry(ctx, config, r2Ready, disabled, persona.allowedTools)
+  const registry = buildRegistry(
+    ctx,
+    config,
+    r2Ready,
+    disabled,
+    persona.allowedTools,
+    toolSettings?.config ?? {},
+  )
 
   // 技能：**渐进披露**。
   //
@@ -340,12 +354,26 @@ export async function executeRun(
       deps.retryDelayMs ?? RETRY_DELAY_MS,
     )
 
-    // 4. 回复。工具已经发过就不重复发
+    // 4a. 先发工具产出的富媒体（图片/文件）。
+    //
+    // 放在纯文本之前：用户的阅读顺序应该是「看到图 → 再看到说明」。
+    // 媒体本身不过内容安全（那是二进制），但 caption 会过。
+    let replied = false
+    for (const item of result.outbound ?? []) {
+      if (!reply.media) {
+        logger.warn('回复通道不支持媒体，退化为纯文本链接', { type: item.type })
+        const fallback = item.url ? `${item.caption ?? ''} ${item.url}`.trim() : (item.caption ?? '')
+        if (fallback) replied = (await reply(fallback)) || replied
+        continue
+      }
+      replied = (await reply.media(item).catch(() => false)) || replied
+    }
+
+    // 4b. 再发纯文本。工具已经发过就不重复发
     //
     // 出站也要过一遍内容安全（对标 AstrBot 的 ResultDecorateStage）：
     // 只查入站不够——模型可能把用户诱导出的敏感内容再复述一遍，
     // 而那才是真正发到群里的东西。
-    let replied = false
     if (!result.repliedByTool && result.reply?.trim()) {
       const outbound = filterOutbound(result.reply.trim(), config)
       if (outbound.blocked) {
@@ -483,6 +511,8 @@ export function buildRegistry(
    * `undefined` = 不限；数组（含空数组）= 只允许这些。
    */
   allowedTools?: readonly string[],
+  /** 每个工具自己的配置（管理页在工具详情里填的），如 `{ 'search.web': { apiKey } }` */
+  toolConfig: Record<string, Record<string, string>> = {},
 ): ToolRegistry {
   if (!config.enable_tools) return createToolRegistry([])
 
@@ -495,10 +525,17 @@ export function buildRegistry(
   // 联网搜索。**未配置 key 时也注册**：模型能看到这个工具、拿到一句可读的
   // 「还没配置搜索」，比让模型以为「我没有搜索能力」然后凭空瞎编要好。
   // 这比整组不注册更诚实——不注册等于假装这个能力不存在。
+  // apiKey 从**工具自己的配置**里读（管理页「工具 → 搜索 → 配置」填的），
+  // 不再从插件配置的 search_api_key 读。这样「加一个需要 key 的工具」只需要
+  // 工具自己声明 configFields，不用改插件配置 schema，也不会让用户在一个
+  // 通用设置页里看到一个不知道自己属于谁的输入框。
+  //
+  // 早期版本把 key 写在插件配置 `search_api_key` 里，v0.1 之后挪到了工具配置。
+  // 老用户升级时那句配置会被忽略——管理页「工具 → 搜索 → 配置」重新填一次即可。
+  // 不做自动迁移：读旧配置写新设置需要一次 D1/AI 之外的写，为一次性升级不值当。
+  const searchApiKey = toolConfig['search.web']?.['apiKey']?.trim() ?? ''
   tools.push(
-    ...createSearchTools(
-      config.search_api_key ? { provider: 'tavily', apiKey: config.search_api_key } : undefined,
-    ),
+    ...createSearchTools(searchApiKey ? { provider: 'tavily', apiKey: searchApiKey } : undefined),
   )
 
   if (config.enable_schedule) {
@@ -506,14 +543,14 @@ export function buildRegistry(
   }
 
   if (config.enable_vfs) {
-    // R2 没绑定时 vfs 不可用（大文件存不进去）。用户开了开关却只能写小文件会困惑，
-    // 所以整组不注册，并在选择模型时记一条日志（只记一次，不刷屏）
-    if (r2Ready) {
-      tools.push(...createVfsTools(ctx.db, ctx.r2))
-    } else if (!warnedNoR2) {
-      warnedNoR2 = true
-      ctx.logger.warn('enable_vfs 打开了但 R2 未绑定，工作区工具不可用')
-    }
+    // **没绑 R2 也注册**（轻量模式：只用 D1 存 ≤8KB 的文本）。
+    //
+    // 以前是「没 R2 就整组不注册」，等于把一个轻量功能绑死在重型基础设施上：
+    // 「让模型记个笔记、存个待办」这类最常见的用途根本用不到大文件，
+    // 结果绝大多数部署里「有虚拟工作区」这句话等于不存在。
+    //
+    // 大文件在轻量模式下会返回可读错误（提示绑定 R2），而不是让工具消失。
+    tools.push(...createVfsTools(ctx.db, r2Ready ? ctx.r2 : undefined))
   }
 
   // 两道收窄，都在末尾统一做。**关掉是硬关**：工具根本不注册，
@@ -538,8 +575,6 @@ export function buildRegistry(
   return createToolRegistry(enabled)
 }
 
-/** 同一个 isolate 里只警告一次，避免每条消息刷一行日志 */
-let warnedNoR2 = false
 
 async function safeResolveModel(llm: LLMService, model: string, logger: Logger) {
   try {
@@ -554,13 +589,41 @@ async function safeResolveModel(llm: LLMService, model: string, logger: Logger) 
   }
 }
 
-/** 从 session 造一个回复函数：走被动回复，省主动消息额度 */export function replyFromSession(session: {
-  reply: (text: string) => Promise<{ ok: boolean }>
+/**
+ * 从 session 造一个回复函数：走被动回复，省主动消息额度。
+ *
+ * 宿主的 `session.reply` 本身就支持 `{ image }` / `{ media }`，
+ * 这里只是把工具产出的媒体转成它认识的形状。
+ */
+export function replyFromSession(session: {
+  reply: (message: import('@qqbot/sdk').OutgoingMessage) => Promise<{ ok: boolean }>
 }): ReplyFn {
-  return async (text: string) => {
+  const reply = (async (text: string) => {
     const result = await session.reply(text)
     return result.ok
+  }) as ReplyFn
+
+  reply.media = async (item) => {
+    const payload =
+      item.type === 'image'
+        ? {
+            ...(item.caption ? { text: item.caption } : {}),
+            image: { ...(item.url ? { url: item.url } : {}), ...(item.base64 ? { base64: item.base64 } : {}) },
+          }
+        : {
+            ...(item.caption ? { text: item.caption } : {}),
+            media: {
+              type: item.type,
+              ...(item.url ? { url: item.url } : {}),
+              ...(item.base64 ? { base64: item.base64 } : {}),
+              ...(item.filename ? { filename: item.filename } : {}),
+            },
+          }
+    const result = await session.reply(payload as import('@qqbot/sdk').OutgoingMessage)
+    return result.ok
   }
+
+  return reply
 }
 
 /**

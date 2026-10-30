@@ -19,7 +19,7 @@ import { normalizeVfsPath } from './path.js'
 
 const SOURCE = { type: 'builtin' as const, id: 'vfs', name: '工作区' }
 
-export function createVfsTools(db: PluginDB, r2: ScopedR2): RegisteredTool[] {
+export function createVfsTools(db: PluginDB, r2?: ScopedR2): RegisteredTool[] {
   const workspace = createVfsWorkspace(db, r2)
   return [
     readFileTool(workspace),
@@ -27,6 +27,7 @@ export function createVfsTools(db: PluginDB, r2: ScopedR2): RegisteredTool[] {
     searchTool(workspace),
     writeFileTool(workspace),
     mkdirTool(workspace),
+    moveTool(workspace),
     deleteTool(workspace),
   ]
 }
@@ -172,6 +173,42 @@ function mkdirTool(workspace: ReturnType<typeof createVfsWorkspace>): Registered
       if (!path) return fail('bad_request', '缺少 path')
       await workspace.mkdir(path)
       return { status: 'success', output: { path: normalizeVfsPath(path) } }
+    },
+  }
+}
+
+function moveTool(workspace: ReturnType<typeof createVfsWorkspace>): RegisteredTool {
+  return {
+    definition: {
+      name: 'vfs.move',
+      title: '移动或重命名',
+      description:
+        '把文件或目录移到新路径，也可以用来重命名。目标已存在时会失败而不是覆盖。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          from: { type: 'string', description: '原路径（绝对路径）' },
+          to: { type: 'string', description: '新路径（绝对路径）' },
+        },
+        required: ['from', 'to'],
+      },
+      permission: { level: 2, scopes: ['workspace:write'] },
+      sideEffect: 'workspace_write',
+      timeoutMs: 8_000,
+    },
+    source: SOURCE,
+    execute: async (context) => {
+      const input = context.input as { from?: string; to?: string }
+      if (!input?.from) return fail('bad_request', '缺少 from')
+      if (!input?.to) return fail('bad_request', '缺少 to')
+      try {
+        const result = await workspace.move(input.from, input.to)
+        return { status: 'success', output: result }
+      } catch (error) {
+        // 目标已存在 / 要移到自己里面 这类是**可预期的用户错误**，
+        // 返回可读消息而不是让它变成 run 失败
+        return fail('move_failed', error instanceof Error ? error.message : String(error))
+      }
     },
   }
 }

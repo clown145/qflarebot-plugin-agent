@@ -305,7 +305,14 @@ describe('executeRun', () => {
    * 于是 enable_vfs 会在没有 R2 的机器人上注册一整套必然失败的工具。
    * 现在真的探测一次（`head()` 抛错即视为未绑定）。
    */
-  it('enable_vfs 打开但 R2 未绑定时，vfs 工具不注册（r2 是抛错桩）', async () => {
+  /**
+   * 轻量模式：没绑 R2 时 vfs **仍然注册**（只用 D1 存 ≤8KB 文本）。
+   *
+   * 以前是「没 R2 就整组不注册」，等于把轻量功能绑死在重型基础设施上——
+   * 「记个笔记、存个待办」根本用不到大文件，结果多数部署里
+   * 「有虚拟工作区」等于不存在。大文件在轻量模式下会返回可读错误。
+   */
+  it('enable_vfs 打开但 R2 未绑定时，vfs 工具仍然注册（轻量模式）', async () => {
     let seenTools: Array<{ name: string }> = []
     const llm = {
       ...fakeLLM(),
@@ -342,8 +349,10 @@ describe('executeRun', () => {
       message(),
     )
 
-    expect(seenTools.map((t) => t.name)).not.toContain('vfs.read_file')
-    // 仍然该有时间与网页工具
+    // 轻量模式下 vfs 可用（只是存不了大文件）
+    expect(seenTools.map((t) => t.name)).toContain('vfs.read_file')
+    expect(seenTools.map((t) => t.name)).toContain('vfs.write_file')
+    // 也仍然该有时间与网页工具
     expect(seenTools.map((t) => t.name)).toContain('time.now')
   })
 

@@ -9,6 +9,9 @@ import type { RegisteredTool, ToolResult } from './types.js'
 import { validateFetchUrl } from './http/url-safety.js'
 import { extractPageContent } from './web/extract.js'
 
+/** 这些 content-type 视为「这是张图」，直接走媒体发送而不是当文本读 */
+const IMG_CONTENT_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp']
+
 const MAX_PAGE_BYTES = 2 * 1024 * 1024
 const MAX_CHARS = 20_000
 /** 重定向跳数上限，与 http.request 一致 */
@@ -79,6 +82,18 @@ export function createWebTool(): RegisteredTool {
       if (!response.ok) return fail('http_error', `HTTP ${response.status}`)
 
       const contentType = response.headers.get('content-type') ?? ''
+
+      // 图片：**不要把二进制当文本读**（会变成一堆乱码，模型看了也没用），
+      // 而是把它作为媒体带出去，由回复通道直接发给用户。
+      // 之前这里会把 PNG 的原始字节塞进 text，既浪费 token 又毫无意义。
+      if (IMG_CONTENT_TYPES.some((type) => contentType.includes(type))) {
+        return {
+          status: 'success',
+          output: { url, contentType, kind: 'image' },
+          outbound: { type: 'image', url },
+        }
+      }
+
       const raw = await readCapped(response, MAX_PAGE_BYTES)
 
       // 非 HTML 直接返回原文（JSON 接口、纯文本公告都常见）

@@ -93,6 +93,18 @@ function createSearchTool(config?: SearchConfig): RegisteredTool {
       sideEffect: 'none',
       timeoutMs: 15_000,
       annotations: { readOnlyHint: true, openWorldHint: true },
+      // 这个工具自己声明它需要一把 Key —— 管理页据此在「工具」页给它生成
+      // 配置弹窗。api key 属于搜索工具，不该出现在插件的通用配置里。
+      configFields: [
+        {
+          key: 'apiKey',
+          label: 'Tavily API Key',
+          hint: '在 tavily.com 注册后获取。留空时这个工具仍会出现，但会提示未配置。',
+          type: 'secret',
+          placeholder: 'tvly-…',
+          required: true,
+        },
+      ],
     },
     source: { type: 'builtin', id: 'search', name: '联网搜索' },
 
