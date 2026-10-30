@@ -216,6 +216,21 @@ export const PAGE_HTML_BODY = `
           </div>
           <div class="setting-row">
             <div class="setting-text">
+              <p class="setting-label">回复时 @ 说话人</p>
+              <p class="setting-hint">
+                「仅群聊」在群和频道里 @ 说话人，单聊不 @。多人同时提问时能一眼看出在回谁。
+              </p>
+            </div>
+            <div class="setting-control">
+              <select class="qb-input" id="replyMention" style="min-width: 8rem">
+                <option value="off">关</option>
+                <option value="group">仅群聊</option>
+                <option value="always">总是</option>
+              </select>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-text">
               <p class="setting-label">群聊按成员隔离会话</p>
               <p class="setting-hint">
                 打开后每个群成员拥有独立历史，互相看不到对方聊的内容；适合客服、多租户。

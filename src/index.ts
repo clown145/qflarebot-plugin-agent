@@ -36,6 +36,7 @@ import { decideWake } from './agent/wake.js'
 import { resolveConfig } from './effective-config.js'
 import { getPersonaBinding, setPersonaBinding } from './persona.js'
 import { hydrateImageAttachments } from './agent/media.js'
+import { withMention, type MentionMode } from './agent/mention.js'
 import { BLOCKED_REPLY, checkContent, parseKeywords } from './agent/safety.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
 import {
@@ -912,7 +913,9 @@ async function serviceConversationObjects(
       }
 
       const message = picked.claimed.message
-      const reply = makeApiReply(ctx, message)
+      // @ 的开关在配置里，这里要先拿到（后面 runUntilQueueEmpty 也用它）
+      resumeConfig ??= await resolveConfig(ctx)
+      const reply = makeApiReply(ctx, message, resumeConfig.reply_mention)
       // **必须用 resolveConfig 而不是 ctx.config**：管理页改的模型/限额/人格
       // 存在 KV 覆盖层里（见 effective-config.ts），`ctx.config` 只是面板配置的
       // 权威默认值。用 ctx.config 会让「被 cron 捡回来的 run」退回旧模型——用户在
@@ -992,7 +995,7 @@ async function fireDueSchedules(
     }
 
     const stub = agentStub(ctx, schedule.conversation)
-    const reply = makeApiReply(ctx, message)
+    const reply = makeApiReply(ctx, message, config.reply_mention)
 
     // 先入队：入队失败会抛，那就**不**推进，交给下一轮
     const claimed = await stub.submit(message)
@@ -1103,6 +1106,8 @@ async function rememberConversation(
 function makeApiReply(
   ctx: PluginContext<AgentConfig>,
   message: InboundMessage,
+  /** @ 说话人的模式（配置项 reply_mention） */
+  mentionMode: MentionMode = 'off',
 ): ReplyFn {
   const target = { scene: message.scene, id: message.targetId } as Parameters<
     typeof ctx.api.sendMessage
@@ -1115,7 +1120,9 @@ function makeApiReply(
     message.passiveMessageId ? { messageId: message.passiveMessageId, msgSeq: seq++ } : {}
 
   const reply = (async (text: string) => {
-    const result = await ctx.api.sendMessage(target, { text }, nextOptions())
+    // @ 只加在**文本**回复上：媒体消息带 @ 会变成独立一行，看着很怪
+    const withAt = withMention(text, message.userId, message.scene, mentionMode)
+    const result = await ctx.api.sendMessage(target, { text: withAt }, nextOptions())
     if (!result.ok) {
       ctx.logger.warn('主动回复失败', { conversation: message.conversation, error: result.error })
     }

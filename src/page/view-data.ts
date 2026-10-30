@@ -172,6 +172,7 @@ function renderConfig() {
   $('timeoutMs').value = c.request_timeout_ms ?? ''
   $('timezone').value = c.timezone ?? ''
   $('contextCompression').value = c.context_compression ?? 'truncate'
+  $('replyMention').value = c.reply_mention ?? 'off'
   $('maxContextTokens').value = c.max_context_tokens ?? ''
   $('rateLimit').value = c.rate_limit_per_minute ?? ''
 
@@ -226,6 +227,7 @@ const FIELD_CONTROL = {
   request_timeout_ms: 'timeoutMs',
   timezone: 'timezone',
   context_compression: 'contextCompression',
+  reply_mention: 'replyMention',
   max_context_tokens: 'maxContextTokens',
   rate_limit_per_minute: 'rateLimit',
   enable_tools: null,
@@ -254,6 +256,7 @@ const FIELD_LABEL = {
   request_timeout_ms: '模型超时',
   timezone: '时区',
   context_compression: '上下文压缩',
+  reply_mention: '@ 说话人',
   max_context_tokens: '压缩阈值',
   rate_limit_per_minute: '每分钟上限',
   enable_tools: '工具调用',

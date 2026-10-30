@@ -166,6 +166,20 @@ export interface AgentConfig {
   expose_sender_id: boolean
 
   /**
+   * 回复时要不要 @ 说话人。
+   *
+   * - `off`：不 @（默认）
+   * - `group`：只在群聊/频道 @（单聊只有两个人，@ 没意义）
+   * - `always`：总是 @
+   *
+   * 为什么默认关：群里每条都 @ 会很吵，客户端还会额外推送。
+   * 但「多人同时问」时它确实有用 —— 用户一眼看出机器人在回谁。
+   *
+   * 注意 @ 只对**群聊/频道**有意义，单聊发 `<@openid>` 会被平台当普通文本。
+   */
+  reply_mention: 'off' | 'group' | 'always'
+
+  /**
    * 是否把当前时间告诉模型。**默认关**。
    *
    * 关的理由：`time.now` 工具已经能取时间，每轮都塞进提示词是重复供养、
@@ -237,6 +251,7 @@ export const defaultConfig: AgentConfig = {
   show_typing: true,
   isolate_sessions: false,
   expose_sender_id: false,
+  reply_mention: 'off' as const,
   expose_datetime: false,
   timezone: 'Asia/Shanghai',
   context_compression: 'truncate',
@@ -347,6 +362,18 @@ export const configSchema = {
         '同一用户在同一台机器人下稳定，换机器人就不同，不能跨机器人识别。' +
         '开了模型才能区分群里不同的人、记住谁说过什么',
       default: defaultConfig.expose_sender_id,
+    },
+    reply_mention: {
+      type: 'string',
+      title: '回复时 @ 说话人',
+      description:
+        '关：不 @（默认，群里不吵）。' +
+        '仅群聊：群聊/频道里 @ 说话人，单聊不 @。' +
+        '总是：所有场景都 @。' +
+        '多人同时提问时 @ 一下，用户能一眼看出机器人在回谁',
+      enum: ['off', 'group', 'always'],
+      enumNames: ['关', '仅群聊', '总是'],
+      default: defaultConfig.reply_mention,
     },
     expose_datetime: {
       type: 'boolean',

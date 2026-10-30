@@ -70,6 +70,7 @@ async function saveScalars() {
     request_timeout_ms: Number($('timeoutMs').value),
     timezone: $('timezone').value,
     context_compression: $('contextCompression').value,
+    reply_mention: $('replyMention').value,
     max_context_tokens: Number($('maxContextTokens').value),
     rate_limit_per_minute: Number($('rateLimit').value),
   }
@@ -226,6 +227,7 @@ function bindEvents() {
   for (const id of [
     'wakePrefix', 'maxSteps', 'maxToolCalls', 'historyLimit',
     'timeoutMs', 'timezone', 'contextCompression', 'maxContextTokens', 'rateLimit',
+    'replyMention',
   ]) {
     $(id).addEventListener('change', () => void saveScalarsSilently())
   }

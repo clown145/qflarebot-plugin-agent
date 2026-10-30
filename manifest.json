@@ -266,6 +266,22 @@
         "description": "提示词里带上说话人的 openid（不是 QQ 号，QQ 机器人接口拿不到真实 QQ 号）。同一用户在同一台机器人下稳定，换机器人就不同，不能跨机器人识别。开了模型才能区分群里不同的人、记住谁说过什么",
         "default": false
       },
+      "reply_mention": {
+        "type": "string",
+        "title": "回复时 @ 说话人",
+        "description": "关：不 @（默认，群里不吵）。仅群聊：群聊/频道里 @ 说话人，单聊不 @。总是：所有场景都 @。多人同时提问时 @ 一下，用户能一眼看出机器人在回谁",
+        "enum": [
+          "off",
+          "group",
+          "always"
+        ],
+        "enumNames": [
+          "关",
+          "仅群聊",
+          "总是"
+        ],
+        "default": "off"
+      },
       "expose_datetime": {
         "type": "boolean",
         "title": "在提示词里带上当前时间",
@@ -403,6 +419,7 @@
     "show_typing": true,
     "isolate_sessions": false,
     "expose_sender_id": false,
+    "reply_mention": "off",
     "expose_datetime": false,
     "timezone": "Asia/Shanghai",
     "context_compression": "truncate",
