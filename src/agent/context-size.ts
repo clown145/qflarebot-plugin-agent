@@ -156,11 +156,25 @@ export function fixMessages(messages: ModelMessage[]): ModelMessage[] {
   // 收尾：最后一组也要结算
   flushIfValid()
 
-  // 2) 保证 system 之后第一条是 user。智谱/Gemini 要求这个形状
+  // 2) 保证 system 之后第一条是 user。智谱/Gemini 要求这个形状。
+  //
+  // **不能把后面第一个 user 提到最前**——那会打乱历史顺序，实测历史被
+  // `history_limit` 截断后形状是 `[assistant, user, assistant]`，
+  // 老写法输出 `user:问题2 / assistant:回答1 / assistant:回答2`：
+  // 「回答1」被摆到了它**不应该回答**的「问题2」后面，模型看到一段答非所问的
+  // 对话，实测会顺着这个错位继续答错。
+  //
+  // 正确修法是**丢掉开头的孤儿 assistant**：历史是从中间截断的，
+  // 这些 assistant 回答的那个 user 已经不在数组里了，它们单独存在对模型没有意义
+  // （留着反而制造错位）。这与 `persona.ts` 的 `finalizeBeginDialogs` 一致：
+  // 那边对开头的 assistant 也是直接丢掉，直到遇到 user。
+  //
+  // 注意人格的 begin_dialogs 不靠这里兜底——`parseBeginDialogs` 已经保证以 user 开头。
   if (fixed.length > 0 && fixed[0]?.role !== 'user') {
-    const firstUser = fixed.find((m) => m.role === 'user')
-    const ordered = firstUser ? [firstUser, ...fixed.filter((m) => m !== firstUser)] : fixed
-    return [...systemPart, ...ordered]
+    const firstUserIndex = fixed.findIndex((m) => m.role === 'user')
+    // 完全没有 user：原样输出（调用方随后会补本轮 user 消息，这里不必强造）
+    if (firstUserIndex < 0) return [...systemPart, ...fixed]
+    return [...systemPart, ...fixed.slice(firstUserIndex)]
   }
 
   return [...systemPart, ...fixed]
@@ -206,6 +220,15 @@ export interface CompactResult {
   /** 被丢掉的轮数。0 表示没压缩 */
   droppedRounds: number
   /**
+   * 被截断的超大工具结果条数。
+   *
+   * 单独的计数，因为**截断不是丢轮**：单轮工具循环里（1 条 user + 一堆 tool 结果）
+   * 一条轮都丢不了（丢了等于删掉本轮问题），只能截断体积。
+   * 调用方（loop.ts）判断「要不要把压缩结果写回去」时必须两个都看：
+   * 只看 `droppedRounds > 0` 会让单轮截断的结果被静默丢弃。
+   */
+  truncatedToolResults: number
+  /**
    * 被丢掉的那些轮（按原顺序，展平成消息）。
    *
    * `summary` 模式要拿它去生成摘要——**丢弃的内容不该凭空消失**，
@@ -217,6 +240,57 @@ export interface CompactResult {
   tokensBefore: number
   /** 压缩后估算 */
   tokensAfter: number
+}
+
+/**
+ * 单条工具结果超过这个 token 估算就截断。
+ *
+ * 为什么卡在这个量级：一次 run 最多 12 个工具调用（`max_tool_calls` 默认值），
+ * 每个都留 2000 token 就是 24k，已经超过默认阈值 `max_context_tokens: 12000`。
+ * 但截断得太狠会让模型看不到关键字段（搜索结果、HTTP 响应体往往前面是正文、
+ * 后面是噪声），所以保留头部 + 尾部，中间的省略号明确告诉模型「被截断了」。
+ */
+const TOOL_RESULT_TOKEN_LIMIT = 2_000
+
+/** 截断时保留的头部/尾部比例（头 70%、尾 20%，中间省略 10%） */
+const TOOL_RESULT_HEAD_RATIO = 0.7
+const TOOL_RESULT_TAIL_RATIO = 0.2
+
+/**
+ * 把超大的工具结果截断到 `TOOL_RESULT_TOKEN_LIMIT` 以内。
+ *
+ * **只动 `tool` 消息的 content，不删消息、不动 toolCalls**：
+ * 删掉 tool 消息会拆散 `tool_call` / `tool_result` 配对，上游直接 400
+ * （Gemini 尤其严格），而截断内容对协议完全合法。
+ *
+ * 返回新数组（不改入参）：调用方拿到的 messages 可能还有别的引用。
+ */
+export function truncateOversizedToolResults(
+  messages: ModelMessage[],
+  limitTokens = TOOL_RESULT_TOKEN_LIMIT,
+): { messages: ModelMessage[]; truncated: number } {
+  let truncated = 0
+  const out = messages.map((message) => {
+    if (message.role !== 'tool') return message
+    if (estimateTextTokens(message.content) <= limitTokens) return message
+
+    // 按 token 估算反推字符预算：CJK 0.6/字、其它 0.3/字符。
+    // 这里直接按「最坏情况」估：保守地多截一点没关系，多留一次请求可能就超上下文
+    const chars = Math.max(256, Math.ceil(limitTokens / 0.6))
+    const head = Math.floor(chars * TOOL_RESULT_HEAD_RATIO)
+    const tail = Math.floor(chars * TOOL_RESULT_TAIL_RATIO)
+    const content = message.content
+    const omitted = content.length - head - tail
+    truncated += 1
+    return {
+      ...message,
+      content:
+        `${content.slice(0, head)}\n\n…（工具结果过长，已省略中间的 ${omitted} 个字符；` +
+        `如需完整内容请缩小查询范围后重试）…\n\n` +
+        content.slice(content.length - tail),
+    }
+  })
+  return { messages: out, truncated }
 }
 
 /**
@@ -242,6 +316,7 @@ export function compactMessages(
   const none = (): CompactResult => ({
     messages,
     droppedRounds: 0,
+    truncatedToolResults: 0,
     droppedMessages: [],
     tokensBefore,
     tokensAfter: tokensBefore,
@@ -250,8 +325,31 @@ export function compactMessages(
   if (totalBefore <= options.maxTokens) return none()
 
   const rounds = splitIntoRounds(messages)
-  // 只有一轮时不能丢——否则等于把本轮问题删了
-  if (rounds.length <= 1) return none()
+
+  // 只有一轮时**不能丢轮**——丢了等于把本轮问题删了。
+  //
+  // 但「不丢轮」不等于「不压缩」：一次 run 里模型可以连着调十几个工具，
+  // 每个结果都塞进 messages，全都属于同一轮。实测 1 条 user + 6 个巨大的
+  // tool 结果 ≈ 72,063 token，而 maxTokens=1000，droppedRounds 却是 0——
+  // 压缩形同虚设，下一次模型调用直接超上下文。
+  //
+  // 所以单轮时改为**截断超大的 tool 结果**：不删消息、不动 toolCalls，
+  // 配对结构不变（不拆散成对），只是把每条 tool content 压到上限内。
+  if (rounds.length <= 1) {
+    const { messages: truncatedMessages, truncated } = truncateOversizedToolResults(messages)
+    if (truncated === 0) return none()
+    const truncatedAfter = estimateMessagesTokens(truncatedMessages)
+    // 极端情况：截断后仍然超阈值（消息太多）。此时也没法再做什么——
+    // 丢轮会丢问题、丢 tool 会破坏配对，只能交给调用方的 max_model_steps 兜住
+    return {
+      messages: truncatedMessages,
+      droppedRounds: 0,
+      truncatedToolResults: truncated,
+      droppedMessages: [],
+      tokensBefore,
+      tokensAfter: truncatedAfter,
+    }
+  }
 
   let dropped = 0
   let kept = rounds
@@ -269,13 +367,18 @@ export function compactMessages(
 
   if (dropped === 0) return none()
 
+  // 丢完轮再截断剩下的超大工具结果：丢轮和截断是两件事，
+  // 只丢轮可能仍然不够（最后一轮自己就超阈值），配合起来才真的能压住
+  const keptMessages = kept.flatMap((round) => round.messages)
+  const { messages: truncatedMessages, truncated } = truncateOversizedToolResults(keptMessages)
+  const compacted = fixMessages(truncatedMessages)
   const droppedMessages = rounds
     .slice(0, dropped)
     .flatMap((round) => round.messages)
-  const compacted = fixMessages(kept.flatMap((round) => round.messages))
   return {
     messages: compacted,
     droppedRounds: dropped,
+    truncatedToolResults: truncated,
     droppedMessages,
     tokensBefore,
     tokensAfter: estimateMessagesTokens(compacted),

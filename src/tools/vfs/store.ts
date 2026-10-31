@@ -90,16 +90,23 @@ export function createVfsWorkspace(db: PluginDB, r2?: ScopedR2): VfsWorkspace { 
       }
 
       await ensureParentDirs(db, path)
+      // **必须写 parent**：`listDir()` 是按 `WHERE parent = ?` 查的，不写这一列
+      // 文件就会挂到表默认值 '/' 下面，于是写完 `/notes/a.md` 再 `listDir('/notes')`
+      // 永远是空——只有父目录那一行（由 ensureParentDirs 写入）是对的。
+      // ON CONFLICT 里也更新 parent：老库里的脏行（parent 全是 '/'）被覆盖时顺手修好。
       await db.run(
-        `INSERT INTO {vfs_entries} (path, name, kind, size, r2_key, content, updated_at)
-         VALUES (?, ?, 'file', ?, ?, ?, ?)
+        `INSERT INTO {vfs_entries} (path, name, parent, kind, size, r2_key, content, updated_at)
+         VALUES (?, ?, ?, 'file', ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
+           name = excluded.name,
+           parent = excluded.parent,
            size = excluded.size,
            r2_key = excluded.r2_key,
            content = excluded.content,
            updated_at = excluded.updated_at`,
         path,
         childName(path),
+        parentPath(path),
         size,
         r2Key,
         r2Key ? null : content,
@@ -153,11 +160,16 @@ export function createVfsWorkspace(db: PluginDB, r2?: ScopedR2): VfsWorkspace { 
       const path = normalizeVfsPath(rawPath)
       if (path === '/') throw new Error('不能删除根目录')
 
-      // 先查出要删的所有路径（自己 + 后代），才能一并清 R2 对象
+      // 先查出要删的所有路径（自己 + 后代），才能一并清 R2 对象。
+      //
+      // LIKE 必须转义：路径里的 `_` 是 SQL 通配符（`/my_notes` 会匹配 `/myxnotes`），
+      // `%` 更是能匹配一切。search() 一直是转义的，这里以前漏了——于是
+      // `remove('/my_notes')` 会把 `/myxnotes/b.md` 一起删掉。
+      const pattern = descendantLikePattern(path)
       const rows = await db.all<{ path: string; r2_key: string | null }>(
-        `SELECT path, r2_key FROM {vfs_entries} WHERE path = ? OR path LIKE ?`,
+        `SELECT path, r2_key FROM {vfs_entries} WHERE path = ? OR path LIKE ? ESCAPE '\\'`,
         path,
-        `${path}/%`,
+        pattern,
       )
       // 目录本身可能没有 entry（写入时只建了父级），但它的子项存在时也要算删成功
       if (rows.length === 0) return false
@@ -165,7 +177,11 @@ export function createVfsWorkspace(db: PluginDB, r2?: ScopedR2): VfsWorkspace { 
       const r2Keys = rows.map((r) => r.r2_key).filter((k): k is string => Boolean(k))
       if (r2Keys.length && r2) await r2.delete(r2Keys)
 
-      await db.run(`DELETE FROM {vfs_entries} WHERE path = ? OR path LIKE ?`, path, `${path}/%`)
+      await db.run(
+        `DELETE FROM {vfs_entries} WHERE path = ? OR path LIKE ? ESCAPE '\\'`,
+        path,
+        pattern,
+      )
       return true
     },
 
@@ -196,11 +212,14 @@ export function createVfsWorkspace(db: PluginDB, r2?: ScopedR2): VfsWorkspace { 
       // 目录：连后代一起改前缀。先查出来，改 R2 key 时需要知道旧的
       // 用与 remove() 相同的查询形状（`path = ? OR path LIKE ?`）：
       // 真实 D1 上纯 `LIKE` 也能跑，但语义上这里要的是「自己 + 后代」，
-      // 写成同一个形状既不依赖实现细节，也和删除逻辑保持一致
+      // 写成同一个形状既不依赖实现细节，也和删除逻辑保持一致。
+      // LIKE 同样要转义（见 remove 的注释）：不然 `move('/my_notes', …)` 会把
+      // `/myxnotes` 的子树也当成自己的后代改掉路径。
+      const pattern = descendantLikePattern(from)
       const subtree = await db.all<{ path: string; r2_key: string | null }>(
-        `SELECT path, r2_key FROM {vfs_entries} WHERE path = ? OR path LIKE ?`,
+        `SELECT path, r2_key FROM {vfs_entries} WHERE path = ? OR path LIKE ? ESCAPE '\\'`,
         from,
-        `${from}/%`,
+        pattern,
       )
       const descendants = subtree.filter((row) => row.path !== from)
 
@@ -231,11 +250,15 @@ export function createVfsWorkspace(db: PluginDB, r2?: ScopedR2): VfsWorkspace { 
       // 但语义上已经属于一个不存在的父目录；先改后代能让每一步都基于
       // 仍然自洽的状态。真实 D1 两种顺序都能跑通，但测试里的内存实现
       // 和「先改父再改子」的直觉容易冲突，统一成这个顺序更省心。
+      //
+      // **parent 必须一起改**：`listDir()` 按 `WHERE parent = ?` 查，只改 path
+      // 不改 parent 的话，移完的文件会从新目录里消失（它的 parent 还指向老目录）。
       for (const row of descendants) {
         const newPath = to + row.path.slice(from.length)
         await db.run(
-          `UPDATE {vfs_entries} SET path = ?, r2_key = ?, updated_at = ? WHERE path = ?`,
+          `UPDATE {vfs_entries} SET path = ?, parent = ?, r2_key = ?, updated_at = ? WHERE path = ?`,
           newPath,
+          parentPath(newPath),
           row.r2_key ? `vfs${newPath}` : null,
           Date.now(),
           row.path,
@@ -243,9 +266,10 @@ export function createVfsWorkspace(db: PluginDB, r2?: ScopedR2): VfsWorkspace { 
       }
 
       await db.run(
-        `UPDATE {vfs_entries} SET path = ?, name = ?, r2_key = ?, updated_at = ? WHERE path = ?`,
+        `UPDATE {vfs_entries} SET path = ?, name = ?, parent = ?, r2_key = ?, updated_at = ? WHERE path = ?`,
         to,
         childName(to),
+        parentPath(to),
         source.r2Key ? `vfs${to}` : null,
         Date.now(),
         from,
@@ -297,6 +321,23 @@ async function readFromR2(r2: ScopedR2, key: string): Promise<string> {
   const text = await r2.getText(key)
   if (text === null) throw new Error(`文件内容丢失：${key}`)
   return text
+}
+
+/**
+ * 拼「某个路径的所有后代」的 LIKE 模式（`/dir` → `/dir/%`），并转义路径里的
+ * LIKE 元字符。
+ *
+ * 为什么必须转义：
+ * - `_` 在 LIKE 里匹配任意单字符，`remove('/my_notes')` 会连带删掉 `/myxnotes/`；
+ * - `%` 匹配任意串，用户目录名里带 `%` 时会扩散到整个库。
+ *
+ * 配合 SQL 里的 `ESCAPE '\\'` 使用（SQL 字符串里 `\\` 是一个反斜杠）。
+ * 顺序上必须先转义 `\` 再转义 `%`/`_`：一次性 replace 的回调写法不会重复转义，
+ * 且结果与逐个替换等价。
+ */
+export function descendantLikePattern(path: string): string {
+  const escaped = path.replace(/[%_\\]/g, (char) => `\\${char}`)
+  return `${escaped}/%`
 }
 
 /** 逐级创建父目录。路径段数通常很少，一次 run 也就几层 */

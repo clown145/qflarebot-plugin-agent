@@ -40,6 +40,7 @@ import { hydrateImageAttachments } from './agent/media.js'
 import { withMention, type MentionMode } from './agent/mention.js'
 import { BLOCKED_REPLY, checkContent, parseKeywords } from './agent/safety.js'
 import { SCHEMA_STATEMENTS } from './store/schema.js'
+import { ensureColumnMigrations } from './store/migrate.js'
 import {
   advanceSchedule,
   cancelSchedule,
@@ -577,13 +578,23 @@ export default definePlugin<AgentConfig>({
   routes: createPageRoutes(),
 })
 
-/** 建表。全部是 IF NOT EXISTS，重复执行安全（onInstall 与 onBoot 共用） */
+/**
+ * 建表 + 补列。重复执行安全（onInstall 与 onBoot 共用）。
+ *
+ * 两步分工：
+ * - `SCHEMA_STATEMENTS` 全是 `CREATE TABLE IF NOT EXISTS`，**只能建缺失的表**。
+ *   老库里表已经存在时会整条跳过，于是后来新增的**列**永远建不出来
+ *   （典型后果：老部署升级后 `{tool_settings}` 缺 `config_json`，保存搜索 Key 直接 500）。
+ * - `ensureColumnMigrations` 负责那些列：`SELECT <col> … LIMIT 0` 探测 + `ALTER TABLE ADD COLUMN`。
+ *   不能用 `PRAGMA table_info` —— 框架的 sqlScope 把 PRAGMA 列为 BANNED，插件执行会直接抛错。
+ */
 let schemaReady = false
 async function ensureSchema(ctx: PluginContext<AgentConfig>): Promise<void> {
   if (schemaReady) return
   for (const statement of SCHEMA_STATEMENTS) {
     await ctx.db.exec(statement)
   }
+  await ensureColumnMigrations(ctx.db, ctx.logger)
   schemaReady = true
 }
 

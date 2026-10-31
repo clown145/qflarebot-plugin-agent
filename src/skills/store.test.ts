@@ -1,5 +1,4 @@
-import { describe, expect, it } from 'vitest'
-import type { PluginDB } from '@qqbot/sdk'
+import { afterAll, describe, expect, it } from 'vitest'
 import {
   MAX_SKILL_BYTES,
   SKILLS_SCHEMA,
@@ -9,44 +8,32 @@ import {
   listSkills,
   upsertSkill,
 } from './store.js'
+import { createTestDb } from '../store/sqlite-test-db.js'
 
 /**
- * 内存版 D1：只实现 `{skills}` 需要的那几条语句。
+ * 测试用 db：**真实 SQLite（Node 22 内置 `node:sqlite`）**，不再是手写内存假件。
  *
- * 用内存实现而不是「记录 SQL 的假 db」，是因为这里要验的是**读回来对不对**
- * （upsert → get/list 的数据形状），只断言 SQL 字符串证明不了这一点。
+ * 为什么换：手写假件会自己实现「应该有的行为」——vfs 那边就因此把两个真实 SQL bug
+ * （INSERT 少写 parent、LIKE 少 ESCAPE）掩盖了整整一版。`{skills}` 用到的 SQL
+ * 虽然简单（UPSERT / ORDER BY / DELETE），但 UPSERT 的 `excluded.*`、`ORDER BY id`
+ * 的排序规则、`NOT NULL` 约束都只有真实 SQLite 才能验证。
+ *
+ * `createTestDb` 复刻线上的 SQL 规则（`{表名}` 展开、PRAGMA 被拒），
+ * 所以这里写的 SQL 与线上走的是同一套检查。
  */
-function memoryDb(): PluginDB {
-  const rows = new Map<string, { id: string; name: string; description: string; body: string; updated_at: number }>()
 
-  return {
-    async run(sql: string, ...params: unknown[]) {
-      if (sql.includes('INSERT INTO {skills}')) {
-        const [id, name, description, body, updatedAt] = params as [string, string, string, string, number]
-        rows.set(id, { id, name, description, body, updated_at: updatedAt })
-        return { changes: 1 }
-      }
-      if (sql.includes('DELETE FROM {skills}')) {
-        return { changes: rows.delete(params[0] as string) ? 1 : 0 }
-      }
-      return { changes: 0 }
-    },
-    async all<T>(sql: string, ...params: unknown[]) {
-      if (!sql.includes('FROM {skills}')) return []
-      const limit = typeof params[0] === 'number' ? params[0] : 100
-      return [...rows.values()]
-        .sort((left, right) => left.id.localeCompare(right.id))
-        .slice(0, limit)
-        .map((row) => ({ id: row.id, name: row.name, description: row.description })) as T[]
-    },
-    async first<T>(sql: string, ...params: unknown[]) {
-      if (!sql.includes('FROM {skills}')) return null
-      return (rows.get(params[0] as string) ?? null) as T | null
-    },
-    async exec() {},
-    table: (name: string) => `p_agent_${name}`,
-  } as unknown as PluginDB
+/** 已创建的测试库，测试结束时统一关掉（node:sqlite 是原生句柄） */
+const openDbs: Array<ReturnType<typeof createTestDb>> = []
+
+function memoryDb(): ReturnType<typeof createTestDb>['db'] {
+  const t = createTestDb()
+  openDbs.push(t)
+  return t.db
 }
+
+afterAll(() => {
+  for (const t of openDbs) t.close()
+})
 
 function markdown(overrides: { name?: string; description?: string; body?: string } = {}): string {
   return [

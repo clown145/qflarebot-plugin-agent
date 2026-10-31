@@ -37,6 +37,9 @@ interface CancelInput {
 
 const MAX_DELAY_SECONDS = 365 * 24 * 3600
 
+/** 重复间隔的下限（秒）。与 inputSchema 的 `minimum: 60` 必须一致 */
+const MIN_REPEAT_SECONDS = 60
+
 export function createScheduleTools(): RegisteredTool[] {
   return [createScheduleTool(), listSchedulesTool(), cancelScheduleTool()]
 }
@@ -103,6 +106,32 @@ function createScheduleTool(): RegisteredTool {
         return fail('bad_request', 'delay_seconds 与 at 必须给一个')
       }
 
+      // repeat_seconds 的**运行时**校验。
+      //
+      // 为什么不能只靠 inputSchema：`minimum: 60` 只是给模型看的提示，
+      // 全仓没有任何 JSON Schema 校验器（没装 ajv/zod），模型照样能传 0 / -60 / 0.001。
+      // 而 repeat_seconds 极小时 `advanceSchedule` 的推进循环会真死循环
+      // （见 store/d1.ts 的注释），一次 cron 拖死整个 invocation 里所有插件的定时任务。
+      // 存储层也有兜底（管住库里已有的坏数据），这里是第一道防线：
+      // 明确拒绝比「安静地存一个坏值」好得多。
+      let repeatSeconds: number | undefined
+      if (parsed.repeat_seconds !== undefined && parsed.repeat_seconds !== null) {
+        const value = parsed.repeat_seconds
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+          return fail('bad_request', 'repeat_seconds 必须是数字')
+        }
+        if (!Number.isInteger(value)) {
+          return fail('bad_request', 'repeat_seconds 必须是整数秒')
+        }
+        if (value < MIN_REPEAT_SECONDS) {
+          return fail('bad_request', `重复间隔不能少于 ${MIN_REPEAT_SECONDS} 秒`)
+        }
+        if (value > MAX_DELAY_SECONDS) {
+          return fail('bad_request', '重复间隔不能超过一年')
+        }
+        repeatSeconds = value
+      }
+
       const id = crypto.randomUUID()
       await createSchedule(context.db, {
         id,
@@ -111,7 +140,7 @@ function createScheduleTool(): RegisteredTool {
         targetId: context.targetId,
         prompt: parsed.prompt.trim(),
         dueAt,
-        ...(parsed.repeat_seconds ? { repeatSeconds: parsed.repeat_seconds } : {}),
+        ...(repeatSeconds !== undefined ? { repeatSeconds } : {}),
         createdBy: context.actorId,
       })
 
@@ -121,7 +150,7 @@ function createScheduleTool(): RegisteredTool {
           id,
           dueAt: new Date(dueAt).toISOString(),
           dueAtLocal: formatLocal(dueAt, context.timezone),
-          repeatSeconds: parsed.repeat_seconds ?? null,
+          repeatSeconds: repeatSeconds ?? null,
         },
       }
     },

@@ -99,22 +99,110 @@ export async function listAllSchedules(db: PluginDB, limit = 50): Promise<Schedu
   )
 }
 
+/** 重复任务的最小间隔（秒）。与 `schedule.ts` 的 inputSchema minimum 一致 */
+export const MIN_REPEAT_SECONDS = 60
+
+/**
+ * 重复间隔是否可用。
+ *
+ * 为什么要在存储层再判一次：`schedule.create` 的 `inputSchema.minimum: 60`
+ * **只是给模型看的提示**，运行时从来没有校验器（全仓没有 ajv/zod）。
+ * 更关键的是**库里的旧数据**：v0.2.0 之前的版本接受 `repeat_seconds: 0` / `-60` /
+ * 小数（实测全被接受），这些行已经躺在 D1 里了。修好工具入口并不能修好它们。
+ */
+export function isUsableRepeatSeconds(value: number | null | undefined): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= MIN_REPEAT_SECONDS &&
+    // 上限一年，与 schedule.ts 的 MAX_DELAY_SECONDS 对齐：再大也没有意义，
+    // 而且极端值容易在推进时算出离谱的 due_at
+    value <= 365 * 24 * 3600
+  )
+}
+
+/**
+ * 算重复任务的下一次到期时间。**纯函数、O(1)、永不循环。**
+ *
+ * ## 为什么必须在这里做死循环防御（不能只在 schedule.ts 加校验）
+ *
+ * 原实现是：
+ *
+ * ```ts
+ * while (nextDue <= ranAt) nextDue += row.repeat_seconds * 1000
+ * ```
+ *
+ * 两种情况会把它变成**真死循环**（不是「很慢」，是永不退出：事件循环被占死，
+ * 连 `setTimeout` 回调都跑不了，一次 cron 会拖死同一个 invocation 里所有插件的
+ * 定时任务，Worker 直接超 CPU 时间）：
+ *
+ * 1. **步长小于 double 的 ULP 时，加法完全不改变数值**。时间戳是 ~1.79e12 ms，
+ *    double 在该量级的 ULP ≈ 0.000244 ms，所以 `repeat_seconds <= 2.4e-7`
+ *    时 `nextDue += step` 是恒等操作 → 条件永远为真，**真·无限循环**（实测枚举确认）；
+ * 2. **步长只是「很小」而没到 ULP 时，是实质挂死**：`repeat_seconds = 0.001`
+ *    要 6 万次迭代、`1e-6` 要 6000 万次（实测 500 万次迭代后仍未退出）。
+ *
+ * 注意 `repeat_seconds === 0` 在原代码里走不到这个循环（`if (row.repeat_seconds
+ * && row.repeat_seconds > 0)` 为假 → 标 done）。但那是幸运而不是防御：
+ * 一旦有人放开那个 `> 0` 判断、或数据以 `1e-9` 之类的形式进来，同一个 bug 立刻复现。
+ * 所以这里对「所有不合法的间隔」统一处理，不依赖上游那个 truthy 判断。
+ *
+ * 两种写入路径都能造出这种行：
+ * - `schedule.create` 的 `inputSchema.minimum: 60` **只是给模型看的**，
+ *   全仓没有 JSON Schema 校验器，旧版本接受 `0` / `-60` / `0.001`（实测全通过）；
+ * - 手工改库、或以后别处加了写入路径。
+ *
+ * 而**库里的旧数据修不回来**：修好工具入口只能挡住新写入，已经存进去的坏行
+ * 会让每次 cron 都撞上。所以存储层必须自己兜底。
+ *
+ * 兜底策略是「不可用就停」而不是「抛错」：抛错会让同一批 cron 里后面的任务
+ * 也跑不掉，而标成 `done` 至少让这个坏行不再被扫到、也会留下可查痕迹。
+ *
+ * 顺带把 `while` 换成算术：即使间隔合法，「离线一年 + 60 秒间隔」也是 52.5 万次
+ * 迭代，在免费版 CPU 预算下不可接受。`nextDue = due_at + k*step`，k 是使
+ * `due_at + k*step > ranAt` 的最小正整数，与逐次累加结果等价。
+ *
+ * @returns 下一次到期时间；`null` 表示这行不该继续重复（调用方应标 done）
+ */
+export function nextDueAt(
+  dueAt: number,
+  repeatSeconds: number | null | undefined,
+  ranAt: number,
+): number | null {
+  if (!isUsableRepeatSeconds(repeatSeconds)) return null
+
+  const step = repeatSeconds * 1000
+  const elapsed = ranAt - dueAt
+  const skips = elapsed <= 0 ? 1 : Math.floor(elapsed / step) + 1
+  let next = dueAt + skips * step
+  // 浮点兜底：间隔是整数秒、时间戳也是整数，理论上不会走到这里；
+  // 但一旦算出「不在将来」的值，下一轮 cron 会立刻再跑一次，所以硬保证推进
+  if (!(next > ranAt)) next = ranAt + step
+  return next
+}
+
 /**
  * 任务跑完后的推进。
  *
  * 单次任务标成 done；重复任务把 due_at 往后推。
  * 这里用 `WHERE status = 'active'` 做一层乐观锁：cron 有并发时只有一个能推进成功，
  * 避免同一个任务被跑两次。
+ *
+ * 间隔不可用（库里已有的坏行）时标 done 而不是抛错——理由见 `nextDueAt` 的注释。
  */
 export async function advanceSchedule(
   db: PluginDB,
   row: ScheduleRow,
   ranAt: number,
 ): Promise<void> {
-  if (row.repeat_seconds && row.repeat_seconds > 0) {
-    // 跳过已经错过的周期：机器人离线一段时间后，重复任务不该补跑几十次
-    let nextDue = row.due_at + row.repeat_seconds * 1000
-    while (nextDue <= ranAt) nextDue += row.repeat_seconds * 1000
+  // 一次性任务（repeat_seconds 为 null）走 done 分支；
+  // 重复任务但间隔坏了，也走 done 分支（停下来，别让 cron 每轮都撞它）
+  const nextDue =
+    row.repeat_seconds === null || row.repeat_seconds === undefined
+      ? null
+      : nextDueAt(row.due_at, row.repeat_seconds, ranAt)
+
+  if (nextDue !== null) {
     await db.run(
       `UPDATE {schedules} SET due_at = ?, last_run_at = ?
        WHERE id = ? AND status = 'active'`,

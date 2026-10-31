@@ -161,7 +161,11 @@ describe('fixMessages', () => {
     ]
     const fixed = fixMessages(input)
     expect(fixed[1]?.role).toBe('user')
-    expect(fixed[2]?.role).toBe('assistant')
+    // 开头的孤儿 assistant 被丢掉（它的提问不在数组里，留着会制造错位）。
+    // 以前这里期望 fixed[2] 是那条开场白——那正是「把 user 提到最前」的旧行为，
+    // 会让回答落到错误的问题后面（见下面「保持历史时间顺序」的用例）。
+    expect(fixed).toHaveLength(2)
+    expect(fixed[1]).toEqual(user('你好'))
   })
 
   it('空数组原样返回', () => {
@@ -367,5 +371,224 @@ describe('摘要消息的构造', () => {
     expect(content).toContain('看图')
     expect(content).toContain('[图片]')
     expect(content).not.toContain('AAAAAAAA')
+  })
+})
+
+/**
+ * P1 回归：`fixMessages` 把后面第一个 user 提到最前，**打乱历史顺序**。
+ *
+ * 触发条件很常见：`history_limit` 把历史从中间截断，剩下的第一条是 assistant。
+ * 老实现的输出是 `user:问题2 / assistant:回答1 / assistant:回答2`——
+ * 「回答1」出现在「问题2」之后，模型看到的是答非所问的对话，实测就会跟着答错。
+ *
+ * 正确做法：保留「第一条非 system 是 user」这个 provider 硬要求，
+ * 但只把**开头那几个 assistant**（开场白/截断残留）挪到第一个 user 之后，
+ * 而不是把 user 提到最前。
+ */
+describe('fixMessages 保持历史时间顺序', () => {
+  it('开头是 assistant 时，不能把后面的 user 提前', () => {
+    const input: ModelMessage[] = [
+      assistant('回答1'),
+      user('问题2'),
+      assistant('回答2'),
+    ]
+    const fixed = fixMessages(input)
+    // 第一问已经随截断丢失的「回答1」必须被丢掉，而不是留在数组里制造错位
+    expect(fixed.map((m) => m.role)).toEqual(['user', 'assistant'])
+    expect(fixed[0]).toEqual(user('问题2'))
+    expect(fixed[1]).toEqual(assistant('回答2'))
+  })
+
+  it('历史被截成 [assistant, user, assistant] 时，问答仍然相邻且顺序正确', () => {
+    const input: ModelMessage[] = [
+      assistant('答：北京晴'),
+      user('上海呢'),
+      assistant('答：上海雨'),
+    ]
+    const fixed = fixMessages(input)
+    // 关键：不能出现「上海呢 → 北京晴」这种错位
+    const userIndex = fixed.findIndex((m) => m.role === 'user')
+    expect(userIndex).toBe(0)
+    expect(fixed[userIndex + 1]).toEqual(assistant('答：上海雨'))
+    expect(fixed.at(-1)).toEqual(assistant('答：上海雨'))
+  })
+
+  it('system 段仍在最前，且 system 后的第一条是 user', () => {
+    const input: ModelMessage[] = [
+      { role: 'system', content: 'sys' },
+      assistant('开场白'),
+      user('你好'),
+      assistant('喵'),
+    ]
+    const fixed = fixMessages(input)
+    expect(fixed[0]).toEqual({ role: 'system', content: 'sys' })
+    expect(fixed[1]?.role).toBe('user')
+    expect(fixed[1]).toEqual(user('你好'))
+  })
+
+  it('开头多条 assistant 全部丢掉，直到遇到 user', () => {
+    const input: ModelMessage[] = [
+      assistant('开场1'),
+      assistant('开场2'),
+      user('问题'),
+      assistant('回答'),
+    ]
+    const fixed = fixMessages(input)
+    expect(fixed).toEqual([user('问题'), assistant('回答')])
+  })
+
+  it('开头是 user 时顺序完全不变（不做任何搬运）', () => {
+    const input: ModelMessage[] = [user('问'), assistant('答'), user('问2'), assistant('答2')]
+    expect(fixMessages(input)).toEqual(input)
+  })
+
+  it('完全没有 user 时原样输出，不凭空造一条', () => {
+    const input: ModelMessage[] = [assistant('只有开场白')]
+    expect(fixMessages(input)).toEqual(input)
+  })
+
+  it('本轮消息不会被打乱：历史后接一条本轮 user，它必须留在最后', () => {
+    const input: ModelMessage[] = [
+      assistant('历史里的回答'),
+      user('历史里的问题'),
+      assistant('历史里的回答2'),
+      user('本轮问题'),
+    ]
+    const fixed = fixMessages(input)
+    expect(fixed.at(-1)).toEqual(user('本轮问题'))
+    // 丢掉开头的孤儿 assistant 之后，历史内部顺序原样保留：
+    // 问题 → 它自己的回答2 → 本轮问题（顺序不能像旧实现那样被打乱）
+    expect(fixed).toEqual([
+      user('历史里的问题'),
+      assistant('历史里的回答2'),
+      user('本轮问题'),
+    ])
+  })
+})
+
+/**
+ * 单轮工具循环里的压缩。
+ *
+ * `rounds.length <= 1` 时老实现直接 `return none()`——一次 run 里模型可以连着调
+ * 十几个工具，全都属于同一轮，于是**一条轮都丢不了、压缩彻底失效**。
+ * 实测：1 条 user + 6 个巨大 tool 结果 ≈ 72,063 token，maxTokens=1000，
+ * droppedRounds 仍然是 0，下一次模型调用直接超上下文。
+ *
+ * 修法：单轮时**截断超大工具结果**，不删消息、不动 toolCalls——
+ * 删 tool 消息会拆散 tool_call/tool_result 配对，上游直接 400。
+ */
+describe('单轮工具循环的压缩（截断超大工具结果）', () => {
+  /** 造一轮：1 条 user + n 组 (assistant.toolCalls + tool 结果) */
+  function singleRoundWithBigResults(count: number, size: number): ModelMessage[] {
+    const messages: ModelMessage[] = [user('帮我查一下这些接口')]
+    for (let i = 0; i < count; i += 1) {
+      messages.push(assistantWithCalls([`c${i}`]))
+      messages.push(toolResult(`c${i}`, 'x'.repeat(size)))
+    }
+    return messages
+  }
+
+  it('单轮 + 6 个巨大工具结果：压缩后 token 显著下降', () => {
+    const messages = singleRoundWithBigResults(6, 120_000)
+    const before = estimateMessagesTokens(messages)
+    // 前提：确实远超阈值
+    expect(before).toBeGreaterThan(50_000)
+
+    const result = compactMessages(messages, { maxTokens: 1_000 })
+
+    expect(result.droppedRounds).toBe(0) // 一轮都不能丢
+    expect(result.truncatedToolResults).toBe(6) // 六条都截了
+    expect(result.tokensAfter).toBeLessThan(before / 10)
+  })
+
+  it('截断后 tool_call / tool_result 仍然成对（不能拆散）', () => {
+    const messages = singleRoundWithBigResults(4, 50_000)
+    const result = compactMessages(messages, { maxTokens: 500 })
+
+    // 每条 tool 消息前面必须是一条带 toolCalls 的 assistant，且 id 对得上
+    for (let i = 0; i < result.messages.length; i += 1) {
+      const message = result.messages[i]
+      if (message?.role !== 'tool') continue
+      const prev = result.messages[i - 1]
+      expect(prev?.role).toBe('assistant')
+      expect(prev && 'toolCalls' in prev ? prev.toolCalls?.[0]?.id : undefined).toBe(
+        message.toolCallId,
+      )
+    }
+    // 条数不变：截断内容，不删消息
+    expect(result.messages).toHaveLength(messages.length)
+    // 本轮用户消息还在
+    expect(result.messages[0]).toEqual(user('帮我查一下这些接口'))
+  })
+
+  it('截断后的工具结果带「已省略」提示，模型知道内容不完整', () => {
+    const messages = singleRoundWithBigResults(1, 100_000)
+    const result = compactMessages(messages, { maxTokens: 100 })
+    const toolMessage = result.messages.find((m) => m.role === 'tool')
+    expect(toolMessage).toBeDefined()
+    const content = toolMessage && 'content' in toolMessage ? toolMessage.content : ''
+    expect(content).toContain('已省略')
+    // 头尾都要保留：正文开头和结尾的字段往往是关键信息
+    expect(content.length).toBeGreaterThan(1_000)
+  })
+
+  it('小工具结果不动（没超限就别截）', () => {
+    const messages = singleRoundWithBigResults(2, 100)
+    const result = compactMessages(messages, { maxTokens: 1 })
+    // 一条轮也丢不了、tool 结果也没超限 → 什么都不做
+    expect(result.droppedRounds).toBe(0)
+    expect(result.truncatedToolResults).toBe(0)
+    expect(result.messages).toBe(messages) // 原样返回，不做无谓拷贝
+  })
+
+  it('未超阈值时完全不碰消息', () => {
+    const messages = singleRoundWithBigResults(3, 100_000)
+    const result = compactMessages(messages, { maxTokens: 10_000_000 })
+    expect(result.truncatedToolResults).toBe(0)
+    expect(result.messages).toBe(messages)
+  })
+
+  it('多轮场景下，丢轮之后仍然截断剩下的超大结果', () => {
+    const long = '历史'.repeat(2000)
+    const messages: ModelMessage[] = [
+      user(`第一问${long}`),
+      assistant(`第一答${long}`),
+      user('第二问'),
+      assistantWithCalls(['c1']),
+      toolResult('c1', 'y'.repeat(200_000)),
+    ]
+    const result = compactMessages(messages, { maxTokens: 100 })
+    expect(result.droppedRounds).toBeGreaterThan(0)
+    // 丢轮之后最后一轮自己就超大，所以还要截断
+    expect(result.truncatedToolResults).toBeGreaterThan(0)
+    expect(result.tokensAfter).toBeLessThan(result.tokensBefore / 10)
+    // 配对仍合法
+    for (let i = 0; i < result.messages.length; i += 1) {
+      if (result.messages[i]?.role === 'tool') {
+        expect(result.messages[i - 1]?.role).toBe('assistant')
+      }
+    }
+  })
+
+  it('截断是纯函数：不改入参的消息对象', () => {
+    const messages = singleRoundWithBigResults(2, 100_000)
+    const originalContent = String(
+      (messages[2] as { content: string }).content,
+    )
+    compactMessages(messages, { maxTokens: 100 })
+    expect((messages[2] as { content: string }).content).toBe(originalContent)
+  })
+
+  it('极端情况：截断后仍超阈值也不会丢轮或破坏配对', () => {
+    // 500 组工具调用，即使每条截到 2000 token 也还是超阈值
+    const messages = singleRoundWithBigResults(50, 20_000)
+    const result = compactMessages(messages, { maxTokens: 1_000 })
+    expect(result.droppedRounds).toBe(0)
+    expect(result.messages).toHaveLength(messages.length)
+    for (let i = 0; i < result.messages.length; i += 1) {
+      if (result.messages[i]?.role === 'tool') {
+        expect(result.messages[i - 1]?.role).toBe('assistant')
+      }
+    }
   })
 })
