@@ -280,9 +280,10 @@ function buildSystemReminder(
 
 function toModelMessage(row: HistoryRow): ModelMessage {
   if (row.role === 'assistant') {
+    const thinking = row.reasoning !== undefined ? { reasoning: row.reasoning } : {}
     const traces = parseToolTraces(row.toolCallsJson)
     if (traces.length === 0) {
-      return { role: 'assistant', content: row.content }
+      return { role: 'assistant', content: row.content, ...thinking }
     }
     // 历史里的工具调用回放成**正文的一部分**，而不是真正的 tool_calls/tool 消息对。
     //
@@ -297,6 +298,7 @@ function toModelMessage(row: HistoryRow): ModelMessage {
     return {
       role: 'assistant',
       content: `${row.content}\n\n（上一轮调用过的工具：\n${lines.join('\n')}）`,
+      ...thinking,
     }
   }
   return { role: 'user', content: row.content }

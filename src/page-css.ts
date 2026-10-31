@@ -10,6 +10,7 @@
  * 那块样式直接消失且不报错 —— `page-tokens.test.ts` 守这条。
  */
 export const PAGE_CSS = `
+  *, *::before, *::after { box-sizing: border-box; }
   /* ============================================================
      自有样式：能省则省。宿主 .qb-* 覆盖了底色、字体、卡片、按钮、输入框，
      这里只补宿主没提供、而本页需要的几样（标签条、开关、徽标、骨架屏、空状态）。
@@ -48,7 +49,7 @@ export const PAGE_CSS = `
     position: relative;
     display: flex;
     gap: 2px;
-    margin-bottom: var(--qb-space-4);
+    margin-top: max(var(--qb-space-4), env(safe-area-inset-top));
     padding: 3px;
     overflow-x: auto;
     border-radius: var(--qb-radius-full);
@@ -391,12 +392,12 @@ export const PAGE_CSS = `
     to { opacity: 1; transform: none; }
   }
 
-  /* ---------- toast：桌面右下（规范：不放底部） ---------- */
+  /* ---------- toast：顶部，避开手机浏览器底部操作区 ---------- */
   .toast-wrap {
     position: fixed;
     right: var(--qb-space-4);
-    bottom: var(--qb-space-4);
-    z-index: 40;
+    top: max(var(--qb-space-4), env(safe-area-inset-top));
+    z-index: 100;
     display: flex;
     flex-direction: column;
     gap: var(--qb-space-2);
@@ -458,4 +459,16 @@ export const PAGE_CSS = `
 
   /* 长标识符不撑破容器 */
   .item-name, .item-meta, td { overflow-wrap: anywhere; }
+  [hidden] { display: none !important; }
+  .field-error { color: var(--qb-danger); font-size: var(--qb-text-sm); margin: var(--qb-space-2) 0 0; }
+  [aria-invalid="true"] { border-color: var(--qb-danger); }
+  .save-status-row { display: flex; align-items: center; gap: var(--qb-space-2); margin-top: var(--qb-space-2); font-size: var(--qb-text-sm); color: var(--qb-fg-muted); }
+  .permission-field { padding: var(--qb-space-3); border: 1px solid var(--qb-border); border-radius: var(--qb-radius); }
+  .permission-field > select { width: 100%; }
+  @media (max-width: 767px), (pointer: coarse) {
+    .qb-btn, .seg-btn, .qb-input, .chip button { min-height: 44px; }
+    .chip button { min-width: 44px; }
+    .modal { max-height: calc(100dvh - 32px); }
+  }
+
 `

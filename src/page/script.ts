@@ -25,9 +25,9 @@
  * 拼成一段反而让顺序一目了然，也避免为了共享 `state` 去搞依赖注入。
  * 页面跑在 sandbox iframe 里，变量不泄漏到面板作用域，所以可接受。
  *
- * 每个片段文件是 `.js`（不是 `.ts`）——它们是浏览器要执行的纯 JS，
- * 放 `.ts` 会让人以为可以写类型注解，而那是**构建时不会被剥离**的，
- * 浏览器拿到会直接语法错误。`page-syntax.test.ts` 守这条。
+ * 每个片段文件导出浏览器 JS 字符串；模板里的内容不经过 TypeScript 编译。
+ * `page-syntax.test.ts` 校验最终脚本语法，`web/page.test.js` 执行组装后的脚本，
+ * 覆盖草稿保存、错误恢复、权限和键盘交互。
  */
 import { SCRIPT_CORE } from './script-core.js'
 import { SCRIPT_SHELL } from './script-shell.js'

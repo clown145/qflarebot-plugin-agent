@@ -8,7 +8,7 @@
  *
  * 1. **工具调用的 arguments**：plugin-llm 用 JSON 字符串（对齐 OpenAI），
  *    loop 里用对象。边界上做一次 parse，失败就当成空对象并把原始串塞进错误。
- * 2. **推理内容**：plugin-llm 返回 `reasoning`，loop 只做透传，不回传。
+ * 2. **推理内容与签名**：原样保留并回填下一轮工具调用。
  * 3. **usage 字段名**：plugin-llm 是 snake_case（`input_tokens`）。
  *
  * 隔离这一层的另一个好处：将来 llm 服务换版本（比如 `llm2`），只改这里。
@@ -69,8 +69,9 @@ function toChatMessages(messages: ModelMessage[]) {
               })),
             }
           : {}),
-        // 推理内容只做本地记录；plugin-llm 会静默忽略回传的 reasoning
-        ...(message.reasoning ? { reasoning: message.reasoning } : {}),
+        ...(message.reasoning !== undefined ? { reasoning: message.reasoning } : {}),
+        ...(message.thoughtSignatures ? { thought_signatures: message.thoughtSignatures } : {}),
+        ...(message.reasoningSignatures ? { reasoning_signatures: message.reasoningSignatures } : {}),
       }
     }
 
@@ -154,7 +155,9 @@ export async function callLLM(llm: LLMService, options: LLMCallOptions): Promise
   return {
     ...(result.text ? { content: result.text } : {}),
     toolCalls,
-    ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+    ...(result.reasoning !== undefined ? { reasoning: result.reasoning } : {}),
+    ...(result.thought_signatures ? { thoughtSignatures: result.thought_signatures } : {}),
+    ...(result.reasoning_signatures ? { reasoningSignatures: result.reasoning_signatures } : {}),
     ...(result.usage
       ? {
           usage: {

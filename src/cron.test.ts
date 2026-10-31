@@ -130,9 +130,9 @@ function mockCtx(
       get() {
         calls.durableGet += 1
         return {
-          async submit() {
+          async submit(message: unknown) {
             calls.submit += 1
-            return submitResult
+            return { ...submitResult, ...(options.acquired ? { message } : {}) }
           },
           async sweep() {
             calls.sweep += 1

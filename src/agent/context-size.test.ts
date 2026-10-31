@@ -206,6 +206,18 @@ describe('splitIntoRounds', () => {
 })
 
 describe('compactMessages', () => {
+  it('历史推理内容计入预算，超限时丢整轮而不截断保留轮次的推理', () => {
+    const latest: ModelMessage = { role: 'assistant', content: '新回答', reasoning: '新推理' }
+    const messages: ModelMessage[] = [
+      user('旧问题'),
+      { role: 'assistant', content: '旧回答', reasoning: '长推理'.repeat(1000) },
+      user('新问题'), latest,
+    ]
+    const result = compactMessages(messages, { maxTokens: 100 })
+    expect(result.droppedRounds).toBe(1)
+    expect(result.messages).toEqual([user('新问题'), latest])
+  })
+
   it('低于阈值时不压缩', () => {
     const messages = [user('你好'), assistant('你好')]
     const result = compactMessages(messages, { maxTokens: 100_000 })

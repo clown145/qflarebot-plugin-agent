@@ -34,7 +34,9 @@ function createListInput(container, values, onChange, placeholder = '输入后�
   }
 
   const input = document.createElement('input')
+  input.addEventListener('input', updateSaveStatus)
   input.placeholder = placeholder
+  input.setAttribute('aria-label', '内容安全关键词')
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault()
@@ -52,7 +54,7 @@ function createListInput(container, values, onChange, placeholder = '输入后�
   })
   input.addEventListener('change', () => {
     const parts = input.value.split(/[,，\\s]+/).map((s) => s.trim()).filter(Boolean)
-    if (parts.length > 1) {
+    if (parts.length > 0) {
       for (const part of parts) addChip(part)
       input.value = ''
       onChange(current())
@@ -148,6 +150,7 @@ function createDialogPairs(pairs, onChange) {
       // 窄屏下 auto 列被压缩，标签会溢出到前一个输入框的边框上（看着像重叠）。
       // 改成一列两行后，任何宽度都不会挤，而且阅读顺序就是对话顺序。
       const group = document.createElement('div')
+      group.dataset.dialogPair = 'true'
       group.style.border = '1px solid var(--qb-border)'
       group.style.borderRadius = 'var(--qb-radius)'
       group.style.padding = 'var(--qb-space-2)'
@@ -171,7 +174,9 @@ function createDialogPairs(pairs, onChange) {
 
         const input = document.createElement('input')
         input.className = 'qb-input'
+        input.dataset.dialogRole = role
         input.placeholder = placeholder
+        input.setAttribute('aria-label', '第 ' + (i + 1) + ' 对 · ' + role)
         input.value = value
         input.style.minWidth = '0'
         input.addEventListener('input', () => {
@@ -229,7 +234,7 @@ function createDialogPairs(pairs, onChange) {
  * 多选清单：从**已知清单**里勾选，而不是让用户手打名字。
  *
  * 手打名字必然拼错（time.now / time now / Time.now），而且用户不知道
- * 系统里到底有哪些可用。留空 = 不限（语义由 persona.tools / persona.skills 定义）。
+ * 系统里到底有哪些可用。权限范围由 createScopeInput 显式选择（persona.tools / persona.skills 定义）。
  */
 function createCheckList(title, options, selected, onChange, hint) {
   const wrap = document.createElement('div')
@@ -289,4 +294,41 @@ function createCheckList(title, options, selected, onChange, hint) {
   wrap.appendChild(box)
   return wrap
 }
+
+/** undefined inherits all; [] denies all. Keep this identical to runtime persona permissions. */
+function createScopeInput(title, options, selected, onChange) {
+  const wrap = document.createElement('div')
+  wrap.className = 'field permission-field'
+  const label = document.createElement('label')
+  label.textContent = title
+  const mode = document.createElement('select')
+  mode.className = 'qb-input'
+  mode.id = 'permission-' + (++fieldSeed)
+  label.htmlFor = mode.id
+  for (const [value, text] of [['all', '全部允许'], ['some', '指定部分'], ['none', '全部禁用']]) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = text
+    mode.appendChild(option)
+  }
+  mode.value = selected === undefined ? 'all' : selected.length ? 'some' : 'none'
+  let chosen = [...(selected ?? [])]
+  const choices = [...options]
+  for (const value of chosen) {
+    if (!choices.some((item) => item.value === value)) choices.push({ value, label: value + '（当前不可用）' })
+  }
+  const list = createCheckList(title + '清单', choices, chosen, (values) => {
+    chosen = values
+    onChange(values)
+  }, '未选任何项时全部禁用。仍受全局开关与工具权限限制。')
+  const sync = () => { list.hidden = mode.value !== 'some'; notifyResize() }
+  mode.addEventListener('change', () => {
+    onChange(mode.value === 'all' ? undefined : mode.value === 'none' ? [] : [...chosen])
+    sync()
+  })
+  wrap.append(label, mode, list)
+  sync()
+  return wrap
+}
+
 `

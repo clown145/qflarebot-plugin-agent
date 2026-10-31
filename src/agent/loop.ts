@@ -96,6 +96,8 @@ export interface LoopOptions {
 export interface LoopResult {
   /** 最终文本。模型没给文本但工具已经发过消息时为 undefined */
   reply?: string
+  /** 最终回答的推理字段，保存到历史以支持后续用户轮次的 reasoning_content 回填。 */
+  reasoning?: string
   /** 是否已经有工具把消息发出去了 */
   repliedByTool: boolean
   steps: number
@@ -207,11 +209,14 @@ async function callLLMWithRetry(
   retry: LoopOptions['retry'],
   logger: Logger,
   step: number,
+  checkCancelled: () => Promise<void>,
 ): Promise<ModelResponse> {
   const attempts = Math.max(0, Math.trunc(retry?.times ?? 0))
   const delayMs = retry?.delayMs ?? 0
 
   for (let attempt = 0; ; attempt += 1) {
+    // 重试等待期间也可能被 /stop；不要再发下一次模型请求。
+    if (attempt > 0) await checkCancelled()
     try {
       return await callLLM(llm, request)
     } catch (error) {
@@ -239,7 +244,9 @@ async function callLLMWithRetry(
  *
  * 判定失败（DO 抖动）按「未取消」处理：一次 storage 读失败不该误杀正常对话。
  */
-async function throwIfCancelled(options: LoopOptions): Promise<void> {
+export async function throwIfCancelled(
+  options: Pick<LoopOptions, 'signal' | 'isCancelled' | 'logger'>,
+): Promise<void> {
   if (options.signal?.aborted) throw new LoopCancelledError()
   if (!options.isCancelled) return
   try {
@@ -340,7 +347,11 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       options.retry,
       logger,
       steps,
+      () => throwIfCancelled(options),
     )
+
+    // 模型可能在取消轮询的下一次 tick 之前返回，不能直接发送结果或执行工具。
+    await throwIfCancelled(options)
 
     inputTokens += response.usage?.inputTokens ?? 0
     outputTokens += response.usage?.outputTokens ?? 0
@@ -356,6 +367,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     if (response.toolCalls.length === 0) {
       return {
         ...(response.content ? { reply: response.content } : {}),
+        ...(response.reasoning !== undefined ? { reasoning: response.reasoning } : {}),
         repliedByTool,
         steps,
         toolCalls: toolCallLimit.usedToolCalls,
@@ -373,10 +385,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       role: 'assistant',
       content: response.content ?? '',
       toolCalls: response.toolCalls,
-      ...(response.reasoning ? { reasoning: response.reasoning } : {}),
+      ...(response.reasoning !== undefined ? { reasoning: response.reasoning } : {}),
+      ...(response.thoughtSignatures ? { thoughtSignatures: response.thoughtSignatures } : {}),
+      ...(response.reasoningSignatures ? { reasoningSignatures: response.reasoningSignatures } : {}),
     })
 
     for (const toolCall of response.toolCalls) {
+      await throwIfCancelled(options)
       // 先预留再执行（原文 reserveToolCall 的语义）
       if (!reserveToolCall(toolCallLimit)) {
         throw new LoopLimitError(toolCallLimitExceededMessage(toolCallLimit))
@@ -389,6 +404,8 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         context: toolContext,
         logger,
       })
+
+      await throwIfCancelled(options)
 
       repliedByTool = repliedByTool || execution.sentMessage
 

@@ -33,14 +33,35 @@ export interface LLMToolCall {
   arguments: string
 }
 
+/** 原样保留 plugin-llm 返回的 Gemini part 签名。 */
+export interface LLMThoughtSignature {
+  part_index: number
+  part_kind: 'text' | 'function_call'
+  signature: string
+  tool_call_index?: number
+  tool_call_id?: string
+  tool_name?: string
+}
+
+/** Anthropic 的 thinking / redacted_thinking block，正文与签名不可分开。 */
+export interface LLMReasoningSignature {
+  part_index: number
+  block_type: 'thinking' | 'redacted_thinking'
+  thinking?: string
+  signature?: string
+  data?: string
+}
+
 export interface LLMChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content?: LLMMessageContent
   tool_calls?: LLMToolCall[]
   tool_call_id?: string
   is_error?: boolean
-  /** 推理内容只作本地记录，回传会被静默忽略 */
+  /** OpenAI 兼容协议回填为 reasoning_content；Anthropic 使用下方的签名块。 */
   reasoning?: string
+  thought_signatures?: LLMThoughtSignature[]
+  reasoning_signatures?: LLMReasoningSignature[]
 }
 
 export type LLMToolChoice = 'auto' | 'none' | 'required' | { name: string }
@@ -70,6 +91,8 @@ export interface LLMUsage {
 export interface LLMChatResult {
   text: string
   reasoning?: string
+  thought_signatures?: LLMThoughtSignature[]
+  reasoning_signatures?: LLMReasoningSignature[]
   tool_calls?: LLMToolCall[]
   finish_reason?: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'other'
   alias: string

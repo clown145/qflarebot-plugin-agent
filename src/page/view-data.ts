@@ -53,6 +53,7 @@ function renderData() {
         render: (row) => {
           const select = document.createElement('select')
           select.className = 'qb-input'
+          select.setAttribute('aria-label', row.conversation + ' 的人格')
           const none = document.createElement('option')
           none.value = ''
           none.textContent = '（不绑定）'
@@ -150,33 +151,33 @@ async function bindPersona(conversation, persona) {
 
 /* ---------------------------------------------------------------- 渲染：配置 */
 
-function renderConfig() {
+function renderConfig(keepPrompt = false) {
   const c = state.config
 
-  $('promptBox').value = c.system_prompt ?? ''
+  if (!keepPrompt) $('promptBox').value = c.system_prompt ?? ''
   // 「已改」由徽标统一表达，这里只说来源，不重复
   $('promptState').textContent = isOverridden('system_prompt')
     ? '本页的这份覆盖了插件配置里的值，点标题旁的 × 可恢复'
     : '来自插件配置'
 
-  $('wakePrefix').value = c.wake_prefix ?? '/'
-  setSwitch($('friendPrefix'), c.friend_needs_wake_prefix)
+  if (!localEdits.has('wake_prefix')) $('wakePrefix').value = c.wake_prefix ?? '/'
+  if (!localEdits.has('friend_needs_wake_prefix')) setSwitch($('friendPrefix'), c.friend_needs_wake_prefix)
 
   for (const sw of document.querySelectorAll('[data-flag]')) {
-    setSwitch(sw, c[sw.dataset.flag])
+    if (!localEdits.has(sw.dataset.flag)) setSwitch(sw, c[sw.dataset.flag])
   }
 
-  $('maxSteps').value = c.max_model_steps ?? ''
-  $('maxToolCalls').value = c.max_tool_calls ?? ''
-  $('historyLimit').value = c.history_limit ?? ''
-  $('timeoutMs').value = c.request_timeout_ms ?? ''
-  $('timezone').value = c.timezone ?? ''
-  $('contextCompression').value = c.context_compression ?? 'truncate'
-  $('replyMention').value = c.reply_mention ?? 'off'
-  $('maxContextTokens').value = c.max_context_tokens ?? ''
-  $('rateLimit').value = c.rate_limit_per_minute ?? ''
+  if (!localEdits.has('max_model_steps')) $('maxSteps').value = c.max_model_steps ?? ''
+  if (!localEdits.has('max_tool_calls')) $('maxToolCalls').value = c.max_tool_calls ?? ''
+  if (!localEdits.has('history_limit')) $('historyLimit').value = c.history_limit ?? ''
+  if (!localEdits.has('request_timeout_ms')) $('timeoutMs').value = c.request_timeout_ms ?? ''
+  if (!localEdits.has('timezone')) $('timezone').value = c.timezone ?? ''
+  if (!localEdits.has('context_compression')) $('contextCompression').value = c.context_compression ?? 'truncate'
+  if (!localEdits.has('reply_mention')) $('replyMention').value = c.reply_mention ?? 'off'
+  if (!localEdits.has('max_context_tokens')) $('maxContextTokens').value = c.max_context_tokens ?? ''
+  if (!localEdits.has('rate_limit_per_minute')) $('rateLimit').value = c.rate_limit_per_minute ?? ''
 
-  createListInput(
+  if (!localEdits.has('content_filter_keywords') && !($('filterKeywords').querySelector('input')?.value)) createListInput(
     $('filterKeywords'),
     splitKeywords(c.content_filter_keywords),
     (values) => void savePatch({ content_filter_keywords: values.join(',') }),
@@ -281,7 +282,7 @@ const FIELD_LABEL = {
 function rowOf(control) {
   if (!control) return null
   // 开关按钮的直接父级是 .setting-control，再往上是 .setting-row
-  return control.closest('.setting-row') ?? control.closest('.field') ?? null
+  return control.closest('.setting-row') ?? control.closest('.field') ?? control.closest('.qb-card') ?? null
 }
 
 /** 清掉上一次渲染插入的标记（幂等的前提） */
@@ -299,7 +300,7 @@ function markOverridden(field, control) {
   const row = rowOf(control)
   if (!row) return
 
-  const host = row.querySelector('.setting-label') ?? row.querySelector('label') ?? row
+  const host = control.matches('.card-title') ? control : row.querySelector('.setting-label, label, .card-title') ?? row
   const badge = document.createElement('span')
   badge.className = 'override-badge'
   badge.style.cssText = [
@@ -337,8 +338,8 @@ function markOverridden(field, control) {
     'line-height: 1',
     'padding: 0 2px',
     'margin: -8px -4px -8px 0',
-    'min-width: 24px',
-    'min-height: 24px',
+    'min-width: 44px',
+    'min-height: 44px',
   ].join(';')
   undo.addEventListener('click', async (event) => {
     event.preventDefault()
@@ -357,14 +358,23 @@ function markOverridden(field, control) {
  * 之前只是页面没用。patch: { 字段: null } 效果相同，用 reset 更直白。
  */
 async function resetField(field) {
+  if (pendingWrites) return
+  const ok = await confirmAction({ title: '恢复配置值', text: '恢复「' + (FIELD_LABEL[field] ?? field) + '」并丢弃这一项的未保存修改？', confirmText: '恢复' })
+  if (!ok || pendingWrites) return
+  pendingWrites += 1
+  updateSaveStatus()
+  const release = lockResetFields([field])
   try {
-    await postJson('/api/settings', { reset: [field] })
-    notify('已恢复「' + (FIELD_LABEL[field] ?? field) + '」', 'success')
-    await load()
+    await queueSettings(() => postJson('/api/settings', { reset: [field] }))
+    savedRevision += 1
+    const refreshed = await load([field])
+    notify(refreshed ? '已恢复「' + (FIELD_LABEL[field] ?? field) + '」' : '恢复已生效，但刷新失败；请重试刷新', refreshed ? 'success' : 'warning')
   } catch (e) {
-    notify('恢复失败：' + e.message, 'error')
-    // 失败也要刷回真实值，否则标记和实际状态不一致
-    await load()
+    notify('恢复失败，修改已保留：' + e.message, 'error')
+  } finally {
+    release()
+    pendingWrites -= 1
+    updateSaveStatus()
   }
 }
 

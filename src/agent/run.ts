@@ -19,6 +19,7 @@ import {
   describeLoopError,
   LoopCancelledError,
   runAgentLoop,
+  throwIfCancelled,
   type LoopResult,
 } from './loop.js'
 import type { StoredSummary } from './context-size.js'
@@ -55,7 +56,7 @@ export interface AgentStub {
   history(limit: number): Promise<HistoryRow[]>
   release(
     runId: string,
-    result: { ok: boolean; error?: string; history?: HistoryRow[] },
+    result: { ok: boolean; error?: string; history?: HistoryRow[]; claimNext?: boolean },
   ): Promise<NextRun>
   retryLater(runId: string, reason: string): Promise<NextRun>
   /** 登记待摘要的轮次（`summary` 模式用；其他模式不调） */
@@ -102,9 +103,11 @@ export interface RunDeps {
   allowDangerous?: boolean
   /** 可重试错误的等待时间。测试传 0 */
   retryDelayMs?: number
+  /** 收尾时是否还有预算执行下一条；没有预算时让队列保持 pending。 */
+  shouldClaimNext?: () => boolean
 }
 
-/** run 的结果。`retryable` 为真时调用方应把 run 退回队列 */
+/** run 的结果。模型重试在 loop 内完成，已开始执行的 run 不再整轮入队。 */
 export interface RunOutcome {
   ok: boolean
   retryable: boolean
@@ -463,6 +466,19 @@ export async function executeRun(
   // （src/llm/client.ts 透传），只是从来没人设置过它。
   const controller = new AbortController()
   const stopWatcher = startCancellationWatcher(agent, runId, controller, logger)
+  const checkCancelled = () => throwIfCancelled({
+    signal: controller.signal,
+    isCancelled: () => isRunCancelled(agent, runId),
+    logger,
+  })
+  const finish = (result: { ok: boolean; error?: string; history?: HistoryRow[] }) =>
+    agent.release(runId, { ...result, claimNext: deps.shouldClaimNext?.() ?? true })
+  const finishCancelled = async (): Promise<RunOutcome> => {
+    stopWatcher()
+    logger.info('run 已被用户取消，停止回复与写历史', { conversation: message.conversation })
+    const next = await finish({ ok: false, error: '用户取消了这轮回答' }).catch(() => undefined)
+    return { ok: false, retryable: false, replied: false, ...(next ? { next } : {}) }
+  }
 
   try {
     // 1–3. 装上下文、建工具集、跑 loop。
@@ -491,6 +507,7 @@ export async function executeRun(
     // 媒体本身不过内容安全（那是二进制），但 caption 会过。
     let replied = false
     for (const item of result.outbound ?? []) {
+      await checkCancelled()
       if (!reply.media) {
         logger.warn('回复通道不支持媒体，退化为纯文本链接', { type: item.type })
         const fallback = item.url ? `${item.caption ?? ''} ${item.url}`.trim() : (item.caption ?? '')
@@ -506,6 +523,7 @@ export async function executeRun(
     // 只查入站不够——模型可能把用户诱导出的敏感内容再复述一遍，
     // 而那才是真正发到群里的东西。
     if (!result.repliedByTool && result.reply?.trim()) {
+      await checkCancelled()
       const outbound = filterOutbound(result.reply.trim(), config)
       if (outbound.blocked) {
         logger.warn('出站内容命中安全关键词，已拦截', { conversation: message.conversation })
@@ -533,6 +551,7 @@ export async function executeRun(
       historyRows.push({
         role: 'assistant',
         content: result.reply.trim(),
+        ...(result.reasoning !== undefined ? { reasoning: result.reasoning } : {}),
         // 把本轮调过的工具写进历史，模型下一轮才能看到「我上次查过什么」。
         // 以前这里是硬编码 null，导致 context.ts 承诺的「历史回放 toolCalls」
         // 分支在真实数据上永远走不到，模型会重复调同一个工具。
@@ -540,7 +559,8 @@ export async function executeRun(
         createdAt: now + 1,
       })
     }
-    const next = await agent.release(runId, { ok: true, history: historyRows })
+    await checkCancelled()
+    const next = await finish({ ok: true, history: historyRows })
 
     // 5b. summary 模式：把这次压缩丢掉的内容登记进 DO，等 cron 生成摘要。
     //
@@ -583,11 +603,8 @@ export async function executeRun(
     // - **不写历史**：这一轮是旧上下文的产物，而 `release()` 见到 cancelled
     //   本来也会跳过写历史（DO 侧双保险）；
     // - **不退回队列**：退回等于「停不下来」，用户按 /stop 后它还会再跑一遍。
-    if (error instanceof LoopCancelledError || controller.signal.aborted) {
-      stopWatcher()
-      logger.info('run 已被用户取消，停止回复与写历史', { conversation: message.conversation })
-      await agent.release(runId, { ok: false, error: '用户取消了这轮回答' }).catch(() => undefined)
-      return { ok: false, retryable: false, replied: false }
+    if (error instanceof LoopCancelledError || controller.signal.aborted || await isRunCancelled(agent, runId)) {
+      return finishCancelled()
     }
 
     const described = describeLoopError(error)
@@ -607,19 +624,14 @@ export async function executeRun(
     // 一个毒舌角色突然冒出「处理失败：HTTP 500」会很出戏。
     // 只在**错误路径**上解析一次人格——成功路径不承担这次 D1 读。
     const customError = await resolvePersonaErrorText(ctx, config, message.conversation)
+    if (controller.signal.aborted || await isRunCancelled(agent, runId)) return finishCancelled()
     const replied = await reply(customError ?? described.text).catch(() => false)
 
-    if (described.retryable) {
-      // 仍然退回队列：用户可能再发一次消息，那时能接着处理。
-      // 但已经告知过用户，不再是静默失败。
-      const next = await agent.retryLater(runId, described.text)
-      await bumpDailyStats(ctx.db, dayKey(config.timezone), { runs: 1, failed: 1 }).catch(() => {})
-      return { ok: false, retryable: true, replied, next }
-    }
-
-    await agent.release(runId, { ok: false, error: described.text })
+    // 单次模型调用已经重试过；重新入队会丢失 loop 状态并重做已成功的工具。
+    // 错误也必须交接 release 认领的下一条，否则会留下没有执行者的 running 锁。
+    const next = await finish({ ok: false, error: described.text })
     await bumpDailyStats(ctx.db, dayKey(config.timezone), { runs: 1, failed: 1 }).catch(() => {})
-    return { ok: false, retryable: false, replied }
+    return { ok: false, retryable: false, replied, next }
   } finally {
     // 成功路径也要停：否则轮询定时器会活过这次请求，
     // 在 isolate 复用的情况下把 abort 打到下一轮的 controller 上。

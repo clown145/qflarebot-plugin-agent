@@ -27,7 +27,6 @@ import type { PluginContext, Session } from '@qqbot/sdk'
 import type { AgentConfig } from './config/index.js'
 import { configSchema, defaultConfig } from './config/index.js'
 import { Agent } from './do/agent-object.js'
-import type { HistoryRow } from './do/agent-object.js'
 import type { InboundMessage } from './types.js'
 import type { LLMService } from './llm/contract.js'
 import { executeRun, replyFromSession, type ReplyFn, type RunDeps } from './agent/run.js'
@@ -533,11 +532,11 @@ export default definePlugin<AgentConfig>({
      *
      * ## 为什么不在这里轮询消息队列
      *
-     * 队列里的 run 只有两种来源：同会话正忙时新消息入队（上一个 run 跑完后
+     * 同会话正忙时新消息入队（上一个 run 跑完后
      * `release()` 会顺手认领下一个并返回，事件处理器接着跑完），以及
      * **执行者中途被掐断**（事件 30 秒硬窗、CPU 1102）。
      *
-     * 前者不需要 cron；后者必须有兜底——否则租约过期后没有任何人会再来认领，
+     * 每条执行链最多处理 5 条；达到上限或执行者被掐断时需要兜底，否则没有人再来认领，
      * 这个会话的排队消息就永久停滞，用户再也收不到回复。所以恢复只在
      * **10 分钟一次的清理轮**里做，平时不碰 DO：每分钟对每个会话 poll 一次是
      * 20 会话 = 每天 28,800 次 DO 唤醒，而 DO 按 GB-秒计费。
@@ -769,7 +768,7 @@ async function handleMessage(
     return
   }
 
-  if (!claimed.acquired || !claimed.runId) {
+  if (!claimed.acquired || !claimed.runId || !claimed.message) {
     // 这个会话已经有人在跑，run 进了队列，**静默排队**。
     //
     // 不要回一句「上一条还在处理」：用户等一会儿自然就收到答复，
@@ -788,9 +787,12 @@ async function handleMessage(
   // 正确做法：超时只停止"等待"，任务本身仍然跑完并自己 release。
   // 超时那一刻告诉用户一声，但不再补第二条。
   const running = runUntilQueueEmpty(
-    { ctx, logger, config, llm, agent: stub, reply },
+    {
+      ctx, logger, config, llm, agent: stub,
+      reply: makeApiReply(ctx, claimed.message, config.reply_mention),
+    },
     claimed.runId,
-    message,
+    claimed.message,
   )
 
   const outcome = await withBudget(running, INLINE_BUDGET_MS)
@@ -803,7 +805,7 @@ async function handleMessage(
     // 只提示一次，不 await 任务本身
     await reply('这个问题要多花点时间，我处理完会直接回复你。').catch(() => false)
     // 让任务在本次请求的后台继续跑完（ctx.waitUntil 保证它不会被提前取消）。
-    // runUntilQueueEmpty 会一路把队列跑空，所以不需要额外标记让 cron 兜底。
+    // 达到执行条数上限后，剩余消息保留为 pending，由后续入站或 cron 兜底。
     ctx.waitUntil(running.catch(() => undefined))
   }
 }
@@ -811,26 +813,28 @@ async function handleMessage(
 /**
  * 跑一个 run，跑完接着跑队列里的下一个，直到队列空或超出预算。
  *
- * **为什么不需要 cron 定期唤醒**：队列里的 run 只有两种情况——
- * 1. 同会话正忙时新消息入队 → 上一个跑完就立刻接着跑，延迟只有几秒
- * 2. 事件处理器超预算 → `ctx.waitUntil` 里这条链会继续跑到队列空
- *
- * 所以正常情况下队列永远是空的，cron 不需要每分钟轮询它。
- * cron 唯一的职责是「检查有没有到期的定时任务」。
+ * 正常情况下上一个跑完就接着跑。达到条数/时间上限时不再认领，
+ * 剩余 pending 消息由后续入站或 cron 的清理轮恢复。
  */
 async function runUntilQueueEmpty(
   deps: RunDeps,
   runId: string,
   message: InboundMessage,
+  deadline = Infinity,
 ): Promise<void> {
   // executeRun 内部的 release() 会顺手认领队列里的下一个并返回，
   // 所以这里循环到「没有下一个」为止。
   // 上限 5 个：防止某个会话积压几十条消息时一次请求跑太久
   for (let i = 0; i < 5; i += 1) {
-    const next = await executeRun(deps, runId, message)
+    const next = await executeRun({
+      ...deps,
+      shouldClaimNext: () => i < 4 && Date.now() < deadline,
+    }, runId, message)
     if (!next.next?.acquired || !next.next.runId || !next.next.message) return
     runId = next.next.runId
     message = next.next.message
+    // 同群的下一条可能来自另一个人，不能复用上一条的被动回复凭据或 @ 对象。
+    deps = { ...deps, reply: makeApiReply(deps.ctx, message, deps.config.reply_mention) }
   }
 }
 
@@ -899,9 +903,8 @@ const CRON_BUDGET_MS = 20_000
  *
  * ## 为什么必须有这一步
  *
- * run 有两种来源：同会话忙时新消息入队（跑完后 `release()` 链式认领，不需要 cron），
- * 和**执行者中途被掐断**（事件 30 秒硬窗、CPU 1102 都会）。后者 `release()` 永远跑不到，
- * 租约 90 秒后过期但没人认领——这个会话的排队消息就永久停滞。
+ * 执行链达到条数/时间上限后会留下 pending 消息；执行者中途被掐断时，
+ * `release()` 永远跑不到，租约过期后同样需要恢复。
  * 只靠「下一条消息进来时顺带认领」在冷会话里等于永远不恢复。
  *
  * ## 为什么节流到 10 分钟
@@ -987,10 +990,11 @@ async function serviceConversationObjects(
       // 权威默认值。用 ctx.config 会让「被 cron 捡回来的 run」退回旧模型——用户在
       // 页面把模型从 chat 切到别的，正常消息走新模型，恢复的那条却走旧的。
       resumeConfig ??= await resolveConfig(ctx)
-      await executeRun(
+      await runUntilQueueEmpty(
         { ctx, logger: ctx.logger, config: resumeConfig, llm, agent: stub, reply },
         picked.claimed.runId,
         message,
+        startedAt + CRON_BUDGET_MS,
       )
     } catch (error) {
       // 某个会话的 DO 挂了不该挡住别的会话
@@ -1022,7 +1026,7 @@ const pruneThrottle = { at: 0 }
  *
  * 以前是「跑成功才推进」，会造成同一条提醒执行两遍：
  * - 会话正忙 → 没抢到执行权，run 进了队列，`due_at` 不动 → 下一分钟 cron 又 submit 一份；
- * - 可重试失败 → `executeRun` 内部 `retryLater()` 把 run 退回队列，`due_at` 还不动 → 同样重复。
+ * - 旧版本把可重试失败的 run 退回队列，`due_at` 还不动 → 同样重复。
  *
  * 推进失败（D1 抖动）时抛出去，让 cron 记录失败——宁可下一分钟重来，也不要静默吞掉。
  */
@@ -1061,19 +1065,21 @@ async function fireDueSchedules(
     }
 
     const stub = agentStub(ctx, schedule.conversation)
-    const reply = makeApiReply(ctx, message, config.reply_mention)
-
     // 先入队：入队失败会抛，那就**不**推进，交给下一轮
     const claimed = await stub.submit(message)
     await advanceSchedule(ctx.db, schedule, Date.now())
 
     // 抢到执行权就当场跑（用户希望提醒准时到），没抢到就交给 DO 的队列，
     // 由 release() 链或 10 分钟一次的 sweep 兜底。
-    if (claimed.acquired && claimed.runId) {
-      await executeRun(
-        { ctx, logger: ctx.logger, config, llm, agent: stub, reply },
+    if (claimed.acquired && claimed.runId && claimed.message) {
+      await runUntilQueueEmpty(
+        {
+          ctx, logger: ctx.logger, config, llm, agent: stub,
+          reply: makeApiReply(ctx, claimed.message, config.reply_mention),
+        },
         claimed.runId,
-        message,
+        claimed.message,
+        startedAt + CRON_BUDGET_MS,
       )
     } else {
       ctx.logger.info('定时任务已入队，等队列执行', { scheduleId: schedule.id })
@@ -1094,32 +1100,6 @@ async function maybePruneAudit(
 }
 
 // ---------------------------------------------------------------- 工具函数
-
-type AgentStub = {
-  submit(
-    message: InboundMessage,
-    rateLimit?: { perMinute: number },
-  ): Promise<{
-    acquired: boolean
-    runId?: string
-    message?: InboundMessage
-    retryAfterMs?: number
-    rateLimited?: { retryAfterMs: number }
-  }>
-  history(limit: number): Promise<HistoryRow[]>
-  release(runId: string, result: { ok: boolean; error?: string; history?: HistoryRow[] }): Promise<void>
-  retryLater(runId: string, reason: string): Promise<void>
-  reset(): Promise<void>
-  /** 只打断正在跑的 run，不清历史（/stop 用） */
-  stop(): Promise<{ stopped: boolean }>
-  /** 会话规模：历史条数、队列长度、是否正在跑（/stats 与状态查看用） */
-  stats(): Promise<{ history: number; pending: number; locked: boolean }>
-  /** 一次 RPC 同时做「认领滞留 run」与「清理终态 run」，cron 的 10 分钟清理轮用 */
-  sweep(olderThanMs: number): Promise<{
-    claimed: { acquired: boolean; runId?: string; message?: InboundMessage; retryAfterMs?: number }
-    pruned: number
-  }>
-}
 
 /**
  * 取会话的 DO stub。
@@ -1163,7 +1143,7 @@ async function rememberConversation(
 }
 
 /**
- * cron 里用的回复函数。
+ * 按实际认领的消息创建回复通道，供入站执行、队列接续与 cron 共用。
  *
  * 优先用被动回复（`messageId` 还在有效期内，群聊 5 分钟），过期就退回主动消息。
  * 主动消息在群里需要群主授权，失败时只能记日志——这时候用户确实收不到，

@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Logger, PluginDB } from '@qqbot/sdk'
-import { describeLoopError, LoopLimitError, runAgentLoop } from './loop.js'
+import { describeLoopError, LoopCancelledError, LoopLimitError, runAgentLoop } from './loop.js'
 import { LLMCallError } from '../llm/client.js'
-import type { LLMService } from '../llm/contract.js'
+import type { LLMChatResult, LLMService } from '../llm/contract.js'
 import { createToolRegistry } from '../tools/registry.js'
 import type { ToolExecuteInput } from '../tools/registry.js'
 import type { RegisteredTool, ToolDefinition } from '../tools/types.js'
@@ -93,6 +93,29 @@ function loopOptions(llm: LLMService, tools: RegisteredTool[], overrides = {}) {
 }
 
 describe('runAgentLoop', () => {
+  it.each([
+    { reasoning: '', thought_signatures: [{ part_index: 0, part_kind: 'function_call' as const, signature: 'gemini-signed', tool_call_id: 'c1' }] },
+    { reasoning: '思考', reasoning_signatures: [
+      { part_index: 0, block_type: 'thinking' as const, thinking: '思考', signature: 'claude-signed' },
+      { part_index: 1, block_type: 'redacted_thinking' as const, data: 'encrypted' },
+    ] },
+    { reasoning: 'DeepSeek reasoning' },
+  ])('工具回填保留模型的推理内容与签名：%j', async (thinking: Partial<LLMChatResult>) => {
+    const base = fakeLLM([
+      { toolCalls: [{ id: 'c1', name: 'lookup', arguments: {} }] },
+      { text: '完成' },
+    ])
+    const chat = vi.fn<LLMService['chat']>(async (request) => {
+      const response = await base.chat(request)
+      return response.tool_calls ? { ...response, ...thinking } : response
+    })
+    await runAgentLoop(loopOptions({ ...base, chat }, [tool('lookup', 'ok')]))
+    expect(chat.mock.calls[1]?.[0].messages.find((item) => item.role === 'assistant')).toMatchObject({
+      ...thinking,
+      tool_calls: [{ id: 'c1', name: 'lookup', arguments: '{}' }],
+    })
+  })
+
   it('模型直接给答复时不调工具，返回文本', async () => {
     const result = await runAgentLoop(loopOptions(fakeLLM([{ text: '你好呀' }]), []))
     expect(result.reply).toBe('你好呀')
@@ -366,6 +389,35 @@ describe('单次模型调用的重试（不重跑 loop）', () => {
  * 现在 loop 每步开头问一次 `isCancelled()`，signal 则负责打断正在飞的调用。
  */
 describe('取消（/stop）', () => {
+  it('同一模型响应里的第一个工具执行时取消，第二个工具不会执行', async () => {
+    const controller = new AbortController()
+    const first = { ...tool('first', 'ok'), execute: vi.fn(async () => {
+      controller.abort()
+      return { status: 'success' as const, output: 'ok' }
+    }) }
+    const second = { ...tool('second', 'ok'), execute: vi.fn(async () => ({ status: 'success' as const, output: 'ok' })) }
+    const llm = fakeLLM([{ toolCalls: [
+      { id: 'c1', name: 'first', arguments: {} },
+      { id: 'c2', name: 'second', arguments: {} },
+    ] }])
+    await expect(runAgentLoop(loopOptions(llm, [first, second], { signal: controller.signal })))
+      .rejects.toBeInstanceOf(LoopCancelledError)
+    expect(first.execute).toHaveBeenCalledOnce()
+    expect(second.execute).not.toHaveBeenCalled()
+  })
+
+  it('模型重试等待期间取消，不再发起重试请求', async () => {
+    let cancelled = false
+    const chat = vi.fn<LLMService['chat']>(async () => {
+      cancelled = true
+      throw Object.assign(new Error('rate limited'), { code: 'rate_limit' })
+    })
+    await expect(runAgentLoop(loopOptions({ ...fakeLLM(), chat }, [], {
+      isCancelled: async () => cancelled, retry: { times: 1, delayMs: 0 },
+    }))).rejects.toBeInstanceOf(LoopCancelledError)
+    expect(chat).toHaveBeenCalledOnce()
+  })
+
   it('取消后不再继续下一步：模型只调一次，抛 LoopCancelledError', async () => {
     const { LoopCancelledError } = await import('./loop.js')
     let cancelled = false

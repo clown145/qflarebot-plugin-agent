@@ -39,8 +39,7 @@ function renderModel() {
 /* ---------------------------------------------------------------- 渲染：人格 */
 
 function renderPersonas() {
-  const list = state.config.personas ?? []
-  draftPersonas = list.map((p) => ({ ...p }))
+  const list = draftPersonas
   $('personaCount').textContent = list.length ? '（' + list.length + ' 套）' : ''
 
   renderDefaultPersonaSelect(list)
@@ -124,6 +123,8 @@ function personaEditor(persona, index) {
     div.className = 'field'
     const lab = document.createElement('label')
     lab.textContent = label
+    control.id = 'persona-field-' + (++fieldSeed)
+    lab.htmlFor = control.id
     div.appendChild(lab)
     div.appendChild(control)
     return div
@@ -131,14 +132,17 @@ function personaEditor(persona, index) {
 
   const nameInput = document.createElement('input')
   nameInput.className = 'qb-input mono-input'
+  nameInput.dataset.personaName = String(index)
   nameInput.value = persona.name ?? ''
   nameInput.placeholder = '如 cat'
   nameInput.addEventListener('input', () => {
+    const wasDefault = $('defaultPersona').value === draftPersonas[index].name
     draftPersonas[index].name = nameInput.value
     summary.querySelector('.item-title').textContent = nameInput.value || '(未命名人格)'
     // 名字是绑定的键，改名会改变下拉里该有的选项 → 立刻重刷，
     // 否则保存时 default_persona 会写成一个不存在的名字（看起来像「默认人格没生效」）
     renderDefaultPersonaSelect(draftPersonas)
+    if (wasDefault) $('defaultPersona').value = nameInput.value.trim()
   })
 
   const promptInput = document.createElement('textarea')
@@ -155,35 +159,43 @@ function personaEditor(persona, index) {
     parseDialogText(persona.begin_dialogs),
     (pairs) => {
       draftPersonas[index].begin_dialogs = serializeDialogPairs(pairs)
+      personaTouched = true
+      updateSaveStatus()
     },
   )
 
   // 工具与技能：从**已知清单勾选**，不让用户手打名字。
   // 手打必然拼错，而且用户根本不知道系统里有哪些可用。
-  const toolsInput = createCheckList(
+  const toolsInput = createScopeInput(
     '可用工具',
     (state.tools?.list ?? []).map((tool) => ({
       value: tool.name,
       label: tool.title && tool.title !== tool.name ? tool.title + ' · ' + tool.name : tool.name,
     })),
-    persona.tools ?? [],
+    persona.tools,
     (values) => {
-      draftPersonas[index].tools = values
+      if (values === undefined) delete draftPersonas[index].tools
+      else draftPersonas[index].tools = values
+      personaTouched = true
+      updateSaveStatus()
     },
-    '留空 = 这套人格可以用全部工具',
+
   )
 
-  const skillsInput = createCheckList(
+  const skillsInput = createScopeInput(
     '可见技能',
     (state.skills ?? []).map((skill) => ({
       value: skill.id,
       label: skill.name && skill.name !== skill.id ? skill.name + ' · ' + skill.id : skill.id,
     })),
-    persona.skills ?? [],
+    persona.skills,
     (values) => {
-      draftPersonas[index].skills = values
+      if (values === undefined) delete draftPersonas[index].skills
+      else draftPersonas[index].skills = values
+      personaTouched = true
+      updateSaveStatus()
     },
-    '留空 = 这套人格能看到全部技能',
+
   )
 
   const errorInput = document.createElement('textarea')
@@ -212,13 +224,16 @@ function personaEditor(persona, index) {
   delBtn.addEventListener('click', async () => {
     const ok = await confirmAction({
       title: '删除人格',
-      text: '删除「' + (draftPersonas[index].name || '未命名') + '」？绑过它的会话会自动回落到默认人格。',
+      text: '从草稿中删除「' + (draftPersonas[index].name || '未命名') + '」？保存后生效，绑定它的会话会回落到默认人格。',
       confirmText: '删除',
       danger: true,
     })
     if (!ok) return
     draftPersonas.splice(index, 1)
-    await savePatch({ personas: draftPersonas }, '已删除')
+    personaTouched = true
+    renderPersonas()
+    updateSaveStatus()
+    $('savePersonaList').focus()
   })
   del.appendChild(delBtn)
   body.appendChild(del)

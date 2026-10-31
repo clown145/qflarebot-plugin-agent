@@ -6,6 +6,8 @@
  * 迁移成本才只落在存储与出站这两处（见 README 的「从 serverless-agent 搬了什么」）。
  */
 
+import type { LLMThoughtSignature, LLMReasoningSignature } from './llm/contract.js'
+
 /** 会话标识。QFlareBot 的 session 已经给了 scene + targetId，这里只做一层归一化 */
 export type ConversationKey = string
 
@@ -56,6 +58,8 @@ export type ModelMessage =
       content?: string
       toolCalls?: ModelToolCall[]
       reasoning?: string
+      thoughtSignatures?: LLMThoughtSignature[]
+      reasoningSignatures?: LLMReasoningSignature[]
     }
   | { role: 'tool'; toolCallId: string; toolName: string; content: string }
 
@@ -83,6 +87,8 @@ export interface ModelResponse {
   content?: string
   toolCalls: ModelToolCall[]
   reasoning?: string
+  thoughtSignatures?: LLMThoughtSignature[]
+  reasoningSignatures?: LLMReasoningSignature[]
   usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number }
 }
 

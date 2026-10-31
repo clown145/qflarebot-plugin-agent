@@ -79,7 +79,8 @@ export function estimateMessageTokens(message: ModelMessage): number {
             .join(''),
         )
       : 0
-    return text + calls
+    // reasoning_content 也会回传，不能在上下文预算里漏算。
+    return text + calls + estimateTextTokens(message.reasoning ?? '')
   }
   const content = message.content
   if (typeof content === 'string') return estimateTextTokens(content)

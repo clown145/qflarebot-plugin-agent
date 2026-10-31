@@ -98,7 +98,7 @@
 | [开发指南](./docs/development.md) | 架构、存储分层、加工具/配置、来源与许可 |
 | [排障](./docs/troubleshooting.md) | 症状 → 原因、日志说明、已知限制 |
 
-遇到问题先看[排障](./docs/troubleshooting.md)，已知限制（Gemini 思考模型、MCP、可观测性等）也都记在那里。
+遇到问题先看[排障](./docs/troubleshooting.md)，已知限制（MCP、可观测性等）也都记在那里。
 
 ## 开发
 
@@ -120,3 +120,10 @@ npm run sync     # 生成 manifest.json 并提交
 ## License
 
 MIT。其中三个零依赖的纯函数文件复用自 [serverless-agent](https://github.com/clown145/serverless-agent)（同一作者），出处见[开发指南 · 来源](./docs/development.md#来源)。
+
+### Web UI 保存与权限
+
+- 开关、模型选择和限额按字段自动保存；系统提示词、人格新增/编辑/删除需要点击对应的“保存”。保存其他设置或刷新运行数据会保留未提交的草稿。
+- 保存失败会保留输入并显示“重试”，请求按顺序提交，避免相邻操作相互覆盖。
+- 人格工具和技能权限分为“全部允许”（省略限制）、“指定部分”和“全部禁用”（空数组），仍受全局能力开关和工具权限约束。
+- `web/page.test.js` 在 DOM 环境执行最终页面脚本，覆盖草稿保留、失败重试、权限映射及键盘操作。

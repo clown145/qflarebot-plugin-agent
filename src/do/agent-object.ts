@@ -72,6 +72,8 @@ const MAX_HISTORY_ROWS = 120
 export interface HistoryRow {
   role: 'user' | 'assistant'
   content: string
+  /** assistant 的原始推理内容；可选以兼容已有历史，回填时保留空字符串。 */
+  reasoning?: string
   /** assistant 消息带的工具调用（JSON 字符串），回放历史时要还原 */
   toolCallsJson: string | null
   createdAt: number
@@ -130,7 +132,7 @@ export class Agent extends PluginDurableObject {
   /**
    * 入队一个 run 并尝试立刻认领。
    *
-   * 返回 `acquired: true` 表示调用方拿到了执行权，应当马上跑 loop；
+   * 返回 `acquired: true` 表示调用方拿到了执行权，应执行返回的 message（可能是更早入队的消息）；
    * `acquired: false` 表示这个会话已经有人在跑，run 进了队列，等 cron 兜底。
    */
   async submit(message: InboundMessage, rateLimit?: RateLimitConfig): Promise<AcquireResult> {
@@ -285,7 +287,7 @@ export class Agent extends PluginDurableObject {
    */
   async release(
     runId: string,
-    result: { ok: boolean; error?: string; history?: HistoryRow[] },
+    result: { ok: boolean; error?: string; history?: HistoryRow[]; claimNext?: boolean },
   ): Promise<AcquireResult> {
     const now = Date.now()
     const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
@@ -324,7 +326,8 @@ export class Agent extends PluginDurableObject {
     //
     // 这是「不需要定期唤醒」的关键：上一版跑完就撒手，队列里的 run 只能靠
     // cron 每分钟轮询捡，而 DO 按 GB-秒计费，空转唤醒是纯浪费。
-    return this.claim(now)
+    // 调用方没有继续执行的预算时，下一条保持 pending，不能先认领再丢下。
+    return result.claimNext === false ? { acquired: false } : this.claim(now)
   }
 
   /**
@@ -383,7 +386,8 @@ export class Agent extends PluginDurableObject {
   }
 
   /**
-   * 把 run 退回队列（可重试的错误，比如上游 429）。
+   * 把尚未开始执行的 run 退回队列（例如 llm 服务尚不可用）。
+   * 已执行过模型/工具的 run 不能用它整轮重试，以免重复副作用。
    *
    * 与 `release` 的区别：不写历史、状态回 pending、保留 attempts 计数。
    */

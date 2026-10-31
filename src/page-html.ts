@@ -13,21 +13,22 @@ export const PAGE_HTML_BODY = `
 <div class="wrap">
   <header class="page-head">
     <h1 class="page-title">Agent</h1>
-    <p class="page-sub">改完立即生效。</p>
+    <p class="page-sub">开关和选项自动保存；提示词与人格编辑后点击保存。</p>
+    <div class="save-status-row"><span id="saveStatus" role="status" aria-live="polite">加载中…</span><button class="qb-btn" id="retrySave" type="button" hidden>重试</button></div>
   </header>
 
   <!-- 页内标签：记在 # 里，刷新和分享停在同一处 -->
   <div class="segmented" id="segmented" role="tablist" aria-label="分区">
     <span class="seg-thumb" id="segThumb" hidden></span>
-    <button class="seg-btn" role="tab" data-tab="model" type="button" aria-selected="true">模型与人格</button>
-    <button class="seg-btn" role="tab" data-tab="behavior" type="button" aria-selected="false">对话行为</button>
-    <button class="seg-btn" role="tab" data-tab="tools" type="button" aria-selected="false">工具</button>
-    <button class="seg-btn" role="tab" data-tab="skills" type="button" aria-selected="false">技能</button>
-    <button class="seg-btn" role="tab" data-tab="data" type="button" aria-selected="false">运行数据</button>
+    <button class="seg-btn" role="tab" id="tab-model" aria-controls="panel-model" tabindex="0" data-tab="model" type="button" aria-selected="true">模型与人格</button>
+    <button class="seg-btn" role="tab" id="tab-behavior" aria-controls="panel-behavior" tabindex="-1" data-tab="behavior" type="button" aria-selected="false">对话行为</button>
+    <button class="seg-btn" role="tab" id="tab-tools" aria-controls="panel-tools" tabindex="-1" data-tab="tools" type="button" aria-selected="false">工具</button>
+    <button class="seg-btn" role="tab" id="tab-skills" aria-controls="panel-skills" tabindex="-1" data-tab="skills" type="button" aria-selected="false">技能</button>
+    <button class="seg-btn" role="tab" id="tab-data" aria-controls="panel-data" tabindex="-1" data-tab="data" type="button" aria-selected="false">运行数据</button>
   </div>
 
   <!-- ==================== 模型与人格 ==================== -->
-  <section class="panel is-active" data-panel="model" role="tabpanel">
+  <section class="panel is-active" data-panel="model" role="tabpanel" id="panel-model" aria-labelledby="tab-model">
     <div class="stack">
       <section class="qb-card" style="padding: var(--qb-space-4)">
         <div class="card-head">
@@ -75,13 +76,13 @@ export const PAGE_HTML_BODY = `
             </div>
           </div>
         </div>
-        <div id="personaList"></div>
+        <p class="qb-muted" id="personaState" role="status"></p><div id="personaList"></div>
       </section>
     </div>
   </section>
 
   <!-- ==================== 对话行为 ==================== -->
-  <section class="panel" data-panel="behavior" role="tabpanel">
+  <section class="panel" data-panel="behavior" role="tabpanel" id="panel-behavior" aria-labelledby="tab-behavior">
     <div class="stack">
       <section class="qb-card" style="padding: var(--qb-space-4)">
         <div class="card-head">
@@ -94,7 +95,7 @@ export const PAGE_HTML_BODY = `
             <button class="qb-btn" id="resetPrompt" type="button">恢复配置值</button>
           </div>
         </div>
-        <textarea class="qb-textarea" id="promptBox" placeholder="留空则用内置默认人格…"></textarea>
+        <textarea class="qb-textarea" id="promptBox" aria-label="系统提示词" aria-describedby="promptState" placeholder="留空则用内置默认人格…"></textarea>
         <p class="qb-muted" style="font-size: var(--qb-text-xs); margin: var(--qb-space-2) 0 0" id="promptState"></p>
       </section>
 
@@ -371,7 +372,7 @@ export const PAGE_HTML_BODY = `
   </section>
 
   <!-- ==================== 工具 ==================== -->
-  <section class="panel" data-panel="tools" role="tabpanel">
+  <section class="panel" data-panel="tools" role="tabpanel" id="panel-tools" aria-labelledby="tab-tools">
     <section class="qb-card" style="padding: var(--qb-space-4)">
       <div class="card-head">
         <div>
@@ -391,7 +392,7 @@ export const PAGE_HTML_BODY = `
   </section>
 
   <!-- ==================== 技能 ==================== -->
-  <section class="panel" data-panel="skills" role="tabpanel">
+  <section class="panel" data-panel="skills" role="tabpanel" id="panel-skills" aria-labelledby="tab-skills">
     <section class="qb-card" style="padding: var(--qb-space-4)">
       <div class="card-head">
         <div>
@@ -410,7 +411,7 @@ export const PAGE_HTML_BODY = `
   </section>
 
   <!-- ==================== 运行数据 ==================== -->
-  <section class="panel" data-panel="data" role="tabpanel">
+  <section class="panel" data-panel="data" role="tabpanel" id="panel-data" aria-labelledby="tab-data">
     <div class="stack">
       <section class="qb-card" style="padding: var(--qb-space-4)">
         <div class="card-head">

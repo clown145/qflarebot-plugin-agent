@@ -140,13 +140,26 @@
 **重试的是「那一次模型调用」，不是整轮对话。** 早期版本在外面重跑整个 loop，
 于是第 1 步已经建过定时任务、第 2 步撞上限流时会从头再来一遍——
 `INSERT INTO {schedules}` 真的执行了两次。现在重试下沉到单次调用，
-已经执行过的工具不会重来（回归测试见 `src/agent/retry.test.ts`）。
+模型重试耗尽后本轮标记失败，不会重新入队触发已成功的工具（回归测试见
+`src/agent/retry.test.ts` 与 `src/agent/queue.test.ts`）。执行者被平台中断后的租约恢复
+仍可能重跑任务；有外部副作用的工具需要自行保证幂等。
+
+## 思考模型与排队消息
+
+工具调用过程中会原样回传 Gemini 的 `thought_signatures`、Anthropic 的
+`reasoning_signatures`，以及 OpenAI 兼容模型的 `reasoning`。使用 DeepSeek 思考模型时，
+需要同时更新 LLM 插件，让 `reasoning` 回填为上游的 `reasoning_content`。
+最终回答的 `reasoning` 也会保存并随历史回传，以支持后续用户轮次。旧版历史没有保存
+这一字段，无法补回；若升级后旧会话仍提示缺少 `reasoning_content`，可用 `/reset` 开始新会话。
+
+每次执行最多连续处理 5 条消息；cron 达到时间预算也会停止接续。剩余消息保持
+pending，由下一条入站消息或每 10 分钟的清理轮继续处理，不会提前占住运行锁。
+`/stop` 会在模型返回、每个工具执行前后及回复前检查取消；已经完成的外部操作不会撤销。
 
 ## 已知限制
 
 | 限制 | 影响 | 现状 |
 | --- | --- | --- |
-| **Gemini 思考模型的工具调用不可用** | 本地契约副本没有 `thought_signatures`，Gemini 对 functionCall 签名严格校验，缺了 400 | 用非思考模型或 OpenAI 兼容协议没影响 |
 | **二次确认闭环是断的** | `sideEffect: 'dangerous'` 的工具永久卡在待确认 | 当前没有这种工具，故为潜在问题 |
 | **策略表没有写入方** | 「策略叠加」实际不生效，真实行为是角色基线 | 要叠加只能手工写 `p_agent_policies` |
 | **没有 run/step 可观测性** | 没有 `runs` / `run_steps` 表，排障靠日志 | 换来的是每条消息完全不碰 D1 |

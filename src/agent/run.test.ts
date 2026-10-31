@@ -170,7 +170,7 @@ describe('executeRun', () => {
     expect(history[0]?.role).toBe('user')
   })
 
-  it('上游限流：重试一次后仍失败，告知用户并退回队列', async () => {
+  it('上游限流：局部重试耗尽后结束本轮，不回队列重跑已成功的工具', async () => {
     const reply = replySpy()
     const retryLater = vi.fn<(runId: string, reason: string) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
     const release = vi.fn<(runId: string, result: ReleaseArg) => Promise<{ acquired: boolean }>>(async () => ({ acquired: false }))
@@ -191,9 +191,9 @@ describe('executeRun', () => {
     )
 
     expect(outcome.ok).toBe(false)
-    expect(outcome.retryable).toBe(true)
-    expect(retryLater).toHaveBeenCalledOnce()
-    expect(release).not.toHaveBeenCalled()
+    expect(outcome.retryable).toBe(false)
+    expect(retryLater).not.toHaveBeenCalled()
+    expect(release).toHaveBeenCalledOnce()
     // 上一版这里是静默的——用户什么都收不到，消息凭空消失。
     // 现在会告知「正在限流」，用户至少知道发生了什么
     expect(reply.calls).toHaveLength(1)
