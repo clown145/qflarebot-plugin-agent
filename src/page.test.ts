@@ -39,7 +39,7 @@ describe('基本结构', () => {
 })
 
 describe('iframe 约束（这是「页面显示不全」的根因）', () => {
-  it('不用 100vh —— iframe 高度由 bridge.resize 决定，100vh 会互相拉扯', () => {
+  it('主内容不固定视口高度，避免在 iframe 文档里再嵌一层滚动区', () => {
     // 允许注释里提到，但不允许出现在 CSS 声明中
     const css = PAGE_HTML.slice(PAGE_HTML.indexOf('<style>'), PAGE_HTML.indexOf('</style>'))
     expect(css).not.toMatch(/height:\s*100vh/)
@@ -52,7 +52,7 @@ describe('iframe 约束（这是「页面显示不全」的根因）', () => {
     expect(css).not.toMatch(/height:\s*100dvh/)
   })
 
-  it('内容高度变化后调用 resize', () => {
+  it('保留 resize 通知以兼容旧面板和自定义宿主', () => {
     expect(PAGE_HTML).toContain('function notifyResize')
     expect(PAGE_HTML).toContain('bridge?.resize?.()')
     // 切标签和加载数据后都要调

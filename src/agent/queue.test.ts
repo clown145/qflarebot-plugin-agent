@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMockContext, createMockSession } from '@qqbot/sdk/testing'
 import { normalizePlugin } from '@qqbot/sdk'
 import plugin from '../index.js'
-import { Agent } from '../do/agent-object.js'
+import type { Agent } from '../do/agent-object.js'
+import { makeObject } from '../do/agent-test-object.js'
 import { defaultConfig } from '../config/index.js'
 import type { AgentConfig } from '../config/index.js'
 import type { InboundMessage } from '../types.js'
@@ -11,34 +12,21 @@ import { createTestDb } from '../store/sqlite-test-db.js'
 import { createSchedule } from '../store/d1.js'
 import { executeRun } from './run.js'
 
-// 用真实 Agent 调度逻辑和 SQLite，只有平台存储与模型请求使用替身。
-function makeAgent(): Agent {
-  const data = new Map<string, unknown>()
-  const storage = {
-    async get<T>(key: string) { return structuredClone(data.get(key)) as T | undefined },
-    async put(key: string | Record<string, unknown>, value?: unknown) {
-      for (const [name, item] of typeof key === 'string' ? [[key, value]] : Object.entries(key)) {
-        data.set(name as string, structuredClone(item))
-      }
-    },
-    async delete(keys: string | string[]) {
-      for (const key of Array.isArray(keys) ? keys : [keys]) data.delete(key)
-      return true
-    },
-    async list<T>({ prefix = '', limit }: { prefix?: string; limit?: number } = {}) {
-      return new Map([...data.entries()].filter(([key]) => key.startsWith(prefix))
-        .sort(([a], [b]) => a.localeCompare(b)).slice(0, limit)) as Map<string, T>
-    },
-  }
-  const agent = Object.create(Agent.prototype) as Agent
-  ;(agent as unknown as { ctx: { storage: unknown } }).ctx = { storage }
-  return agent
-}
-
+/** 连接真实执行流、DO 调度和 SQLite；平台存储复用 DO 单测的替身。 */
 function message(text: string, userId = 'old-user'): InboundMessage {
-  return { conversation: 'group:g1', userId, userName: userId, text, displayText: text,
-    attachments: [], scene: 'group', targetId: 'g1', memberRole: 'admin',
-    passiveMessageId: `${userId}-message`, receivedAt: Date.now() }
+  return {
+    conversation: 'group:g1',
+    userId,
+    userName: userId,
+    text,
+    displayText: text,
+    attachments: [],
+    scene: 'group',
+    targetId: 'g1',
+    memberRole: 'admin',
+    passiveMessageId: `${userId}-message`,
+    receivedAt: Date.now(),
+  }
 }
 
 function result(text = '完成', extra: Partial<LLMChatResult> = {}): LLMChatResult {
@@ -46,21 +34,43 @@ function result(text = '完成', extra: Partial<LLMChatResult> = {}): LLMChatRes
 }
 
 const cleanup: Array<() => void> = []
-afterEach(() => { for (const close of cleanup.splice(0)) close(); vi.restoreAllMocks() })
+afterEach(() => {
+  for (const close of cleanup.splice(0)) close()
+  vi.restoreAllMocks()
+})
 
 function setup(chat: LLMService['chat'] = async () => result(), config: Partial<AgentConfig> = {}) {
   const store = createTestDb()
   cleanup.push(() => store.close())
-  const agent = makeAgent()
+  const { obj: agent } = makeObject()
   const llm: LLMService = {
-    contractVersion: 1, chat: vi.fn(chat), stream: async function* () {}, listModels: async () => [],
-    resolve: async () => ({ alias: 'chat', provider: 'fake', provider_name: 'fake', model: 'fake', capabilities: ['text', 'tools'] }),
+    contractVersion: 1,
+    chat: vi.fn(chat),
+    stream: async function* () {},
+    listModels: async () => [],
+    resolve: async () => ({
+      alias: 'chat',
+      provider: 'fake',
+      provider_name: 'fake',
+      model: 'fake',
+      capabilities: ['text', 'tools'],
+    }),
     ping: async () => ({ ok: true, latency_ms: 1 }),
   }
   const ctx = createMockContext<AgentConfig>(plugin, {
-    config: { ...defaultConfig, enable_tools: false, enable_schedule: true,
-      enable_skills: false, enable_vfs: false, enable_audit: false, reply_mention: 'group', ...config },
-    db: store.db, services: { llm }, durable: { Agent: agent as unknown as DurableObjectStub },
+    config: {
+      ...defaultConfig,
+      enable_tools: false,
+      enable_schedule: true,
+      enable_skills: false,
+      enable_vfs: false,
+      enable_audit: false,
+      reply_mention: 'group',
+      ...config,
+    },
+    db: store.db,
+    services: { llm },
+    durable: { Agent: agent as unknown as DurableObjectStub },
   })
   const send = vi.spyOn(ctx.api, 'sendMessage')
   const reply = vi.fn(async () => true)
@@ -69,12 +79,23 @@ function setup(chat: LLMService['chat'] = async () => result(), config: Partial<
     // 每次 cron 模块实例隔离，避免另一个测试的十分钟清理节流影响本用例。
     vi.resetModules()
     const fresh = (await import('../index.js')).default
-    return normalizePlugin(fresh).cron.find((item) => item.name === 'tick')!.handler({ ctx, job: 'tick', scheduledAt: Date.now() })
+    return normalizePlugin(fresh).cron.find((item) => item.name === 'tick')!.handler({
+      ctx, job: 'tick', scheduledAt: Date.now(),
+    })
   }
   const ask = (text = 'new request') => normalizePlugin(plugin).commands.find((item) => item.name === 'ask')!.handler({
-    ctx, session: createMockSession({ scene: 'group', targetId: 'g1', userId: 'new-user',
-      messageId: 'new-user-message', memberRole: 'admin', content: text }),
-    command: 'ask', args: text.split(' '), argText: text,
+    ctx,
+    session: createMockSession({
+      scene: 'group',
+      targetId: 'g1',
+      userId: 'new-user',
+      messageId: 'new-user-message',
+      memberRole: 'admin',
+      content: text,
+    }),
+    command: 'ask',
+    args: text.split(' '),
+    argText: text,
   })
   return { store, agent, llm, ctx, send, reply, deps, tick, ask }
 }
@@ -94,9 +115,12 @@ describe('执行流与 DO 队列的衔接', () => {
   ])('后续用户轮次保留历史回答的 reasoning：%j', async ({ reasoning, withTool }) => {
     let calls = 0
     const s = setup(async () => {
-      if (++calls === 1 && withTool) return result('', {
-        reasoning: '先查询时间', tool_calls: [{ id: 'c1', name: 'time.now', arguments: '{}' }],
-      })
+      if (++calls === 1 && withTool) {
+        return result('', {
+          reasoning: '先查询时间',
+          tool_calls: [{ id: 'c1', name: 'time.now', arguments: '{}' }],
+        })
+      }
       return result('回答', { reasoning })
     }, { enable_tools: true })
     await s.ask('第一轮')
@@ -110,8 +134,14 @@ describe('执行流与 DO 队列的衔接', () => {
   it('成功创建提醒之后模型重试耗尽，不会把整轮重新排队并重复创建提醒', async () => {
     let calls = 0
     const s = setup(async () => {
-      if (++calls === 1) return result('', { tool_calls: [{ id: 'c1', name: 'schedule.create',
-        arguments: JSON.stringify({ delay_seconds: 600, prompt: '喝水' }) }] })
+      if (++calls === 1) {
+        return result('', {
+          tool_calls: [{
+            id: 'c1', name: 'schedule.create',
+            arguments: JSON.stringify({ delay_seconds: 600, prompt: '喝水' }),
+          }],
+        })
+      }
       throw Object.assign(new Error('429'), { code: 'rate_limit' })
     }, { enable_tools: true })
     const first = await enqueue(s.agent, '十分钟后提醒我喝水')
@@ -125,7 +155,10 @@ describe('执行流与 DO 队列的衔接', () => {
 
   it.each(['auth', 'rate_limit', 'cancelled'])('%s 收尾时返回下一条已认领的消息', async (code) => {
     const s = setup(async () => {
-      if (code === 'cancelled') { await s.agent.stop(); return result('不应发送') }
+      if (code === 'cancelled') {
+        await s.agent.stop()
+        return result('不应发送')
+      }
       throw Object.assign(new Error(code), { code })
     })
     const first = await enqueue(s.agent, '第一条')
@@ -184,7 +217,10 @@ describe('执行流与 DO 队列的衔接', () => {
   it('cron 预算用完时不提前认领下一条', async () => {
     const now = Date.now()
     const time = vi.spyOn(Date, 'now').mockReturnValue(now)
-    const s = setup(async () => { time.mockReturnValue(now + 60_000); return result() })
+    const s = setup(async () => {
+      time.mockReturnValue(now + 60_000)
+      return result()
+    })
     const first = await enqueue(s.agent, 'old request')
     await s.agent.retryLater(first.runId, '待处理')
     await createSchedule(s.store.db, { id: 'reminder', conversation: 'group:g1', scene: 'group',

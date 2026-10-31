@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { PluginDurableObject } from '@qqbot/sdk'
 import { Agent, LEASE_MS, MAX_ATTEMPTS } from './agent-object.js'
+import { makeObject } from './agent-test-object.js'
 import type { HistoryRow } from './agent-object.js'
 import type { InboundMessage } from '../types.js'
 
@@ -11,44 +12,6 @@ import type { InboundMessage } from '../types.js'
  * 这里用 `Object.create` 绕过构造器，只注入它真正用到的东西：
  * `this.ctx.storage`（内存实现）。这样测的是调度逻辑本身，不是平台行为。
  */
-
-/** 内存版 DurableObjectStorage，只实现 Agent 用到的方法 */
-function memoryStorage() {
-  const map = new Map<string, unknown>()
-  return {
-    map,
-    async get<T>(key: string): Promise<T | undefined> {
-      return map.get(key) as T | undefined
-    },
-    async put(keyOrEntries: string | Record<string, unknown>, value?: unknown) {
-      if (typeof keyOrEntries === 'string') {
-        map.set(keyOrEntries, value)
-      } else {
-        for (const [k, v] of Object.entries(keyOrEntries)) map.set(k, v)
-      }
-    },
-    async delete(keyOrKeys: string | string[]) {
-      for (const k of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) map.delete(k)
-      return true
-    },
-    async list<T>(options: { prefix?: string; limit?: number } = {}) {
-      const prefix = options.prefix ?? ''
-      const entries = [...map.entries()]
-        .filter(([k]) => k.startsWith(prefix))
-        .sort((a, b) => a[0].localeCompare(b[0]))
-      const limited = options.limit ? entries.slice(0, options.limit) : entries
-      return new Map(limited) as Map<string, T>
-    },
-  }
-}
-
-function makeObject() {
-  const storage = memoryStorage()
-  const obj = Object.create(Agent.prototype) as Agent
-  // 只注入 ctx.storage —— Agent 里没有别的地方碰 this.ctx
-  ;(obj as unknown as { ctx: { storage: unknown } }).ctx = { storage }
-  return { obj, storage }
-}
 
 function message(overrides: Partial<InboundMessage> = {}): InboundMessage {
   return {

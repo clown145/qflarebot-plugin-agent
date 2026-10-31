@@ -19,6 +19,13 @@ npm run sync     # 把 dist/manifest.json 复制到仓库根目录，需要提�
 > 忘了同步会让 `manifest.test.ts` 失败 —— 这是**刻意设计的哨兵**，
 > 防止你改了 `index.ts` 的 commands/events/routes/cron 却忘了更新清单。
 
+## 测试组织
+
+- 测试就近放在被测模块旁，使用 `*.test.ts` 和 Vitest；用例名延续中文场景描述。
+- `src/page.test.ts`、`src/page-syntax.test.ts` 检查静态页面和内联脚本；`src/page/interactions.test.ts` 在 jsdom 中执行页面脚本，检查保存、草稿和键盘操作。
+- DOM 测试由 `src/page/tsconfig.json` 单独检查类型，Worker 代码仍使用根配置；`npm run typecheck` 会同时运行两套检查，`npm test` 会自动选择测试环境。
+- DO 单测与队列集成测试共用 `src/do/agent-test-object.ts`；SQLite 替身沿用 `src/store/sqlite-test-db.ts`。每个用例自行创建状态，结束后清理计时器、监听器和模拟函数。
+
 ## 架构
 
 ```text
