@@ -211,3 +211,120 @@ describe('图片体积的两道闸', () => {
     }
   })
 })
+
+/**
+ * 回归：图片下载完全不校验 URL、不逐跳、无超时。
+ *
+ * 旧实现是 `fetch(url, { redirect: 'follow' })`。图片 URL 来自消息（可被伪造），
+ * 于是：①内网地址直接抓；②公网地址 302 到 127.0.0.1 / 云元数据也能抓；
+ * ③一张挂住不返回的图会一直吃这次事件的 30 秒预算。
+ */
+describe('图片下载的 SSRF 防护与逐跳校验', () => {
+  it('图片地址是内网时直接拒绝，不发起请求', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const result = await hydrateImageAttachments([
+        { type: 'image', url: 'http://127.0.0.1:8080/secret.png' },
+      ])
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(result.attachments).toHaveLength(0)
+      expect(result.notes[0]).toContain('图片地址被拒绝')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('图片地址是云元数据时拒绝', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const result = await hydrateImageAttachments([
+        { type: 'image', url: 'http://169.254.169.254/latest/meta-data/' },
+      ])
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(result.notes[0]).toContain('被拒绝')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('重定向到内网时拒绝（不能只校验初始地址）', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('', { status: 302, headers: { location: 'http://127.0.0.1/secret' } })),
+    )
+    try {
+      const result = await hydrateImageAttachments([
+        { type: 'image', url: 'https://example.com/a.png' },
+      ])
+      expect(result.attachments).toHaveLength(0)
+      expect(result.notes[0]).toContain('被拒绝')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('用 manual 模式逐跳跟随：公网重定向照常拿到图片', async () => {
+    const calls: Array<{ url: string; redirect?: string }> = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: { redirect?: string }) => {
+        calls.push({ url: String(url), redirect: init?.redirect })
+        if (calls.length === 1) {
+          return new Response('', { status: 301, headers: { location: 'https://cdn.example.com/b.png' } })
+        }
+        return new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { 'content-type': 'image/png' },
+        })
+      }),
+    )
+    try {
+      const result = await hydrateImageAttachments([
+        { type: 'image', url: 'https://example.com/a.png' },
+      ])
+      expect(result.attachments).toHaveLength(1)
+      expect(result.attachments[0]?.contentType).toBe('image/png')
+      expect(calls).toHaveLength(2)
+      // 每一跳都是 manual，插件自己解析 Location 并校验
+      expect(calls.every((c) => c.redirect === 'manual')).toBe(true)
+      expect(calls[1]?.url).toBe('https://cdn.example.com/b.png')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('重定向超过 3 跳时放弃', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('', { status: 302, headers: { location: 'https://example.com/next' } })),
+    )
+    try {
+      const result = await hydrateImageAttachments([
+        { type: 'image', url: 'https://example.com/a.png' },
+      ])
+      expect(result.attachments).toHaveLength(0)
+      expect(result.notes[0]).toContain('重定向超过')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('带 abort signal 与超时（不能用无超时的裸 fetch）', async () => {
+    let seenSignal: unknown
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: { signal?: unknown }) => {
+        seenSignal = init?.signal
+        return new Response(new Uint8Array([1]), { status: 200 })
+      }),
+    )
+    try {
+      await hydrateImageAttachments([{ type: 'image', url: 'https://example.com/a.png' }])
+      expect(seenSignal).toBeInstanceOf(AbortSignal)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})

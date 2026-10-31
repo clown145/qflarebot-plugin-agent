@@ -10,12 +10,17 @@
 import type { Logger, PluginContext, ScopedR2 } from '@qqbot/sdk'
 import type { AgentConfig } from '../config/index.js'
 import type { HistoryRow, SummaryInput } from '../do/agent-object.js'
-import type { InboundMessage } from '../types.js'
+import type { InboundMessage, RunStatus } from '../types.js'
 import type { LLMService } from '../llm/contract.js'
 import type { ToolRegistry } from '../tools/registry.js'
 import type { PermissionLevel, RegisteredTool } from '../tools/types.js'
 import { buildMessages } from './context.js'
-import { describeLoopError, runAgentLoop, type LoopResult } from './loop.js'
+import {
+  describeLoopError,
+  LoopCancelledError,
+  runAgentLoop,
+  type LoopResult,
+} from './loop.js'
 import type { StoredSummary } from './context-size.js'
 import { createToolRegistry } from '../tools/registry.js'
 import { createTimeTool } from '../tools/time.js'
@@ -33,6 +38,7 @@ import { parseSkillCommand } from '../skills/context.js'
 import { buildFragmentBlock, listActiveFragments } from '../prompt-fragments.js'
 import {
   listPluginTools,
+  sanitizeToolName,
   type PluginToolExecutor,
   type PluginToolMeta,
   type PluginToolsService,
@@ -56,6 +62,22 @@ export interface AgentStub {
   stageSummary(messages: SummaryInput[], coveredMessages: number): Promise<void>
   /** 读取会话摘要（`summary` 模式用） */
   summary(): Promise<StoredSummary | null>
+  /**
+   * 读这个 run 的当前状态。**取消判定的跨 isolate 通道**：
+   * `/stop` 打在 DO 上（另一个 isolate），执行流只能靠轮询这里知道。
+   *
+   * 可选：老的 stub / 测试替身没有它时，按「未取消」处理（不检查）。
+   */
+  runStatus?(runId: string): Promise<RunStatus | null>
+  /**
+   * 续租。每步之前调一次，把 `lock.expiresAt` 往后推。
+   *
+   * 不续租的话，单次 run 的最坏耗时（8 步 × 20 秒 = 160 秒）必然超过
+   * `LEASE_MS`（90 秒），另一个执行者会在锁过期后接手同一个 run，用户收到两条回复。
+   *
+   * 可选：没有它时不续租（测试替身用）。
+   */
+  renewLease?(runId: string): Promise<boolean>
 }
 
 export interface ReplyFn {
@@ -101,8 +123,9 @@ const RETRY_DELAY_MS = 3_000
 /**
  * 装上下文、建工具集、跑一轮 loop。
  *
- * 抽出来是为了让 `runWithRetry` 能整个重跑——重跑时上下文和工具集都会重建，
- * 不会带着上一轮的部分状态。
+ * **这个函数整体只跑一次**（旧版外层 `runWithRetry` 会在 429 时把它整个重跑，
+ * 于是已经执行过的工具会重复产生副作用——见 executeRun 的注释）。
+ * 现在可重试的错误在 loop 内部的单次模型调用上重试，这里不再被重入。
  */
 async function runLoopOnce(input: {
   ctx: PluginContext<AgentConfig>
@@ -113,6 +136,10 @@ async function runLoopOnce(input: {
   message: InboundMessage
   runId: string
   allowDangerous?: boolean
+  /** 取消信号（本地一级） */
+  signal?: AbortSignal
+  /** 重试配置（下沉到单次模型调用） */
+  retry?: { times: number; delayMs: number }
 }): Promise<LoopResult> {
   const { ctx, logger, config, llm, agent, message, runId } = input
 
@@ -248,6 +275,17 @@ async function runLoopOnce(input: {
     maxModelSteps: config.max_model_steps,
     maxToolCalls: config.max_tool_calls,
     requestTimeoutMs: config.request_timeout_ms,
+    // 取消：signal 打断正在飞的模型调用，isCancelled 在每步开头问一次 DO。
+    // 两条都要有——只靠 signal 的话，abort 只发生在轮询器发现取消的那一刻，
+    // 而在那个 tick 之前到达的步仍会继续；只靠轮询的话，用户按 /stop 之后
+    // 还得等当前这次模型调用自己吐完（可能几十秒）。
+    ...(input.signal ? { signal: input.signal } : {}),
+    isCancelled: () => isRunCancelled(agent, runId),
+    // 重试下沉到**单次模型调用**：loop 状态与已执行的工具都不重来。
+    retry: input.retry ?? { times: 1, delayMs: RETRY_DELAY_MS },
+    // 每步之前续租：单次 run 最坏 8 步 × 20 秒 = 160 秒，必然超过 LEASE_MS(90s)。
+    // 不续的话另一个执行者会在锁过期后接手同一个 run，用户收到两条回复。
+    onStep: () => renewLease(agent, runId, logger),
     // 压缩在 loop 内部每步前执行（工具结果会不断堆进 messages）。
     //
     // **loop 里一律用 truncate**，包括 summary 模式：循环内不可能再插一次模型调用
@@ -312,41 +350,97 @@ async function resolvePersonaErrorText(
 }
 
 /**
- * 跑一次，遇到可重试错误就等一会儿再跑一次。
+ * 判断这个 run 是否已被取消（`/stop` / `/agent reset`）。
  *
- * **为什么不在事件处理器里做**：限流发生在 loop 内部（第一次模型调用就可能 429），
- * 在外面重试等于把整个 loop 重跑，但如果已经执行过工具就会重复副作用。
- * 所以放在这一层：重试时上下文和工具集重建，loop 从头开始——
- * 此时还没有产生任何副作用（第一次模型调用就失败了）。
- *
- * 重试次数固定为 1：两次都失败说明不是瞬时抖动，继续等只会吃满事件预算。
+ * 跨 isolate 的取消只能在**每次问 DO storage**：执行流在 Worker 的 isolate 里，
+ * `/stop` 打在 DO 的 isolate 里，两者没有共享对象。查询本身失败时按「未取消」，
+ * 一次 storage 抖动不该误杀正常对话。
  */
-async function runWithRetry(
-  run: () => Promise<LoopResult>,
-  logger: Logger,
-  delayMs: number,
-): Promise<LoopResult> {
+async function isRunCancelled(agent: AgentStub, runId: string): Promise<boolean> {
+  if (!agent.runStatus) return false
   try {
-    return await run()
-  } catch (error) {
-    const described = describeLoopError(error)
-    if (!described.retryable) throw error
-
-    logger.warn('可重试错误，稍后重试一次', { error: described.text, delayMs })
-    await sleep(delayMs)
-
-    try {
-      return await run()
-    } catch (secondError) {
-      const second = describeLoopError(secondError)
-      logger.error('重试后仍失败', { error: second.text })
-      throw secondError
-    }
+    return (await agent.runStatus(runId)) === 'cancelled'
+  } catch {
+    return false
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+/**
+ * 续租。`onStep` 每步调一次。
+ *
+ * 失效（返回 false）也不中断这一轮：续租失败通常意味着锁已经过期、
+ * 另一个执行者可能接手了，此时硬跑下去反而更糟——但更糟的选择是
+ * 半途抛错让用户什么都收不到。所以只 warn，由 `release()` 的 runId 校验兜底
+ * （旧执行者的 release 删不掉新执行者的锁）。
+ */
+async function renewLease(agent: AgentStub, runId: string, logger: Logger): Promise<void> {
+  if (!agent.renewLease) return
+  try {
+    const renewed = await agent.renewLease(runId)
+    if (!renewed) logger.warn('续租失败，锁可能已被他人接管', { runId })
+  } catch (error) {
+    logger.warn('续租出错，继续执行', {
+      runId,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+/**
+ * 取消轮询的退避参数：首查 800ms，之后每次翻倍，封顶 5 秒。
+ *
+ * 为什么要退避而不是固定 500ms：这个轮询是**每次 run 都在跑**的，
+ * 不是「用户按了 /stop 才跑」。一次模型调用最长 20 秒，固定 500ms 就是
+ * 每次对话多打 40 次 DO RPC（DO 按 GB-秒 + 请求计费，免费版额度共享）。
+ * 退避后：典型 3 秒调用只多 2 次 RPC，20 秒的长调用约 5 次，
+ * 而 /stop 的最坏响应时间仍然是 5 秒级、通常 1 秒级。
+ */
+const CANCEL_POLL_FIRST_MS = 800
+const CANCEL_POLL_MAX_MS = 5_000
+
+/**
+ * 取消轮询器：**唯一**负责在 `/stop` 之后 abort 正在飞的模型调用的地方。
+ *
+ * 为什么单独一个轮询器而不是在每步检查时顺便 abort：
+ * 步与步之间的检查只发生在两次模型调用之间；一次模型调用可能跑满 20 秒，
+ * 用户按 `/stop` 之后要等这一整段结束才看到停止。这个轮询把
+ * 「已停止继续生成」的延迟压到秒级。
+ *
+ * 返回一个 stop 函数，调用方在 finally 里必须调它（否则定时器会泄漏到下一次请求）。
+ */
+function startCancellationWatcher(
+  agent: AgentStub,
+  runId: string,
+  controller: AbortController,
+  logger: Logger,
+): () => void {
+  if (!agent.runStatus) return () => {}
+
+  let stopped = false
+  let interval = CANCEL_POLL_FIRST_MS
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  const tick = async (): Promise<void> => {
+    if (stopped || controller.signal.aborted) return
+    try {
+      if ((await agent.runStatus?.(runId)) === 'cancelled') {
+        logger.info('检测到 run 已取消，中断正在进行的模型调用', { runId })
+        controller.abort(new Error('run cancelled by user'))
+        return
+      }
+    } catch {
+      // 查询失败不当成取消：下一步的同步检查会再试
+    }
+    interval = Math.min(interval * 2, CANCEL_POLL_MAX_MS)
+    if (!stopped) timer = setTimeout(() => void tick(), interval)
+  }
+
+  timer = setTimeout(() => void tick(), interval)
+
+  return () => {
+    stopped = true
+    if (timer) clearTimeout(timer)
+  }
 }
 
 /**
@@ -364,27 +458,32 @@ export async function executeRun(
 ): Promise<RunOutcome> {
   const { ctx, logger, config, llm, agent, reply } = deps
 
+  // 本地取消信号。跨 isolate 的那一级由 DO storage 承担（见 isRunCancelled），
+  // 这里负责**打断正在飞的模型调用**——llm 契约里早就有 ChatRequest.signal
+  // （src/llm/client.ts 透传），只是从来没人设置过它。
+  const controller = new AbortController()
+  const stopWatcher = startCancellationWatcher(agent, runId, controller, logger)
+
   try {
     // 1–3. 装上下文、建工具集、跑 loop。
     //
-    // 限流/超时这类可重试错误在这里**就地重试一次**，而不是退回队列——
-    // 退回队列会让用户什么都收不到（消息静默消失）。429 通常几秒就恢复，
-    // 而被动回复窗口群聊有 5 分钟，完全等得起。
-    const result = await runWithRetry(
-      () =>
-        runLoopOnce({
-          ctx,
-          logger,
-          config,
-          llm,
-          agent,
-          message,
-          runId,
-          allowDangerous: deps.allowDangerous,
-        }),
+    // **重试不在这里**：限流/超时这类可重试错误在 loop 内部就地对**单次模型调用**
+    // 重试一次。旧版本在这里重跑整个 runLoopOnce，于是一旦第 1 步已经执行过工具
+    // （比如 schedule.create 已经 INSERT 过一行），第 2 步 429 会让整个 loop
+    // 从头再来——工具副作用执行两次，而注释当时还声称「此时还没有产生任何副作用」。
+    // 重试下沉之后，已经跑过的工具不会重来，消息数组也不会被重置。
+    const result = await runLoopOnce({
+      ctx,
       logger,
-      deps.retryDelayMs ?? RETRY_DELAY_MS,
-    )
+      config,
+      llm,
+      agent,
+      message,
+      runId,
+      allowDangerous: deps.allowDangerous,
+      signal: controller.signal,
+      retry: { times: 1, delayMs: deps.retryDelayMs ?? RETRY_DELAY_MS },
+    })
 
     // 4a. 先发工具产出的富媒体（图片/文件）。
     //
@@ -477,6 +576,20 @@ export async function executeRun(
 
     return { ok: true, retryable: false, replied, next }
   } catch (error) {
+    // 用户主动喊停不算失败：不回复、不写历史、不退回队列。
+    //
+    // 三条都必须不做：
+    // - **不回复**：用户说的是「别说了」，再补一句错误提示就是反着来；
+    // - **不写历史**：这一轮是旧上下文的产物，而 `release()` 见到 cancelled
+    //   本来也会跳过写历史（DO 侧双保险）；
+    // - **不退回队列**：退回等于「停不下来」，用户按 /stop 后它还会再跑一遍。
+    if (error instanceof LoopCancelledError || controller.signal.aborted) {
+      stopWatcher()
+      logger.info('run 已被用户取消，停止回复与写历史', { conversation: message.conversation })
+      await agent.release(runId, { ok: false, error: '用户取消了这轮回答' }).catch(() => undefined)
+      return { ok: false, retryable: false, replied: false }
+    }
+
     const described = describeLoopError(error)
     logger.error('run 失败', {
       conversation: message.conversation,
@@ -487,7 +600,7 @@ export async function executeRun(
     // **无论可不可重试，都要告诉用户**。
     //
     // 上一版在可重试时静默退回队列，用户什么都收不到——消息凭空消失，
-    // 比报错更让人困惑。而 runWithRetry 已经在内部重试过一次，
+    // 比报错更让人困惑。可重试错误已经在 loop 内部对单次模型调用重试过一次，
     // 走到这里说明重试也没成功，该让用户知道。
     //
     // 人格可以自定义错误文案（AstrBot 的 `custom_error_message`）：
@@ -507,6 +620,10 @@ export async function executeRun(
     await agent.release(runId, { ok: false, error: described.text })
     await bumpDailyStats(ctx.db, dayKey(config.timezone), { runs: 1, failed: 1 }).catch(() => {})
     return { ok: false, retryable: false, replied }
+  } finally {
+    // 成功路径也要停：否则轮询定时器会活过这次请求，
+    // 在 isolate 复用的情况下把 abort 打到下一轮的 controller 上。
+    stopWatcher()
   }
 }
 
@@ -640,15 +757,30 @@ export async function buildRegistry(
  * 函数不是可序列化的值。所以元数据从库里读，函数从提供者的
  * `services` 运行时取。
  *
- * 提供者的服务名约定是 `tools`：它导出一个
- * `{ [工具短名]: (input) => Promise<unknown> }` 的对象。
+ * ## 服务名与 key 的映射（这里踩过两个坑）
  *
- * ## 失败处理
+ * 1. **服务名是 `tools`，不是提供者插件名**。宿主对 `services` 的约定是
+ *    `{ <服务名>: (ctx) => <对象> }`，提供者导出的是 `services: { tools: () => … }`，
+ *    所以要用 `ctx.service('tools')` 取，而不是 `ctx.service(<插件名>)`。
+ * 2. **对象 key 是工具短名（未规整）**。`registerTool` 时登记的名字会经过
+ *    `sanitizeToolName()`（`weather.query` → `weather_query`），而 D1 里
+ *    `name` 列存的就是**规整后**的短名——执行对象用的是提供者写的那份原始 key。
+ *    两者不一致时按规整后的名字去取会永远取不到（`service[meta.name] === undefined`），
+ *    工具静默消失。所以这里两种 key 都试：先原始、再规整。
  *
- * 任何一个提供者出问题都**只影响它自己的工具**：
- * - 服务取不到（没装/被停用）→ 跳过它的全部工具
- * - 某个工具没有对应执行函数 → 跳过那个工具
- * - 每次调用都包了超时，防止一个插件拖死整个 run
+ * ## 一个**框架限制**，不要在这里假装解决
+ *
+ * 宿主的 `ctx.service(name)` 只认本插件 manifest 里 `depends` 声明过的服务。
+ * Agent 无法为「任意第三方插件」声明依赖——`depends` 是静态清单，插件名在安装
+ * 别的插件之前不可能知道。所以：
+ *
+ * - 第三方插件提供的工具，**只有在 Agent 的 depends 里能写死的服务名（`llm`、
+ *   未来的 `tools`）才真的取得到**；
+ * - 其余 owner 的 `ctx.service()` 会抛「没有在 depends 中声明服务」。
+ *
+ * 这里不伪造可用性：抛错时**记一次带原因日志**（而不是静默 continue），
+ * 并在 docs/plugin-api.md 里如实写明限制。以前是无日志 `continue`，
+ * 表现为「按文档接线了但工具就是不见」，排障时完全看不出原因。
  */
 async function loadPluginTools(ctx: PluginContext<AgentConfig>): Promise<RegisteredTool[]> {
   let metas: PluginToolMeta[]
@@ -670,22 +802,111 @@ async function loadPluginTools(ctx: PluginContext<AgentConfig>): Promise<Registe
 
   const out: RegisteredTool[] = []
   for (const [owner, items] of byOwner) {
-    let service: PluginToolsService
-    try {
-      service = ctx.service<PluginToolsService>(owner)
-    } catch {
-      // 提供者没装 / 被停用：静默跳过（这条路径每个会话都会走，不能刷日志）
-      continue
-    }
-    if (!service || typeof service !== 'object') continue
+    const service = resolvePluginToolsService(ctx, owner)
+    if (!service) continue
 
+    let registered = 0
     for (const meta of items) {
-      const execute = service[meta.name]
-      if (typeof execute !== 'function') continue
+      const execute = pickExecutor(service, meta)
+      if (typeof execute !== 'function') {
+        // 有元数据却没有执行函数：注册时可能写坏、或提供者改了 key。
+        // 只影响这一个工具，记一条可排查的 warn（以前是静默 continue）
+        ctx.logger.warn('插件工具没有对应的执行函数，已跳过', {
+          owner,
+          tool: meta.fullName,
+          keys: Object.keys(service).slice(0, 10),
+        })
+        continue
+      }
       out.push(toRegisteredPluginTool(meta, execute))
+      registered += 1
+    }
+
+    if (registered === 0 && items.length > 0) {
+      ctx.logger.warn('插件声明了工具但一个都没注册上', { owner, count: items.length })
     }
   }
   return out
+}
+
+/**
+ * 取一个提供者的 `tools` 服务对象。
+ *
+ * 取不到就返回 null 并**记日志说明原因**：这条路径每个会话都会走，
+ * 所以按 owner 做**时间窗节流**（10 分钟内只记一次），既能查到原因又不刷屏。
+ *
+ * 用时间窗而不是「只记一次」：结构性问题修好后（比如宿主支持了动态 depends），
+ * 日志应当能重新出现；进程内永久静音会让「第一次没注意到」的人再也看不到。
+ */
+const pluginToolWarnAt = new Map<string, number>()
+const PLUGIN_TOOL_WARN_INTERVAL_MS = 10 * 60_000
+
+function shouldWarnPluginTool(owner: string, now: number): boolean {
+  const last = pluginToolWarnAt.get(owner)
+  if (last !== undefined && now - last < PLUGIN_TOOL_WARN_INTERVAL_MS) return false
+  pluginToolWarnAt.set(owner, now)
+  return true
+}
+
+function resolvePluginToolsService(
+  ctx: PluginContext<AgentConfig>,
+  owner: string,
+): PluginToolsService | null {
+  // 首选取约定服务名 `tools`（提供者 `services: { tools: () => … }`）。
+  // 取不到再退回提供者插件名：老文档曾把服务名写成插件名，兼容它不会带来风险
+  // ——两个都取不到就是「没有」，行为与以前一致。
+  const candidates = ['tools', owner]
+  const errors: string[] = []
+
+  for (const name of candidates) {
+    let raw: unknown
+    try {
+      raw = ctx.service<PluginToolsService>(name)
+    } catch (error) {
+      errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`)
+      continue
+    }
+    if (raw && typeof raw === 'object') return raw as PluginToolsService
+  }
+
+  // 框架的硬约束：depends 里没声明的服务取不到。
+  // 这不是「提供者没装」的瞬时状态，而是**结构性限制**，必须能看得见——
+  // 以前这里是静默 continue，表现为「按文档接线了但工具就是不见」，完全查不出原因。
+  // 按 owner 做时间窗节流，避免每个会话刷一条。
+  if (shouldWarnPluginTool(owner, Date.now())) {
+    ctx.logger.warn(
+      '第三方插件工具当前不可用：宿主只允许取 depends 里声明的服务，' +
+        'Agent 无法为任意插件声明依赖（见 docs/plugin-api.md「已知限制」）',
+      { owner, error: errors.join('; ') },
+    )
+  }
+  return null
+}
+
+/**
+ * 从服务对象里挑执行函数。
+ *
+ * 提供者写的是**原始短名**，而 D1 里的 `meta.name` 是 `sanitizeToolName()` 的
+ * 结果（`weather.query` → `weather_query`）。两种 key 都要试，顺序是
+ * 「原始 → 规整 → 反查（把服务对象里的 key 规整后比对）」。
+ */
+function pickExecutor(
+  service: PluginToolsService,
+  meta: PluginToolMeta,
+): PluginToolExecutor | undefined {
+  const direct = service[meta.name]
+  if (typeof direct === 'function') return direct
+
+  const sanitized = sanitizeToolName(meta.name)
+  const bySanitized = service[sanitized]
+  if (typeof bySanitized === 'function') return bySanitized
+
+  // 最后一种：提供者用了原名（含点、空格、中文），与服务对象 key 只是一次规整之差
+  for (const [key, value] of Object.entries(service)) {
+    if (typeof value !== 'function') continue
+    if (sanitizeToolName(key) === sanitized) return value
+  }
+  return undefined
 }
 
 /** 把一条元数据 + 执行函数包成 Agent 自己的 RegisteredTool */

@@ -188,3 +188,80 @@ describe('loop 的压缩接线', () => {
     expect(result.compactedRounds).toBe(0)
   })
 })
+
+/**
+ * Lead 追加项 A：单轮内「截断超大工具结果」必须被写回 messages。
+ *
+ * `compactMessages` 在 `rounds.length <= 1` 时的返回值里 `droppedRounds` 是 0、
+ * 只有 `truncatedToolResults > 0`。如果 loop 只判断 `droppedRounds > 0`，
+ * 算出来的截断结果**写不回** messages —— 端到端等于没生效。
+ */
+describe('单轮内截断超大工具结果的接线', () => {
+  /** 一轮里塞多个巨大 tool 结果（同一轮 = 1 条 user + N 个 tool 结果） */
+  function singleRoundWithHugeToolResults(count: number, size: number): ModelMessage[] {
+    const messages: ModelMessage[] = [{ role: 'system', content: 'sys' }]
+    messages.push({ role: 'user', content: '帮我查几件事' })
+    messages.push({
+      role: 'assistant',
+      content: '',
+      toolCalls: Array.from({ length: count }, (_, i) => ({
+        id: `c${i}`,
+        name: 'big',
+        arguments: {},
+      })),
+    })
+    for (let i = 0; i < count; i += 1) {
+      messages.push({
+        role: 'tool',
+        toolCallId: `c${i}`,
+        toolName: 'big',
+        content: '巨大结果'.repeat(size),
+      })
+    }
+    return messages
+  }
+
+  it('只有一轮时 droppedRounds=0，但截断必须真的写回：发给模型的 tool 内容变短', async () => {
+    const calls: ModelMessage[][] = []
+    // 每条 tool 结果 ≈ 8000 字符 ≈ 4800 token，远超单条上限 2000 token
+    const messages = singleRoundWithHugeToolResults(6, 2000)
+
+    const result = await runAgentLoop({
+      llm: fakeLLM('好', calls),
+      registry: createToolRegistry([]),
+      logger,
+      model: 'chat',
+      messages,
+      // 单步即可：只要保证「第一次模型调用前压过一次」
+      maxModelSteps: 1,
+      maxToolCalls: 3,
+      requestTimeoutMs: 1000,
+      toolContext,
+      compaction: { mode: 'truncate', maxTokens: 1000 },
+    })
+
+    // 丢弃轮数仍然是 0（单轮不能丢问题）
+    expect(result.compactedRounds).toBe(0)
+
+    const sent = calls[0]!
+    const toolsBefore = messages.filter((m) => m.role === 'tool')
+    const toolsAfter = sent.filter((m) => m.role === 'tool')
+    // 消息条数不变（只截内容，不删消息，配对结构保持）
+    expect(toolsAfter).toHaveLength(toolsBefore.length)
+
+    const totalBefore = toolsBefore.reduce(
+      (n, m) => n + ('content' in m ? String(m.content).length : 0),
+      0,
+    )
+    const totalAfter = toolsAfter.reduce(
+      (n, m) => n + ('content' in m ? String(m.content).length : 0),
+      0,
+    )
+    // 关键断言：真的变短了（没变短说明截断结果没写回 messages）
+    expect(totalAfter).toBeLessThan(totalBefore)
+    // tool_call_id 配对必须完整保留（这里读到的是契约层的线格式：
+    // 内部 ModelMessage 的 toolCallId 在 toChatMessages 里变成 tool_call_id）
+    const idsAfter = toolsAfter.map((m) => String((m as { tool_call_id?: string }).tool_call_id))
+    expect(idsAfter).toEqual(['c0', 'c1', 'c2', 'c3', 'c4', 'c5'])
+  })
+})

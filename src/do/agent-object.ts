@@ -33,7 +33,7 @@
 
 import { PluginDurableObject } from '@qqbot/sdk'
 import type { StoredSummary } from '../agent/context-size.js'
-import type { InboundMessage, RunRecord } from '../types.js'
+import type { InboundMessage, RunRecord, RunStatus } from '../types.js'
 
 /**
  * 待摘要的一条消息。
@@ -290,24 +290,34 @@ export class Agent extends PluginDurableObject {
     const now = Date.now()
     const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
 
+    // 被取消的 run **保留 cancelled 状态**。
+    //
+    // 执行流被 `/stop` 打断后仍会走一次 `release()` 收尾（否则锁永远不释放）。
+    // 如果这里无条件改写成 failed/completed，那个「用户主动取消」的事实就丢了：
+    // 排障时看起来像一次执行失败，`prune` 的 cancelled 分支也永远走不到。
+    const cancelled = run?.status === 'cancelled'
     if (run) {
       await this.ctx.storage.put(`run:${runId}`, {
         ...run,
-        status: result.ok ? 'completed' : 'failed',
+        status: cancelled ? 'cancelled' : result.ok ? 'completed' : 'failed',
         error: result.error,
         lockedUntil: undefined,
         updatedAt: now,
       } satisfies RunRecord)
     }
 
-    // 被 `/agent reset` 取消的 run 不写历史：用户明确清了记忆，这一轮是旧上下文的产物。
-    // 队列里被取消的 run 同样不再执行（claim 只认 pending）。
-    const cancelled = run?.status === 'cancelled'
+    // 被 `/agent reset` / `/stop` 取消的 run 不写历史：用户明确清了记忆，
+    // 这一轮是旧上下文的产物。队列里被取消的 run 同样不再执行（claim 只认 pending）。
     if (!cancelled && result.history?.length) {
       await this.appendHistory(result.history)
     }
 
-    await this.ctx.storage.delete('lock')
+    // **只删自己的锁**。
+    //
+    // 以前无条件 `delete('lock')`：执行者 A 的租约过期后 B 接手同一个 run（甚至
+    // 新 run）拿到了锁，A 跑完收尾时把 B 的锁删掉——于是同会话可以并发执行，
+    // 串行化保证直接失效，用户收到两条回复且历史交错。
+    await this.releaseLockIfOwned(runId)
 
     // 队列里还有活就立刻认领下一个并返回给调用方——调用方（事件处理器）
     // 可以接着跑，不必等 cron。
@@ -315,6 +325,61 @@ export class Agent extends PluginDurableObject {
     // 这是「不需要定期唤醒」的关键：上一版跑完就撒手，队列里的 run 只能靠
     // cron 每分钟轮询捡，而 DO 按 GB-秒计费，空转唤醒是纯浪费。
     return this.claim(now)
+  }
+
+  /**
+   * 续租：把锁与 run 的 `lockedUntil/expiresAt` 往后推一个 `LEASE_MS`。
+   *
+   * 为什么必须做：单次 run 的最坏耗时是 `max_model_steps`（默认 8）×
+   * `request_timeout_ms`（默认 20 秒）= 160 秒，而 `LEASE_MS` 只有 90 秒。
+   * 也就是说**正常的长回答必然超租约**：锁过期 → `claim()` 认为执行者死了 →
+   * 把同一个 run 退回 pending 并重新认领 → 两个执行者跑同一轮，
+   * 用户收到两条回复、历史写两遍。
+   *
+   * 返回 false 表示锁已经不属于这个 run（被 reset / 被他人接管），
+   * 调用方应当知道自己的续租失效了（但不该因此抛错中断对话）。
+   */
+  async renewLease(runId: string): Promise<boolean> {
+    const lock = await this.ctx.storage.get<{ runId: string; expiresAt: number }>('lock')
+    if (!lock || lock.runId !== runId) return false
+
+    const now = Date.now()
+    const expiresAt = now + LEASE_MS
+    await this.ctx.storage.put('lock', { runId, expiresAt })
+
+    const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
+    // run 已不在 running（被取消/被清理）时只续锁没有意义，如实返回 false
+    if (!run || run.status !== 'running') return false
+    await this.ctx.storage.put(`run:${runId}`, {
+      ...run,
+      lockedUntil: expiresAt,
+      updatedAt: now,
+    } satisfies RunRecord)
+    return true
+  }
+
+  /**
+   * 读一个 run 的状态。执行流用它做**跨 isolate 的取消判定**
+   * （`/stop` 打在 DO 里，跑 loop 的 Worker 只能按步轮询这里）。
+   *
+   * run 不存在（已被 prune 掉）返回 null，调用方按「未取消」处理。
+   */
+  async runStatus(runId: string): Promise<RunStatus | null> {
+    const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
+    return run?.status ?? null
+  }
+
+  /**
+   * 只在自己持有锁时删锁。
+   *
+   * 竞态的形态：执行者 A 的租约过期 → B 认领下一个 run 并写入自己的锁 →
+   * A 这时才跑完收尾。无条件删锁会让 B 的锁消失，同会话立刻可以并发执行。
+   */
+  private async releaseLockIfOwned(runId: string): Promise<void> {
+    const lock = await this.ctx.storage.get<{ runId: string }>('lock')
+    if (!lock) return
+    if (lock.runId !== runId) return
+    await this.ctx.storage.delete('lock')
   }
 
   /**
@@ -337,7 +402,7 @@ export class Agent extends PluginDurableObject {
       await this.ctx.storage.put(queueKey(await nextSequence(this.ctx.storage), run.id), run.id)
     }
 
-    await this.ctx.storage.delete('lock')
+    await this.releaseLockIfOwned(runId)
 
     // **不立刻重新认领**：退回的 run 会马上被捡回来，等于无限重试，
     // 而上游限流这类错误需要等一会儿再试。交给 cron 或下一次用户消息触发。
@@ -347,6 +412,11 @@ export class Agent extends PluginDurableObject {
   // ------------------------------------------------------------ 历史
 
   async history(limit: number): Promise<HistoryRow[]> {
+    // `slice(-0)` 等于 `slice(0)`，所以 limit=0 会返回**全部历史**而不是空——
+    // 而配置允许 `history_limit: 0`（表示「不给历史」）。这个边界必须在读之前挡掉：
+    // 调用方传 0 的本意是「不要历史」，返回全部正好是反的，上下文会被灌满。
+    if (!Number.isFinite(limit) || limit <= 0) return []
+
     const all = await this.ctx.storage.list<HistoryRow>({ prefix: 'msg:' })
     const rows = [...all.entries()]
       .sort((a, b) => a[0].localeCompare(b[0]))
@@ -476,23 +546,40 @@ export class Agent extends PluginDurableObject {
    * AstrBot 的 `/stop` 就是这个语义（`active_event_registry.stop_all()`），
    * 它和 `/reset` 是两个命令 —— 用户想「打断这句」时不该被迫丢掉全部记忆。
    *
-   * 实现上只把 run 标成 cancelled：`release()` 见到 cancelled 就跳过写历史，
-   * 所以被打断的那次回答不会污染记忆。
+   * 实现上只把 run 标成 `cancelled`：
+   * - 执行流每步轮询 `runStatus()`，看到 cancelled 就停（**这是本条的关键**：
+   *   以前只改状态、没人读，`/stop` 形同虚设，用户按下后仍然会收到完整回答）；
+   * - `release()` 见到 cancelled 就跳过写历史，所以被打断的那次回答不会污染记忆。
+   *
+   * 锁不存在时也扫一遍 running 的 run：锁可能因为租约过期被别人摘掉，
+   * 而那个 run 仍在跑（比如跨事件预算的那条执行链）。只认锁会让 `/stop` 偶发无效。
    */
   async stop(): Promise<{ stopped: boolean }> {
+    const now = Date.now()
+
+    const stopRun = async (runId: string): Promise<boolean> => {
+      const key = `run:${runId}`
+      const run = await this.ctx.storage.get<RunRecord>(key)
+      if (!run || run.status !== 'running') return false
+      await this.ctx.storage.put(key, {
+        ...run,
+        status: 'cancelled',
+        updatedAt: now,
+      } satisfies RunRecord)
+      return true
+    }
+
     const lock = await this.ctx.storage.get<{ runId: string }>('lock')
-    if (!lock) return { stopped: false }
+    if (lock && (await stopRun(lock.runId))) return { stopped: true }
 
-    const key = `run:${lock.runId}`
-    const run = await this.ctx.storage.get<RunRecord>(key)
-    if (!run || run.status !== 'running') return { stopped: false }
+    // 兜底：没有锁（或锁指向的 run 已经不在 running）时，扫一遍 run 记录。
+    // 数量很小：终态 run 会被 prune 掉，同一会话同时最多一两个 running。
+    const runs = await this.ctx.storage.list<RunRecord>({ prefix: 'run:' })
+    for (const run of runs.values()) {
+      if (run.status === 'running' && (await stopRun(run.id))) return { stopped: true }
+    }
 
-    await this.ctx.storage.put(key, {
-      ...run,
-      status: 'cancelled',
-      updatedAt: Date.now(),
-    })
-    return { stopped: true }
+    return { stopped: false }
   }
 
   async stats(): Promise<{ history: number; pending: number; locked: boolean }> {
@@ -562,7 +649,14 @@ export class Agent extends PluginDurableObject {
     const all = await this.ctx.storage.list<RunRecord>({ prefix: 'run:' })
     const stale = [...all.entries()]
       .filter(([, run]) => {
-        if (run.status !== 'completed' && run.status !== 'failed') return false
+        // 终态有 4 个（见 types.ts 的 RunStatus）：pending / running 还要继续跑，
+        // completed / failed / cancelled 都已经结束。
+        //
+        // cancelled 以前漏了：用户每按一次 `/stop` 或 `/agent reset` 就永久留一条
+        // run 记录，DO storage 只增不减（它没有 TTL）。
+        if (run.status !== 'completed' && run.status !== 'failed' && run.status !== 'cancelled') {
+          return false
+        }
         return run.updatedAt < cutoff
       })
       .map(([key]) => key)

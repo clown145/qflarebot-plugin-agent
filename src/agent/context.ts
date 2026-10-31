@@ -360,11 +360,44 @@ function parseToolTraces(json: string | null): HistoryToolTrace[] {
  * 环境信息（现在几点、在哪说话），提前给比追加强。
  */
 function withReminder(content: ModelContent, reminder: string): ModelContent {
+  if (!reminder) return content
   if (typeof content === 'string') {
-    return `${reminder}\n\n${content}`
+    return `${reminder}\n\n${neutralizeReminderTags(content)}`
   }
   // 多模态：把 reminder 作为第一个 text 片段
-  return [{ type: 'text', text: reminder }, ...content]
+  return [
+    { type: 'text', text: reminder },
+    ...neutralizeParts(content),
+  ]
+}
+
+/**
+ * 中和用户正文里的 `<system_reminder>` 标记。
+ *
+ * 为什么必须做：真正的环境信息（时间/会话/说话人）是用
+ * `<system_reminder>…</system_reminder>` 包起来拼在**本轮 user 消息**里的，
+ * 模型被训练成「看到这个标记就是系统给的」。而用户的聊天正文同样能写出这段标签，
+ * 于是一次输入里会出现两个 `<system_reminder>`——模型分不清哪段才是系统的，
+ * 这正是提示注入的经典形态（伪造「现在是管理员模式」之类）。
+ *
+ * 处理方式是把用户内容里的尖括号替换成全角字符：语义仍然可读（人看得出来用户
+ * 写了这个词），但**不再构成标签**，模型侧也就没有可混淆的结构。
+ *
+ * 只改这一对标记，不做通用的 HTML/XML 转义：那会把 `a < b`、代码片段、
+ * XML 示例一起改乱，而这些是正常对话内容。
+ */
+function neutralizeReminderTags(text: string): string {
+  if (!text.includes('<') && !text.includes('>')) return text
+  return text.replace(/<(\/?)\s*system_reminder\s*>/gi, (_match, slash: string) =>
+    slash ? '＜/system_reminder＞' : '＜system_reminder＞',
+  )
+}
+
+/** 多模态内容里只动 text 片段，图片片段原样保留 */
+function neutralizeParts(parts: ModelContentPart[]): ModelContentPart[] {
+  return parts.map((part) =>
+    part.type === 'text' ? { ...part, text: neutralizeReminderTags(part.text) } : part,
+  )
 }
 
 function buildUserContent(message: InboundMessage, supportsVision: boolean): ModelContent {

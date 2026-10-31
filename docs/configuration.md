@@ -311,7 +311,10 @@ token 按字符估算（CJK 约 0.6/字、其他约 0.3/字符），
 | `reply_mention` | **关** | 回复时 @ 说话人（`off` / `group` / `always`） |
 | `expose_sender_id` | 关 | 提示词里带上说话人的 openid |
 | `expose_datetime` | 关 | 提示词里带上当前时间 |
-| `search_api_key` | 空 | Tavily 搜索 Key。留空时 `search.web` 仍注册但返回可读错误 |
+
+> 搜索 Key **不在插件配置里**：它属于工具自己的配置，在面板「工具 → 搜索 → 配置」
+> 里填（`src/tools/types.ts` 的 `ToolConfigField` 机制）。早期版本的
+> `search_api_key` 配置项已经删除，升级后旧值会被忽略，请到工具面板重新填一次。
 
 ### 会话隔离（`isolate_sessions`）
 
@@ -381,9 +384,10 @@ system prompt 仍跨轮稳定，**不影响缓存**。
 > 绑死在重型基础设施上——多数部署里「有虚拟工作区」这句话等于不存在。
 
 
-### 关于 `search_api_key`
+### 关于搜索 Key
 
-未配置时 **工具仍然注册**，返回「还没配置搜索」的可读错误。
+搜索 Key 属于**工具自己的配置**（面板「工具 → 搜索 → 配置」），不是插件配置项。
+未配置时 **工具仍然注册**，调用会返回「还没配置搜索」的可读错误。
 这比整组不注册更诚实 —— 不注册等于假装这个能力不存在，模型会凭空瞎编。
 
 ---
@@ -412,7 +416,6 @@ system prompt 仍跨轮稳定，**不影响缓存**。
   "context_compression": "truncate",
   "max_context_tokens": 12000,
   "rate_limit_per_minute": 10,
-  "search_api_key": "",
   "content_filter_keywords": ""
 }
 ```

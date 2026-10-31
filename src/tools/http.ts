@@ -96,11 +96,17 @@ export function createHttpTool(): RegisteredTool {
           continue
         }
 
-        const { text, truncated } = await readCapped(response)
+        const { bytes, truncated } = await readCapped(response)
         // 结果要回到模型上下文里，而 plugin-llm 的请求体上限是 256 KB：
         // 1 MB 的正文塞进去会让下一条消息直接 bad_request，还会白烧 token。
         // 按字符截断（与 web.fetch_page 的 20k 一致），二进制走 base64 不截（调用方要完整字节）。
-        const capped = parsed.binary ? text : text.slice(0, MAX_BODY_CHARS)
+        //
+        // **binary 模式必须直接用原始字节做 base64**：先 `TextDecoder().decode()`
+        // 再 encode 回来是有损的——非 UTF-8 字节会被替换成 U+FFFD（EF BF BD），
+        // PNG/JPEG/ZIP 的头几个字节直接损坏，而调用方看不出任何异常。
+        // 这也是为什么 readCapped 返回的是 Uint8Array 而不是 string。
+        const text = parsed.binary ? '' : decodeCapped(bytes)
+        const capped = text.slice(0, MAX_BODY_CHARS)
         return {
           status: 'success',
           output: {
@@ -108,7 +114,7 @@ export function createHttpTool(): RegisteredTool {
             url: current,
             contentType: response.headers.get('content-type') ?? '',
             truncated: truncated || capped.length < text.length,
-            ...(parsed.binary ? { bodyBase64: toBase64(text) } : { body: capped }),
+            ...(parsed.binary ? { bodyBase64: bytesToBase64(bytes) } : { body: capped }),
           },
         }
       }
@@ -118,10 +124,15 @@ export function createHttpTool(): RegisteredTool {
   }
 }
 
-/** 读响应体并截断。按字节数算，不是按字符——中文一个字三字节 */
-async function readCapped(response: Response): Promise<{ text: string; truncated: boolean }> {
+/**
+ * 读响应体并截断。按字节数算，不是按字符——中文一个字三字节。
+ *
+ * **返回原始字节而不是字符串**：binary 模式要拿它直接做 base64，
+ * 中间过一次 `TextDecoder` 会破坏非 UTF-8 字节（见调用处注释）。
+ */
+async function readCapped(response: Response): Promise<{ bytes: Uint8Array; truncated: boolean }> {
   const reader = response.body?.getReader()
-  if (!reader) return { text: '', truncated: false }
+  if (!reader) return { bytes: new Uint8Array(0), truncated: false }
 
   const chunks: Uint8Array[] = []
   let total = 0
@@ -148,13 +159,21 @@ async function readCapped(response: Response): Promise<{ text: string; truncated
     offset += chunk.byteLength
   }
 
-  return { text: new TextDecoder().decode(merged), truncated }
+  return { bytes: merged, truncated }
 }
 
-function toBase64(text: string): string {
-  const bytes = new TextEncoder().encode(text)
+/** 只有文本模式才解码。用非 fatal 解码器：上游编码标错时退化成替换字符，而不是抛错 */
+function decodeCapped(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes)
+}
+
+/** 对原始字节做 base64。分块避免大数组展开成函数参数时爆栈（与 media.ts 同一写法） */
+function bytesToBase64(bytes: Uint8Array): string {
+  const CHUNK = 0x8000
   let binary = ''
-  for (const byte of bytes) binary += String.fromCharCode(byte)
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+  }
   return btoa(binary)
 }
 

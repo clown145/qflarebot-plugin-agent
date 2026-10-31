@@ -8,7 +8,7 @@
  * 都是从配置/DB 一路传下来的，中间漏一环**不会报错**，只会「看起来一切正常但
  * 开关从来没生效」——正是这次审计在 `allowDangerous` 上发现过的失效模式。
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { buildRegistry, replyFromSession } from './run.js'
 import { buildMessages } from './context.js'
 import { applyToolSettings } from '../tools/catalog.js'
@@ -568,6 +568,85 @@ describe('插件提供的工具接通 buildRegistry', () => {
       new Set(['plugin.weather.query']),
     )
     expect(registry.list().map((t) => t.definition.name)).not.toContain('plugin.weather.query')
+  })
+
+  /**
+   * 回归：插件工具链路的两个 key 映射错误。
+   *
+   * ① 服务名约定是 `tools`（提供者 `services: { tools: () => … }`），
+   *    而代码取的是 `ctx.service(owner)`——按文档接线时工具静默消失。
+   * ② D1 里 `name` 列存的是 `sanitizeToolName()` 规整后的短名
+   *    （`weather.query` → `weather_query`），但提供者服务对象的 key 是原始名字，
+   *    于是 `service[meta.name]` 取到 undefined，工具又一次静默消失。
+   */
+  it('服务挂在约定名 tools 下时也能接通（不只是提供者插件名）', async () => {
+    const ctx = ctxWithPluginTools([meta], { query: async () => ({ temp: 21 }) }, 'tools')
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    expect(registry.list().map((t) => t.definition.name)).toContain('plugin.weather.query')
+  })
+
+  it('D1 里是规整后的短名、服务对象用原始 key（含点）时仍能取到执行函数', async () => {
+    // meta.name = 'weather.query'（带点）；D1 列存规整后的 'weather_query'
+    const dirty = { ...meta, name: 'weather_query' }
+    const ctx = ctxWithPluginTools([dirty], { 'weather.query': async () => ({ temp: 21 }) }, 'tools')
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    const names = registry.list().map((t) => t.definition.name)
+    expect(names).toContain('plugin.weather.query')
+
+    const result = await registry.execute('plugin.weather.query', {
+      db: ctx.db,
+      logger: ctx.logger,
+      conversationId: 'group:g1',
+      actorId: 'u1',
+      actorRole: 'admin',
+      scene: 'group',
+      targetId: 'g1',
+      runId: 'r1',
+      stepId: 's1',
+      toolCallId: 'c1',
+      input: {},
+      timezone: 'Asia/Shanghai',
+    })
+    expect(result.status).toBe('success')
+    expect(result.output).toMatchObject({ temp: 21 })
+  })
+
+  it('服务键被规整过（空格/中文换成下划线）时也能反查到执行函数', async () => {
+    const dirty = { ...meta, name: 'query_weather' }
+    const ctx = ctxWithPluginTools(
+      [dirty],
+      { 'query weather': async () => ({ ok: true }) },
+      'tools',
+    )
+    const registry = await buildRegistry(ctx, defaultConfig, false)
+    expect(registry.list().map((t) => t.definition.name)).toContain('plugin.weather.query')
+  })
+
+  it('取不到服务时记一条明确的 warn，而不是静默 continue', async () => {
+    const warns: string[] = []
+    const ctx = ctxWithPluginTools([meta], {}, 'not-provided')
+    const loggingCtx = {
+      ...ctx,
+      logger: {
+        debug() {},
+        info() {},
+        warn(message: string) {
+          warns.push(message)
+        },
+        error() {},
+      },
+    } as PluginContext<AgentConfig>
+
+    // 日志按 owner 做 10 分钟节流；把时钟推远，保证这条测试不依赖执行顺序
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60 * 60_000)
+    try {
+      await buildRegistry(loggingCtx, defaultConfig, false)
+    } finally {
+      now.mockRestore()
+    }
+    // 这条日志是「按文档接线了但工具不见」的唯一线索，必须存在且说得清原因
+    expect(warns.join('\n')).toContain('depends')
+    expect(warns.join('\n')).toContain('plugin-api.md')
   })
 
   it('enable_tools 关掉时，插件工具也不注册', async () => {

@@ -566,3 +566,229 @@ describe('摘要存储（summary 压缩模式）', () => {
     expect(await obj.takePendingSummary()).toBeNull()
   })
 })
+
+/**
+ * 回归：租约永不续期。
+ *
+ * `LEASE_MS=90s`，而单次 run 的最坏耗时是 8 步 × 20 秒 = 160 秒，
+ * 所以**正常的长回答必然超租约**：锁过期 → claim() 判定执行者已死 →
+ * 同一个 run 被退回 pending 并重新认领 → 两个执行者跑同一轮。
+ */
+describe('Agent.renewLease（租约续期）', () => {
+  it('续租把锁的过期时间推后，过期后不会被别人接管', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    const before = await storage.get<{ expiresAt: number }>('lock')
+    expect(before?.expiresAt).toBeDefined()
+
+    // 模拟「已经跑了 80 秒」：把锁与 run 的过期时间都推到快过期
+    const nearExpiry = Date.now() + 1_000
+    await storage.put('lock', { runId: runId!, expiresAt: nearExpiry })
+
+    const renewed = await obj.renewLease(runId!)
+    expect(renewed).toBe(true)
+
+    const after = await storage.get<{ expiresAt: number }>('lock')
+    expect(after!.expiresAt).toBeGreaterThan(nearExpiry)
+    // 推后量就是一个完整租约
+    expect(after!.expiresAt - Date.now()).toBeGreaterThan(LEASE_MS - 5_000)
+
+    // 关键行为：按「原来的」过期时间去认领，不该抢到（锁还活着）
+    await storage.put('lock', { runId: runId!, expiresAt: Date.now() + LEASE_MS })
+    expect((await obj.poll()).acquired).toBe(false)
+  })
+
+  it('run 的 lockedUntil 也一起续（否则 sweep 的判定与实际锁不一致）', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.renewLease(runId!)
+    const run = await storage.get<{ lockedUntil?: number; status: string }>(`run:${runId}`)
+    expect(run?.status).toBe('running')
+    expect(run?.lockedUntil).toBeGreaterThan(Date.now())
+  })
+
+  it('锁不属于这个 run 时返回 false（不越权续别人的锁）', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    await storage.put('lock', { runId: 'someone-else', expiresAt: Date.now() + 1000 })
+    expect(await obj.renewLease(runId!)).toBe(false)
+  })
+
+  it('run 已被取消时续租返回 false', async () => {
+    const { obj } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.stop()
+    expect(await obj.renewLease(runId!)).toBe(false)
+  })
+})
+
+/**
+ * 回归：`release()` 无条件删锁。
+ *
+ * 场景：执行者 A 的租约过期 → B 接手（写了自己的锁）→ A 才跑完收尾。
+ * 旧实现无条件 `delete('lock')` 会把 B 的锁删掉，同会话立刻可以并发执行。
+ */
+describe('Agent.release（只删自己的锁）', () => {
+  it('旧执行者收尾时不删新执行者的锁', async () => {
+    const { obj, storage } = makeObject()
+    const first = await obj.submit(message({ text: '第一条' }))
+    expect(first.acquired).toBe(true)
+
+    // 模拟「A 的租约过期、B 接手了另一个 run」
+    await storage.put('lock', { runId: 'newer-run', expiresAt: Date.now() + LEASE_MS })
+
+    await obj.release(first.runId!, { ok: true })
+
+    const lock = await storage.get<{ runId: string }>('lock')
+    expect(lock?.runId).toBe('newer-run')
+  })
+
+  it('retryLater 同样只删自己的锁', async () => {
+    const { obj, storage } = makeObject()
+    const first = await obj.submit(message())
+    await storage.put('lock', { runId: 'newer-run', expiresAt: Date.now() + LEASE_MS })
+
+    await obj.retryLater(first.runId!, '限流')
+
+    const lock = await storage.get<{ runId: string }>('lock')
+    expect(lock?.runId).toBe('newer-run')
+  })
+
+  it('自己持有锁时照常释放（不能因为加校验就不删了）', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.release(runId!, { ok: true })
+    expect(await storage.get('lock')).toBeUndefined()
+  })
+})
+
+/**
+ * 回归：`history(limit)` 的边界。
+ *
+ * `Array.prototype.slice(-0)` 等于 `slice(0)`，所以 `limit=0` 会返回**全部历史**。
+ * 而配置允许 `history_limit: 0`（意思是「不给模型历史」），
+ * 调用方（run.ts）传 0 时上下文会被灌满——正好与期望相反。
+ */
+describe('Agent.history 边界', () => {
+  it('limit=0 返回空数组，而不是全部历史', async () => {
+    const { obj } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.release(runId!, {
+      ok: true,
+      history: [historyRow('user', '第一句'), historyRow('assistant', '第一答')],
+    })
+
+    expect(await obj.history(0)).toEqual([])
+  })
+
+  it('负数与 NaN 也返回空数组', async () => {
+    const { obj } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.release(runId!, { ok: true, history: [historyRow('user', 'x')] })
+
+    expect(await obj.history(-5)).toEqual([])
+    expect(await obj.history(Number.NaN)).toEqual([])
+  })
+
+  it('正常 limit 不受影响', async () => {
+    const { obj } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.release(runId!, {
+      ok: true,
+      history: [historyRow('user', 'a'), historyRow('assistant', 'b'), historyRow('user', 'c')],
+    })
+    expect(await obj.history(2)).toHaveLength(2)
+  })
+})
+
+/**
+ * 回归：cancelled 的 run 永不被回收。
+ *
+ * `RunStatus` 的终态是 completed / failed / cancelled，但 prune 只清了前两个。
+ * 用户每按一次 `/stop`（`/agent reset` 也会 cancel）就永久留一条 run 记录，
+ * 而 DO storage 没有 TTL —— 只增不减。
+ */
+describe('Agent.prune 覆盖 cancelled', () => {
+  it('超期的 cancelled run 会被清掉', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.stop()
+
+    // 把更新时间推到很久以前（prune 按 updatedAt 判定超期）
+    const run = await storage.get<Record<string, unknown>>(`run:${runId}`)
+    await storage.put(`run:${runId}`, { ...run, updatedAt: Date.now() - 3600_000 })
+
+    expect(await obj.prune(600_000)).toBe(1)
+    expect(await storage.get(`run:${runId}`)).toBeUndefined()
+  })
+
+  it('未超期的 cancelled run 仍然保留（给排障留窗口）', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.stop()
+    expect(await obj.prune(600_000)).toBe(0)
+    expect(await storage.get(`run:${runId}`)).toBeDefined()
+  })
+})
+
+/**
+ * 回归：`/stop` 只改状态、执行流不知道。
+ *
+ * 这里测 DO 侧的**契约**：stop 之后 `runStatus()` 必须能读到 cancelled
+ * （执行流每步轮询它）。执行流侧的行为在 src/agent/run.test.ts 里测。
+ */
+describe('Agent.stop 的可观测性（执行流靠它判定取消）', () => {
+  it('stop 之后 runStatus 返回 cancelled', async () => {
+    const { obj } = makeObject()
+    const { runId } = await obj.submit(message())
+    expect(await obj.runStatus(runId!)).toBe('running')
+
+    expect((await obj.stop()).stopped).toBe(true)
+    expect(await obj.runStatus(runId!)).toBe('cancelled')
+  })
+
+  it('run 不存在时 runStatus 返回 null（执行流按未取消处理）', async () => {
+    const { obj } = makeObject()
+    expect(await obj.runStatus('no-such-run')).toBeNull()
+  })
+
+  it('锁被摘掉后仍能 stop 到正在跑的 run（只认锁会偶发无效）', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    // 模拟租约过期后锁被清掉，但执行流还在跑
+    await storage.delete('lock')
+
+    expect((await obj.stop()).stopped).toBe(true)
+    expect(await obj.runStatus(runId!)).toBe('cancelled')
+  })
+})
+
+/**
+ * 回归：取消后的收尾不能把 cancelled 改写成 failed。
+ *
+ * 执行流被 `/stop` 打断后仍要走一次 `release()` 释放锁；如果 release 无条件
+ * 按 `ok:false` 写成 failed，「用户主动取消」这个事实就丢了——
+ * 排障时看起来像一次执行失败，prune 的 cancelled 分支也永远走不到。
+ */
+describe('取消后的 release 保留 cancelled 状态', () => {
+  it('stop 之后 release 不会把状态改成 failed', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.stop()
+
+    await obj.release(runId!, { ok: false, error: '用户取消了这轮回答' })
+
+    const run = await storage.get<{ status: string }>(`run:${runId}`)
+    expect(run?.status).toBe('cancelled')
+    // 锁仍然要被释放（否则会话永远卡住）
+    expect(await storage.get('lock')).toBeUndefined()
+  })
+
+  it('没有取消时照常记 failed', async () => {
+    const { obj, storage } = makeObject()
+    const { runId } = await obj.submit(message())
+    await obj.release(runId!, { ok: false, error: '模型超时' })
+    const run = await storage.get<{ status: string }>(`run:${runId}`)
+    expect(run?.status).toBe('failed')
+  })
+})

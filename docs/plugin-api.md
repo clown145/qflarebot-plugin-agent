@@ -18,7 +18,20 @@
 ### 2. 注册片段
 
 ```ts
-import type { AgentPromptService } from 'qflarebot-plugin-agent/src/prompt-fragments'
+/**
+ * 接口要**内联声明**，不能 import 本插件的源码路径。
+ *
+ * 为什么：本插件不发 npm 包、package.json 里也没有 `exports`，
+ * 所以 `import ... from 'qflarebot-plugin-agent/src/...'` 在任何调用方里
+ * 都解析不了（构建直接失败）。插件之间的类型对齐靠「各自声明同一份形状」，
+ * 和 `llm` 服务的做法一致——这样两个插件可以独立发布、独立升级。
+ */
+interface AgentPromptService {
+  registerPrompt(plugin: string, fragment: string, priority?: number): Promise<boolean>
+  disablePrompt(plugin: string): Promise<boolean>
+  clearPrompt(plugin: string): Promise<boolean>
+  listPrompts(): Promise<Array<{ plugin: string; fragment: string; priority: number; enabled: boolean }>>
+}
 
 export default definePlugin({
   name: 'weather',
@@ -42,6 +55,9 @@ export default definePlugin({
   },
 })
 ```
+
+> 同一份接口在源码里是 `src/agent-service.ts` 的 `AgentService`，
+> 只作为**文档参考**——不要 import 它。
 
 ### 3. 之后每一轮
 
@@ -126,6 +142,11 @@ export default definePlugin({
 
 服务名约定是 **`tools`**，对象的 key 是**工具短名**（不是 `plugin.weather.query`）。
 
+> **key 怎么写都能匹配上**：Agent 会依次尝试「你写的原始 key」→「规整后的 key
+> （`weather.query` → `weather_query`）」→「把服务对象里的 key 规整后比对」。
+> 这一层是补过一个真 bug 的：早期只按规整后的名字取，而服务对象用的是原始 key，
+> 于是 `service[meta.name]` 恒为 `undefined`，工具**静默消失**。
+
 ## 为什么元数据和执行函数分两处
 
 | 部分 | 存哪 | 为什么 |
@@ -178,3 +199,43 @@ export default definePlugin({
 | 执行超时 | 返回 `timeout`，run 继续 |
 
 任何一个插件出问题都**只影响它自己的工具**。
+
+## 已知限制：第三方插件的工具当前不可用（框架约束，不是 bug）
+
+宿主的 `ctx.service(name)` 只认**本插件 manifest 里 `depends` 声明过的服务**：
+
+```ts
+// packages/runtime/src/context.ts
+if (!Object.hasOwn(plugin.manifest.depends ?? {}, serviceName)) {
+  throw new Error(`插件 ${name} 没有在 depends 中声明服务 ${serviceName}`)
+}
+```
+
+而 Agent 无法为「任意第三方插件」声明依赖——`depends` 是**静态清单**，
+写死在 manifest 里，插件名在安装别的插件之前不可能知道。所以：
+
+| 场景 | 现状 |
+| --- | --- |
+| 提供者把执行函数挂在 `services: { tools: () => … }` | **取不到**：`tools` 不在 Agent 的 depends 里，`ctx.service('tools')` 抛错 |
+| 提供者按插件名暴露（`services: { weather: () => … }`） | 同样取不到：`weather` 也不在 depends 里 |
+| 元数据注册成功（D1 里看得到） | ✅ 这一步是好的，管理页能看到 |
+| 模型实际调用 | ❌ 执行函数取不到，工具不注册 |
+
+代码的行为是**明确失败而不是伪造可用性**：
+
+- 注册表里不出现这个工具（模型看不到，不会尝试调用后被拒）；
+- 日志里记一条 `第三方插件工具当前不可用：宿主只允许取 depends 里声明的服务…`
+  （按 owner 做 10 分钟节流，不会刷屏），带 owner 与内部错误原因；
+- 有元数据但执行函数缺失时，另记一条 `插件工具没有对应的执行函数，已跳过`，
+  并带上该服务对象实际有哪些 key。
+
+### 会有解吗
+
+需要宿主支持「动态/通配服务声明」，例如 `depends: { "tools:*": "optional" }`
+或运行时的插件间事件总线。在那之前，**Agent 能可靠使用的外部工具只有内置的那些**，
+以及未来如果宿主把工具扩展做成协议而不是 `services` 的时候。
+
+如果你要接入自定义能力，目前可行的替代：
+1. 用内置的 `http.request` / `vfs.*` 组合（不需要新插件）；
+2. 把你的逻辑做成 Agent 的**提示词片段**（`registerPrompt`）来引导模型用内置工具；
+3. 等宿主把这条链路补上。

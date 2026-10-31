@@ -244,3 +244,213 @@ describe('describeLoopError', () => {
     expect(described.retryable).toBe(false)
   })
 })
+
+/**
+ * 回归：重试重跑整个 loop 导致工具副作用重复（P0）。
+ *
+ * 旧实现把重试放在 `run.ts` 的 `runWithRetry` 里、重跑整个 `runLoopOnce`。
+ * 实测：第 1 步 `schedule.create` 成功（INSERT 已落库）、第 2 步 429 →
+ * 整个 loop 从头再来 → INSERT 执行 2 次。
+ *
+ * 正确的层是**单次模型调用**：这里断言「工具只执行一次、模型最多调 2 次」。
+ */
+describe('单次模型调用的重试（不重跑 loop）', () => {
+  it('第 2 步 429 时只重试那次调用：工具只执行一次，模型调 2 次', async () => {
+    const execute = vi.fn(async () => ({ status: 'success' as const, output: '已建任务' }))
+    const tools = [{ ...tool('schedule.create', 'x'), execute }]
+
+    let call = 0
+    const llm = {
+      ...fakeLLM(),
+      chat: async () => {
+        call += 1
+        if (call === 1) {
+          return {
+            text: '',
+            tool_calls: [
+              { id: 'c1', name: 'schedule.create', arguments: JSON.stringify({ prompt: '喝水' }) },
+            ],
+            alias: 'chat',
+            provider: 'fake',
+            model: 'fake',
+            latency_ms: 1,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }
+        }
+        if (call === 2) {
+          const error = new Error('429 rate limited') as Error & { code: string }
+          error.code = 'rate_limit'
+          throw error
+        }
+        return {
+          text: '任务建好了',
+          alias: 'chat',
+          provider: 'fake',
+          model: 'fake',
+          latency_ms: 1,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }
+      },
+    } as unknown as LLMService
+
+    const result = await runAgentLoop(
+      loopOptions(llm, tools, { retry: { times: 1, delayMs: 0 } }),
+    )
+
+    expect(result.reply).toBe('任务建好了')
+    // 关键断言：有副作用的工具只跑了一次
+    expect(execute).toHaveBeenCalledOnce()
+    // 模型调 3 次是「1 次成功 + 1 次失败 + 1 次重试成功」，不是 loop 重来
+    expect(call).toBe(3)
+    // loop 的步数仍然是 2（第 1 步工具、第 2 步回答），没有从头再来
+    expect(result.steps).toBe(2)
+  })
+
+  it('不传 retry 时不重试（默认行为不变）', async () => {
+    let calls = 0
+    const llm = {
+      ...fakeLLM(),
+      chat: async () => {
+        calls += 1
+        const error = new Error('429') as Error & { code: string }
+        error.code = 'rate_limit'
+        throw error
+      },
+    } as unknown as LLMService
+
+    await expect(runAgentLoop(loopOptions(llm, []))).rejects.toThrow()
+    expect(calls).toBe(1)
+  })
+
+  it('不可重试错误（auth）即使配了 retry 也不重试', async () => {
+    let calls = 0
+    const llm = {
+      ...fakeLLM(),
+      chat: async () => {
+        calls += 1
+        const error = new Error('401') as Error & { code: string }
+        error.code = 'auth'
+        throw error
+      },
+    } as unknown as LLMService
+
+    await expect(
+      runAgentLoop(loopOptions(llm, [], { retry: { times: 1, delayMs: 0 } })),
+    ).rejects.toThrow()
+    expect(calls).toBe(1)
+  })
+
+  it('重试只做一次，不会无限重试', async () => {
+    let calls = 0
+    const llm = {
+      ...fakeLLM(),
+      chat: async () => {
+        calls += 1
+        const error = new Error('429') as Error & { code: string }
+        error.code = 'rate_limit'
+        throw error
+      },
+    } as unknown as LLMService
+
+    await expect(
+      runAgentLoop(loopOptions(llm, [], { retry: { times: 1, delayMs: 0 } })),
+    ).rejects.toThrow()
+    expect(calls).toBe(2)
+  })
+})
+
+/**
+ * 回归：`/stop` 形同虚设（P0）。
+ *
+ * `stop()` 只改 DO 里的 status，执行流完全不知道，照旧把完整回答发出去。
+ * 现在 loop 每步开头问一次 `isCancelled()`，signal 则负责打断正在飞的调用。
+ */
+describe('取消（/stop）', () => {
+  it('取消后不再继续下一步：模型只调一次，抛 LoopCancelledError', async () => {
+    const { LoopCancelledError } = await import('./loop.js')
+    let cancelled = false
+    const llm = fakeLLM([
+      { toolCalls: [{ id: 'c1', name: 't', arguments: {} }] },
+      { text: '不该走到这里' },
+    ])
+    let calls = 0
+    const counting = {
+      ...llm,
+      chat: async (...args: Parameters<LLMService['chat']>) => {
+        calls += 1
+        // 第一次模型调用之后（执行完工具）用户按了 /stop
+        if (calls === 1) cancelled = true
+        return llm.chat(...args)
+      },
+    } as LLMService
+
+    await expect(
+      runAgentLoop(
+        loopOptions(
+          counting,
+          [tool('t', 'x')],
+          { isCancelled: async () => cancelled },
+        ),
+      ),
+    ).rejects.toBeInstanceOf(LoopCancelledError)
+    // 取消发生在第 2 步开头：模型只被调了 1 次
+    expect(calls).toBe(1)
+  })
+
+  it('signal 已 abort 时一步都不跑', async () => {
+    const { LoopCancelledError } = await import('./loop.js')
+    const controller = new AbortController()
+    controller.abort()
+    let calls = 0
+    const llm = {
+      ...fakeLLM(),
+      chat: async () => {
+        calls += 1
+        return { text: 'x', alias: 'chat', provider: 'fake', model: 'fake', latency_ms: 1 }
+      },
+    } as unknown as LLMService
+
+    await expect(
+      runAgentLoop(loopOptions(llm, [], { signal: controller.signal })),
+    ).rejects.toBeInstanceOf(LoopCancelledError)
+    expect(calls).toBe(0)
+  })
+
+  it('signal 透传给 llm.chat（llm 契约里早就有 ChatRequest.signal，只是从来没人设置）', async () => {
+    const controller = new AbortController()
+    let seen: AbortSignal | undefined
+    const llm = {
+      ...fakeLLM(),
+      chat: async (req: { signal?: AbortSignal }) => {
+        seen = req.signal
+        return { text: '好', alias: 'chat', provider: 'fake', model: 'fake', latency_ms: 1 }
+      },
+    } as unknown as LLMService
+
+    await runAgentLoop(loopOptions(llm, [], { signal: controller.signal }))
+    expect(seen).toBe(controller.signal)
+  })
+
+  it('取消检查失败（DO 抖动）按未取消处理，不误杀对话', async () => {
+    const result = await runAgentLoop(
+      loopOptions(fakeLLM([{ text: '正常回答' }]), [], {
+        isCancelled: async () => {
+          throw new Error('DO 抖动')
+        },
+      }),
+    )
+    expect(result.reply).toBe('正常回答')
+  })
+
+  it('onStep 每步都在，续租靠它（step 1,2 都被回调）', async () => {
+    const steps: number[] = []
+    const llm = fakeLLM([
+      { toolCalls: [{ id: 'c1', name: 't', arguments: {} }] },
+      { text: 'done' },
+    ])
+    await runAgentLoop(
+      loopOptions(llm, [tool('t', 'x')], { onStep: async (n: number) => void steps.push(n) }),
+    )
+    expect(steps).toEqual([1, 2])
+  })
+})

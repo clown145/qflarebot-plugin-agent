@@ -6,19 +6,27 @@
 | --- | --- | --- | --- |
 | `time.now` | 1 | 无 | — |
 | `web.fetch_page` | 1 | 无 | — |
-| `search.web` | 1 | 无 | 配了 `search_api_key`；没配会返回可读错误 |
-| `vfs.read_file` | 1 | 无 | `enable_vfs` + 绑了 R2 |
+| `search.web` | 1 | 无 | 面板「工具 → 搜索 → 配置」填了 Tavily Key；没填仍注册，调用返回可读错误 |
+| `vfs.read_file` | 1 | 无 | 只要 `enable_vfs`（**默认开**）；不绑 R2 走轻量模式，只能读 ≤8KB 文本 |
 | `vfs.list_dir` | 1 | 无 | 同上 |
 | `vfs.search` | 1 | 无 | 同上 |
-| `vfs.write_file` | 2 | 工作区写 | 同上 |
+| `vfs.write_file` | 2 | 工作区写 | 同上（>8KB 的写需要绑 R2，否则返回可读错误） |
 | `vfs.mkdir` | 2 | 工作区写 | 同上 |
 | `vfs.move` | 2 | 工作区写 | 同上。改名/移动，目标已存在时失败而不是覆盖 |
 | `vfs.delete` | 3 | 工作区写 | 同上 |
 | `http.request` | 3 | 外部写 | — |
-| `schedule.create` | 3 | 工作区写 | `enable_schedule` |
+| `schedule.create` | 3 | 工作区写 | `enable_schedule`（**默认关**） |
 | `schedule.list` | 1 | 无 | `enable_schedule` |
 | `schedule.cancel` | 3 | 工作区写 | `enable_schedule` |
 | `skills.*` | — | — | 见 [Skills](./skills.md) |
+
+> **`enable_vfs` 默认是开的，且不要求 R2。** 没绑 R2 时走「轻量模式」：
+> 文本存在 D1（单条 ≤8KB），大文件直接返回可读错误（提示绑 R2）。
+> 详见 [配置说明 → 关于 enable_vfs 的 R2 探测](./configuration.md#关于-enable_vfs-的-r2-探测)。
+>
+> **工具不见 ≠ 权限不足**：`enable_tools` 是总开关，关掉时全部不注册；
+> `enable_vfs` / `enable_schedule` 关掉时对应那组不注册；工具栏里单独关掉的、
+> 或人格白名单之外的，也**根本不注册**（模型看不到，也就不会尝试）。
 
 每个工具都能单独开关 —— 见下面的**工具栏**。
 
@@ -135,7 +143,7 @@ GET 返回的是**未过滤**的完整列表：被关掉的工具也要出现，
 
 | 防线 | 覆盖 | 说明 |
 | --- | --- | --- |
-| **SSRF 防护** | `http.request` / `web.fetch_page` / `search.web` | 拦截 localhost、私有 IPv4/IPv6、链路本地、映射地址；**每一跳重定向都重新校验** |
+| **SSRF 防护** | `http.request` / `web.fetch_page` / 图片下载（`agent/media.ts`） | 拦截 localhost、私有/保留 IPv4、链路本地、CGNAT、IPv6 映射/兼容/NAT64 地址；**每一跳重定向都重新校验**。**不解析 DNS**，见下方限制 |
 | **响应体积上限** | http 1MB / web 2MB / search 512KB | 防止一个大响应吃光 128MB 内存 |
 | **工具超时** | 每个工具自带 `timeoutMs` | 超时返回 `timeout` 结果，不吊死整个 run |
 | **工具白名单** | loop 内 | 模型编出的工具名会被拦下 |
@@ -143,12 +151,45 @@ GET 返回的是**未过滤**的完整列表：被关掉的工具也要出现，
 | **内容安全** | 入站 + 出站 | 见[配置说明](./configuration.md#内容安全) |
 | **频率限制** | 每会话每分钟 | 见[配置说明](./configuration.md#频率限制) |
 
-### 关于 SSRF 的一个细节
+### 关于 SSRF 的两个细节
 
-`redirect: 'follow'` 是**不能用**的 —— 攻击者可以让你请求一个公网地址，
-然后 302 到 `http://169.254.169.254/`（云元数据）。所以两个网络工具都是
-**手动逐跳**：每次 `redirect: 'manual'`，拿到 `Location` 重新校验再跟，
-最多 3 跳。这条曾经漏过（`web.ts` 早期版本用了 `follow`），现已修正并有单测。
+**① `redirect: 'follow'` 是不能用的。**
+攻击者可以让你请求一个公网地址，然后 302 到 `http://169.254.169.254/`（云元数据）。
+所以三个抓取路径都是**手动逐跳**：每次 `redirect: 'manual'`，拿到 `Location`
+重新校验再跟，最多 3 跳。这条漏过两次：
+
+- `web.ts` 早期版本用了 `follow`（已修，有单测）；
+- **图片下载**（`agent/media.ts`）一直是 `fetch(url, { redirect: 'follow' })`：
+  不校验、不逐跳、**无超时**（一张挂住的图能吃光 30 秒事件预算）。
+  图片 URL 来自消息正文，可以被伪造。现在它复用 `validateFetchUrl` +
+  `manual` 逐跳 + `AbortSignal.timeout`。
+
+**② 明确的限制：不做 DNS 解析，因此不防 DNS rebinding。**
+
+`src/tools/http/url-safety.ts` 只对**字面量**做判断（IP、`localhost`、`*.localhost`），
+**不发 DNS 查询**。所以下面这些拦不住：
+
+- `http://169.254.169.254.nip.io/`（公有域名解析到内网地址）；
+- DNS rebinding（校验时解析到公网、fetch 时解析到内网）；
+- 任何「域名 → 内网 IP」的映射。
+
+不解析的理由：Worker 里没有同步 DNS；每次抓取多做一次查询既费子请求额度，
+又仍有 TOCTOU 窗口，只能算提高门槛、不能算防住。
+**真正的防线在网络层**（Cloudflare 的出口访问控制 / 不要把元数据服务暴露给 Worker），
+这里的名单只是纵深防御的一层。别把它当成完整的 SSRF 防护。
+
+当前拦住的段（`url-safety.ts` 里有逐条注释与单测）：
+
+| 类别 | 网段 |
+| --- | --- |
+| IPv4 本网 / 私网 / 回环 | `0.0.0.0/8`、`10/8`、`127/8`、`172.16/12`、`192.168/16` |
+| IPv4 链路本地（云元数据） | `169.254/16` |
+| IPv4 CGNAT | `100.64/10` |
+| IPv4 保留 / 测试段 | `192.0.0/24`、`192.0.2/24`、`198.18/15`、`198.51.100/24`、`203.0.113/24` |
+| IPv4 组播 / 保留 | `224.0.0.0/4`、`240.0.0.0/4`（含广播） |
+| IPv6 回环 / 未指定 | `::1`、`::` |
+| IPv6 私网 / 链路本地 / site-local | `fc00::/7`、`fe80::/10`、`fec0::/10` |
+| IPv4 藏进 IPv6 | `::ffff:a.b.c.d`（映射）、`::a.b.c.d`（兼容）、`64:ff9b::/96`（NAT64） |
 
 ---
 

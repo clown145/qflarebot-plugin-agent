@@ -27,6 +27,7 @@
  * 依然过大」这种组合。超限的图不下载、只留一句说明，整条对话不受影响。
  */
 import type { MessageAttachment } from '../types.js'
+import { validateFetchUrl } from '../tools/http/url-safety.js'
 
 /**
  * 单张图片上限（原始字节，未编码）。
@@ -48,10 +49,72 @@ const MAX_TOTAL_IMAGE_BYTES = 1_500_000
 /** 一次最多取几张图。群里有人连发十几张时不能全下 */
 const MAX_IMAGES = 4
 
+/**
+ * 单张图片的下载超时。
+ *
+ * 以前完全没设超时：一张挂住的图会一直占着这次事件的预算（整条事件链只有 30 秒），
+ * 用户什么都收不到。5 秒对 CDN 够用，超了就记一句 note 当作「没读到」。
+ */
+const IMAGE_TIMEOUT_MS = 5_000
+
 export interface DownloadResult {
   attachments: MessageAttachment[]
   /** 下载失败或被跳过的图片说明，会写进正文让模型知道 */
   notes: string[]
+}
+
+/** 一次最多跟几跳重定向。与 http.request / web.fetch_page 一致 */
+const MAX_REDIRECTS = 3
+
+/**
+ * 下载单张图片。**每一跳都过 SSRF 校验**——只校验初始 URL 的话，
+ * 攻击者可以让 QQ 的图片地址 302 到 127.0.0.1 / 云元数据地址。
+ *
+ * 以前这里是 `fetch(url, { redirect: 'follow' })`：不校验、不逐跳、无超时。
+ * 三条都是真问题：图片 URL 来自消息（可被伪造），follow 让中间跳数不可见，
+ * 没有超时则一张挂住的图能拖死整次事件预算。
+ */
+async function downloadImage(url: string): Promise<{
+  bytes: ArrayBuffer
+  contentType: string | null
+}> {
+  let current = url
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+    const invalid = validateFetchUrl(current)
+    if (invalid) throw new Error(`图片地址被拒绝：${invalid}`)
+
+    const response = await fetch(current, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS),
+    })
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location')
+      if (!location) throw new Error(`图片地址返回 ${response.status} 但没有 Location`)
+      current = new URL(location, current).toString()
+      continue
+    }
+
+    if (!response.ok) {
+      // 保留原来的文案（调用方拼进 notes 给模型看），只是前面多了逐跳校验
+      throw new HttpStatusError(response.status)
+    }
+
+    return {
+      bytes: await response.arrayBuffer(),
+      contentType: response.headers.get('content-type'),
+    }
+  }
+
+  throw new Error(`图片地址重定向超过 ${MAX_REDIRECTS} 次`)
+}
+
+/** 只用来区分「HTTP 状态码不对」与其它错误，文案在 catch 里统一拼 */
+class HttpStatusError extends Error {
+  constructor(readonly status: number) {
+    super(`HTTP ${status}`)
+    this.name = 'HttpStatusError'
+  }
 }
 
 /**
@@ -91,13 +154,9 @@ export async function hydrateImageAttachments(
     }
 
     try {
-      const response = await fetch(image.url, { redirect: 'follow' })
-      if (!response.ok) {
-        notes.push(`有一张图片下载失败（HTTP ${response.status}）`)
-        continue
-      }
+      const response = await downloadImage(image.url)
 
-      const buffer = await response.arrayBuffer()
+      const buffer = response.bytes
       if (buffer.byteLength > MAX_IMAGE_BYTES) {
         notes.push(`有一张图片太大（${Math.round(buffer.byteLength / 1024)} KB），没有读取`)
         continue
@@ -114,9 +173,13 @@ export async function hydrateImageAttachments(
         dataBase64: arrayBufferToBase64(buffer),
         ...(image.contentType
           ? {}
-          : { contentType: response.headers.get('content-type') ?? 'image/jpeg' }),
+          : { contentType: response.contentType ?? 'image/jpeg' }),
       })
     } catch (error) {
+      if (error instanceof HttpStatusError) {
+        notes.push(`有一张图片下载失败（HTTP ${error.status}）`)
+        continue
+      }
       notes.push(`有一张图片下载出错：${error instanceof Error ? error.message : String(error)}`)
     }
   }

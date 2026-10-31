@@ -32,11 +32,11 @@
  * - 原文从 `context.provider` 拿模型，这里走 plugin-llm 的 `llm` 服务。
  */
 import type { Logger } from '@qqbot/sdk'
-import { callLLM, LLMCallError } from '../llm/client.js'
+import { callLLM, LLMCallError, type LLMCallOptions } from '../llm/client.js'
 import { compactMessages, estimateMessagesTokens } from './context-size.js'
 import type { SummaryInput } from '../do/agent-object.js'
 import type { LLMService } from '../llm/contract.js'
-import type { HistoryToolTrace, ModelMessage } from '../types.js'
+import type { HistoryToolTrace, ModelMessage, ModelResponse } from '../types.js'
 import { executeAgentToolCall } from './tool-executor.js'
 import type { ToolRegistry, ToolExecuteInput } from '../tools/registry.js'
 import { toModelTools } from '../tools/registry.js'
@@ -54,6 +54,32 @@ export interface LoopOptions {
   toolContext: Omit<ToolExecuteInput, 'input' | 'toolCallId'>
   /** 每步回调，用于可观测 */
   onStep?: (step: number) => Promise<void>
+  /**
+   * 取消信号。`/stop` 与 `reset` 走这条路。
+   *
+   * 跨 isolate 的取消没法直接传对象（DO 与 Worker 是两个 isolate），
+   * 所以实际是**两级**：
+   * 1. 本层每步开始前调一次 `isCancelled()`（轮询 DO storage 里的 run 状态）；
+   * 2. 调用方另有一个轮询器，发现取消后 `signal.abort()`，
+   *    让**正在飞的**那次模型调用立刻断开——否则用户按 `/stop` 还得等模型吐完。
+   */
+  signal?: AbortSignal
+  /** 判据：这个 run 是否已被取消（每步开头问一次）。返回不可用时按「未取消」处理 */
+  isCancelled?: () => Promise<boolean>
+  /**
+   * 单次模型调用的重试配置。
+   *
+   * **重试必须在这一层做，不能重跑整个 loop**：loop 跑过一步之后，
+   * 之前执行过的工具已经产生了副作用（`schedule.create` 已经 INSERT 过一行），
+   * 整个 loop 重来会让副作用执行两次。而这里重试的只是**那一次模型调用**，
+   * 消息数组与工具执行状态原地不动。
+   */
+  retry?: {
+    /** 额外重试几次。固定 1 次：两次都失败说明不是瞬时抖动 */
+    times: number
+    /** 重试前的等待。测试传 0 */
+    delayMs: number
+  }
   /**
    * 上下文压缩配置。**每个模型步之前**都会检查一次（对标 AstrBot
    * 的 `tool_loop_agent_runner.py` —— 它也是在每次 provider 调用前压，而不是每 run 一次）。
@@ -114,6 +140,19 @@ export class LoopLimitError extends Error {
 }
 
 /**
+ * run 被用户取消（`/stop` 或 `/agent reset`）。
+ *
+ * 单独一个错误类而不是返回空结果：调用方（run.ts）需要区分
+ * 「模型答完了」与「用户喊停」——后者的语义是**不回复、不写历史**。
+ */
+export class LoopCancelledError extends Error {
+  constructor(message = '这轮回答已被用户取消') {
+    super(message)
+    this.name = 'LoopCancelledError'
+  }
+}
+
+/**
  * 工具调用限额。照搬原文 `tool-call-limit.ts`（26 行）——
  * 原文把这个状态做成独立模块，因为「预留」和「检查」是两步：
  * 先 reserve，成功了才执行。这里保留同样的语义。
@@ -135,6 +174,82 @@ function reserveToolCall(state: ToolCallLimitState): boolean {
 
 function toolCallLimitExceededMessage(state: ToolCallLimitState): string {
   return `单次对话最多调用 ${state.maxToolCallsPerRun} 次工具，已经用完。可以让我少做几步，或者把任务拆开。`
+}
+
+/**
+ * 判断这次错误能不能重试。与 `describeLoopError` 同一套判据，
+ * 但只关心「值不值得再来一次」。
+ */
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof LLMCallError) return error.retryable
+  return false
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * 单次模型调用的重试包装。
+ *
+ * **这是本文件最要紧的一处语义**：重试的是「这一次模型调用」，
+ * 不是整个 loop。旧实现把重试放在 `run.ts` 外面、重跑 `runLoopOnce`，
+ * 于是第一步已经 `schedule.create` 过（DML 已落库）之后，第二步 429
+ * 会让整个 loop 从头再来一遍——工具副作用执行两次。
+ *
+ * 这里消息数组、工具执行状态、已累计的 usage 全部原地保留，
+ * 失败的只有这一次 HTTP 调用。
+ */
+async function callLLMWithRetry(
+  llm: LLMService,
+  request: LLMCallOptions,
+  retry: LoopOptions['retry'],
+  logger: Logger,
+  step: number,
+): Promise<ModelResponse> {
+  const attempts = Math.max(0, Math.trunc(retry?.times ?? 0))
+  const delayMs = retry?.delayMs ?? 0
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await callLLM(llm, request)
+    } catch (error) {
+      // abort 与「上游返回错误」要分开：用户按了 /stop 之后 LLM 层会抛一个
+      // 带 code='aborted' 的错误，它落到普通错误路径会变成一条「模型调用失败」
+      // 的回复——而用户说的正是「别说了」。这里把它归一成取消语义。
+      if (request.signal?.aborted) throw new LoopCancelledError()
+      if (attempt >= attempts || !isRetryableError(error)) throw error
+      const described = error instanceof LLMCallError ? error.message : String(error)
+      logger.warn('模型调用可重试错误，重试这一次调用', {
+        step,
+        attempt: attempt + 1,
+        delayMs,
+        error: described,
+      })
+      await sleep(delayMs)
+    }
+  }
+}
+
+/**
+ * 取消判定的两个来源合在一起：
+ * 1. 本地 AbortSignal（同 isolate 内可以直接 abort）；
+ * 2. 调用方给的 `isCancelled()`（跨 isolate 时轮询 DO storage 里的 run 状态）。
+ *
+ * 判定失败（DO 抖动）按「未取消」处理：一次 storage 读失败不该误杀正常对话。
+ */
+async function throwIfCancelled(options: LoopOptions): Promise<void> {
+  if (options.signal?.aborted) throw new LoopCancelledError()
+  if (!options.isCancelled) return
+  try {
+    if (await options.isCancelled()) throw new LoopCancelledError()
+  } catch (error) {
+    if (error instanceof LoopCancelledError) throw error
+    options.logger.warn('取消状态检查失败，按未取消继续', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
 }
 
 export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
@@ -161,6 +276,14 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     steps = index + 1
     await options.onStep?.(steps)
 
+    // 取消检查放在**每步开头**（onStep 之后、模型调用之前）：
+    // 用户按 `/stop` 时，执行流可能正停在两次模型调用之间等工具结果，
+    // 没有这一步检查它就会继续把剩下的步数跑完，用户等来的是一条完整的回答。
+    //
+    // 这里是**第二级**取消判定：跨 isolate 传不了对象，所以每步问一次 DO
+    // storage 里这个 run 的状态。`signal` 那一级负责打断正在飞的模型调用。
+    await throwIfCancelled(options)
+
     // 每步之前压一次。工具结果会不断堆进 messages，只在装配时压一次等于没压。
     //
     // system 消息单独拎出来算 token：它每轮都在，但不能被丢。
@@ -173,7 +296,15 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         maxTokens: compaction.maxTokens,
         systemTokens,
       })
-      if (compacted.droppedRounds > 0) {
+      // 两种情况都要把压缩结果写回 messages：
+      // 1) 丢了整轮（droppedRounds > 0）——消息数组变了；
+      // 2) 没丢轮、但把单轮里的超大工具结果截断了（truncatedToolResults > 0）——
+      //    消息条数不变、内容变了。
+      // 只判断丢轮的话，「同一轮工具循环里截断大结果」算出来却写不回去，
+      // 端到端等于没生效。
+      //
+      const truncatedToolResults = compacted.truncatedToolResults
+      if (compacted.droppedRounds > 0 || truncatedToolResults > 0) {
         compactedRounds += compacted.droppedRounds
         // 只留 user / assistant 的文本：tool 结果可能几十 KB，
         // 存进 DO 的待摘要槽会白白撑大体积，摘要也不需要逐字复述它。
@@ -187,6 +318,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         messages.push(...systemMessages, ...compacted.messages)
         logger.info('上下文已压缩', {
           droppedRounds: compacted.droppedRounds,
+          truncatedToolResults,
           tokensBefore: compacted.tokensBefore,
           tokensAfter: compacted.tokensAfter,
         })
@@ -196,12 +328,19 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       contextTokens = estimateMessagesTokens(messages.filter((m) => m.role !== 'system'))
     }
 
-    const response = await callLLM(llm, {
-      model,
-      messages,
-      ...(tools.length ? { tools } : {}),
-      timeoutMs: requestTimeoutMs,
-    })
+    const response = await callLLMWithRetry(
+      llm,
+      {
+        model,
+        messages,
+        ...(tools.length ? { tools } : {}),
+        timeoutMs: requestTimeoutMs,
+        ...(options.signal ? { signal: options.signal } : {}),
+      },
+      options.retry,
+      logger,
+      steps,
+    )
 
     inputTokens += response.usage?.inputTokens ?? 0
     outputTokens += response.usage?.outputTokens ?? 0
