@@ -1,10 +1,11 @@
 /**
  * 工具开关与单工具配置
  *
- * 工具开关是**整批状态**（`disabled: [...]`），单工具配置是**某个工具的若干字段**。
+ * 工具开关是**整批状态**（`disabled` / `enabled` 名单），单工具配置是**某个工具的若干字段**。
  * 拆成两个端点，是因为「点开关」是高频路径，不该顺带传一遍配置从而多一次覆盖风险。
  */
 import type { Route } from '@qqbot/sdk'
+import type { ToolSettings } from '../tools/catalog.js'
 import type { AgentConfig } from '../config/index.js'
 import { getToolSettings, setToolSettings } from '../store/d1.js'
 import { canonicalDisabledTools, normalizeToolSettings, toToolCatalog } from '../tools/catalog.js'
@@ -21,14 +22,19 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
       auth: 'admin',
       handler: async ({ ctx }) => {
         const config = await resolveConfig(ctx)
-        const settings = await getToolSettings(ctx.db).catch(() => ({ disabled: [], config: {} }))
+        const settings: ToolSettings = await getToolSettings(ctx.db).catch(() => ({
+          disabled: [],
+          enabled: [],
+          config: {},
+        }))
         const r2Ready = config.enable_tools && config.enable_vfs ? await hasR2(ctx) : false
         const tools = (await buildRegistry(ctx, config, r2Ready)).list()
         return Response.json({
           ok: true,
           tools: toToolCatalog(tools, settings),
           frameworkTools: { available: coreTools(ctx) !== null },
-          disabled: canonicalDisabledTools(tools, settings.disabled),
+          disabled: canonicalDisabledTools(tools, settings.disabled, settings.enabled),
+          enabled: settings.enabled ?? [],
         })
       },
     },
@@ -44,16 +50,28 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
         } catch {
           return Response.json({ ok: false, error: '请求体不是合法 JSON' }, { status: 400 })
         }
-        // normalizeToolSettings 吃任何形状（裸数组 / {disabled:[...]} / 垃圾），
-        // 页面传错不会 500——最差情况是「什么都没关」
+        // 明确开启列表不能从“没有禁用”推断；旧客户端不传 enabled 时保留已有选择。
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          return Response.json({ ok: false, error: '工具设置必须是对象' }, { status: 400 })
+        }
+        const fields = body as Record<string, unknown>
+        for (const key of ['disabled', 'enabled']) {
+          const value = fields[key]
+          if (
+            Object.hasOwn(fields, key) &&
+            (!Array.isArray(value) || !value.every(name => typeof name === 'string'))
+          ) {
+            return Response.json({ ok: false, error: `${key} 必须是工具名数组` }, { status: 400 })
+          }
+        }
         const incoming = normalizeToolSettings(body)
-        const current = await getToolSettings(ctx.db).catch(() => ({ disabled: [], config: {} }))
+        const current: ToolSettings = await getToolSettings(ctx.db)
 
-        // **按字段合并，不是整体覆盖**：页面上的「关掉一个工具」只发
-        // `{ disabled: [...] }`，如果整体写回就会把工具配置（api key 那些）清空。
+        // 按字段合并开关；不能因为保存开关清空工具配置或已有明确开启名单。
         // 这是最容易踩的坑——用户点一下开关，搜索 key 就没了，而且不报错。
         const merged = {
-          disabled: incoming.disabled,
+          disabled: Object.hasOwn(fields, 'disabled') ? incoming.disabled : current.disabled,
+          enabled: Object.hasOwn(fields, 'enabled') ? incoming.enabled : (current.enabled ?? []),
           config:
             incoming.config && Object.keys(incoming.config).length
               ? incoming.config
@@ -72,11 +90,15 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
           if (!matches.length) continue
           const enabled =
             !disabled.has(meta.fullName) &&
-            !matches.some(tool => disabled.has(tool.definition.name))
+            matches.some(
+              tool =>
+                merged.enabled?.includes(tool.definition.name) &&
+                !disabled.has(tool.definition.name),
+            )
           if (meta.enabled !== enabled) await setPluginToolEnabled(ctx.db, meta.fullName, enabled)
         }
         await setToolSettings(ctx.db, merged)
-        return Response.json({ ok: true, disabled: merged.disabled })
+        return Response.json({ ok: true, disabled: merged.disabled, enabled: merged.enabled })
       },
     },
 
@@ -106,10 +128,7 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
           return Response.json({ ok: false, error: 'values 必须是对象' }, { status: 400 })
         }
 
-        const current = await getToolSettings(ctx.db).catch(() => ({
-          disabled: [] as string[],
-          config: {} as Record<string, Record<string, string>>,
-        }))
+        const current = await getToolSettings(ctx.db)
         const config: Record<string, Record<string, string>> = { ...(current.config ?? {}) }
         // 空字符串视为「清空这项」，直接把键删掉，不存一个空串进去
         const values: Record<string, string> = {}
@@ -121,7 +140,7 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
         if (Object.keys(values).length) config[tool] = values
         else delete config[tool]
 
-        await setToolSettings(ctx.db, { disabled: current.disabled, config })
+        await setToolSettings(ctx.db, { ...current, config })
         return Response.json({ ok: true })
       },
     },

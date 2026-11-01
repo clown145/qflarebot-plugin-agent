@@ -10,11 +10,8 @@
  * 两个真相、必然对不上。这里真正缺的是「这个机器人别开 http.request」这种
  * 按**工具名**的开关。
  *
- * ## 为什么存「关掉的」而不是「打开的」
- *
- * 设置里只记 disabled。存 enabled 的话，每次升级新增的工具都要先把名字补进设置里
- * 才可用，漏了就是「明明注册了却调不到」；反过来漏一个 disable 只是多开一个工具，
- * 用户看得见，也改得回来。
+ * 内置工具沿用 disabled 黑名单；其他插件的工具默认关闭，使用 enabled 显式开启。
+ * 新工具加入目录只用于发现，不能因为不在 disabled 中就自动交给模型。
  *
  * ## 为什么投影一层，不把 registry 直接吐给页面
  *
@@ -31,14 +28,11 @@ import type {
   ToolSource,
 } from './types.js'
 
-/**
- * 工具开关状态。
- *
- * 只有「关掉了哪些」。空数组 = 全部可用，也就是说**注册了就能用**是默认值；
- * 这样新版本新增的工具不需要任何迁移就能出现（见文件头的注释）。
- */
+/** 机器人全局工具开关；disabled 优先于 enabled。 */
 export interface ToolSettings {
   disabled: string[]
+  /** 明确开启的插件工具名；缺省为空，内置工具不依赖此列表。 */
+  enabled?: string[]
   /**
    * 每个工具自己的配置，如 `{ 'search.web': { apiKey: 'tvly-…' } }`。
    *
@@ -92,9 +86,10 @@ export function toToolCatalog(
 ): ToolCatalogItem[] {
   const normalized = normalizeToolSettings(settings)
   const disabled = new Set(normalized.disabled)
+  const enabled = new Set(normalized.enabled ?? [])
   return tools
     .map((tool) => {
-      const item = toToolCatalogItem(tool, !isToolDisabled(tool, disabled))
+      const item = toToolCatalogItem(tool, !isToolDisabled(tool, disabled, enabled))
       const fields = tool.definition.configFields
       if (!fields?.length) return item
 
@@ -156,21 +151,21 @@ export function applyToolSettings(
   tools: RegisteredTool[],
   settings?: ToolSettings,
 ): RegisteredTool[] {
-  const disabled = new Set(normalizeToolSettings(settings).disabled)
-  return tools.filter((tool) => !isToolDisabled(tool, disabled))
+  const normalized = normalizeToolSettings(settings)
+  const disabled = new Set(normalized.disabled)
+  const enabled = new Set(normalized.enabled ?? [])
+  return tools.filter((tool) => !isToolDisabled(tool, disabled, enabled))
 }
 
 /**
- * 把库里 / 请求体里的任意值归一成 `{ disabled: string[] }`。**永不抛错**。
+ * 归一化持久化设置。无法解析 enabled 时默认无插件工具授权。
  *
  * 接受两种形状，因为两处真的都会传进来：
  * - `'["a","b"]'` / `['a','b']`——`{tool_settings}.disabled_json` 列存的就是名字
  *   数组本身（列名即约定，手工翻库一眼能看懂），读出来是字符串；
  * - `{ disabled: [...] }`——页面 POST 上来的接口形状。
  *
- * 坏数据最坏的结果应当是「工具照常全部可用」，而不是「一个都调不到」——后者会让
- * 机器人整体失灵，排查成本远高于一个设置项失效。所以解析失败、字段类型不对、
- * 顶层是数字/null，一律退回全开。
+ * 旧配置和坏数据仍保留内置工具的缺省行为；插件工具必须出现在明确开启名单里。
  *
  * 顺手做的清理：去掉非字符串（数字 / null / 对象）、去空白、去空串、去重。
  * 重复项不影响过滤结果，但面板会重复画一行勾选框，看着像坏了。
@@ -178,9 +173,11 @@ export function applyToolSettings(
 export function normalizeToolSettings(raw: unknown): ToolSettings {
   const value = typeof raw === 'string' ? parseJsonOrNull(raw) : raw
   // 裸数组 = 库里的存储形状（老版本只存 disabled）；对象 = 接口形状
-  const list = Array.isArray(value) ? value : readDisabledField(value)
+  const list = Array.isArray(value) ? value : readField(value, 'disabled')
   const disabled = Array.isArray(list) ? readStringList(list) : []
-  return { disabled, config: readConfigMap(value) }
+  const rawEnabled = readField(value, 'enabled')
+  const enabled = Array.isArray(rawEnabled) ? readStringList(rawEnabled) : []
+  return { disabled, enabled, config: readConfigMap(value) }
 }
 
 function readStringList(list: unknown[]): string[] {
@@ -221,19 +218,19 @@ function readConfigMap(value: unknown): Record<string, Record<string, string>> {
   return out
 }
 
-function readDisabledField(value: unknown): unknown {
-  // 顶层不是对象（null / 数字 / 字符串解析失败的 undefined）都当全开
+function readField(value: unknown, field: 'disabled' | 'enabled'): unknown {
+  // 顶层不是对象时使用默认开关：内置工具保留原行为，插件工具关闭。
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   // 取字段也可能抛（Proxy、getter、`Object.create` 出来的怪东西）。
   // 「读设置」在每条 run 的路径上，这里抛一次 = 整轮对话挂掉，比设置失效严重得多。
   try {
-    return (value as { disabled?: unknown }).disabled
+    return (value as Record<string, unknown>)[field]
   } catch {
     return undefined
   }
 }
 
-/** JSON 解析失败退回 null，交给 normalize 统一产出「全开」 */
+/** JSON 解析失败退回 null，交给 normalize 使用默认开关 */
 function parseJsonOrNull(raw: string): unknown {
   try {
     return JSON.parse(raw) as unknown
@@ -244,9 +241,17 @@ function parseJsonOrNull(raw: string): unknown {
 
 
 /** 旧截断名称用于收窄开关；发生碰撞时关闭所有候选，不能意外放开。 */
-export function isToolDisabled(tool: RegisteredTool, disabled: ReadonlySet<string>): boolean {
-  return tool.compatibility?.disabled === true || disabled.has(tool.definition.name) ||
+export function isToolDisabled(
+  tool: RegisteredTool,
+  disabled: ReadonlySet<string>,
+  enabled: ReadonlySet<string> = new Set(),
+): boolean {
+  return (
+    (tool.source.type === 'plugin' && !enabled.has(tool.definition.name)) ||
+    tool.compatibility?.disabled === true ||
+    disabled.has(tool.definition.name) ||
     (tool.compatibility?.aliases.some(name => disabled.has(name)) ?? false)
+  )
 }
 
 /** 白名单只接受唯一的旧名称映射，碰撞时要求管理员选择新的完整名称。 */
@@ -263,11 +268,18 @@ export function filterAllowedTools(tools: RegisteredTool[], allowed: readonly st
 }
 
 /** 管理页提交规范名称，保留当前未安装工具的开关。 */
-export function canonicalDisabledTools(tools: RegisteredTool[], disabled: readonly string[]): string[] {
+export function canonicalDisabledTools(
+  tools: RegisteredTool[],
+  disabled: readonly string[],
+  enabled: readonly string[] = [],
+): string[] {
   const names = new Set(disabled)
+  const approved = new Set(enabled)
   const aliases = new Set(tools.flatMap(tool => tool.compatibility?.aliases ?? []))
-  return [...new Set([
-    ...disabled.filter(name => !aliases.has(name)),
-    ...tools.filter(tool => isToolDisabled(tool, names)).map(tool => tool.definition.name),
-  ])]
+  return [
+    ...new Set([
+      ...disabled.filter(name => !aliases.has(name)),
+      ...tools.filter(tool => isToolDisabled(tool, names, approved)).map(tool => tool.definition.name),
+    ]),
+  ]
 }

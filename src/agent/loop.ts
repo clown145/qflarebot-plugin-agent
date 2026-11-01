@@ -8,12 +8,14 @@ import { callLLM, LLMCallError, type LLMCallOptions } from '../llm/client.js'
 import { compactMessages, estimateMessagesTokens } from './context-size.js'
 import type { SummaryInput } from '../do/agent-object.js'
 import type { LLMService } from '../llm/contract.js'
-import type { HistoryToolTrace, ModelMessage, ModelResponse, ModelToolCall } from '../types.js'
+import type { HistoryToolTrace, HistoryUserInput, ModelMessage, ModelResponse, ModelToolCall } from '../types.js'
 import { executeAgentToolCall } from './tool-executor.js'
 import type { ToolRegistry, ToolExecuteInput } from '../tools/registry.js'
 import { toModelTools } from '../tools/registry.js'
 
 export interface LoopCheckpoint {
+  /** 保留实际输入，恢复完成后仍按首次正文写历史。 */
+  historyInput?: HistoryUserInput
   toolBindings?: Record<string, { id: string; revision: string }>
   version: 1
   model?: string

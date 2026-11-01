@@ -42,6 +42,9 @@ export interface InboundMessage {
 
 export type ReplyScene = 'group' | 'c2c' | 'guild' | 'guild_dm' | 'unknown'
 
+/** 历史回放所需的原始输入；正文已经过技能指令处理，身份和附件复用历史行。 */
+export type HistoryUserInput = Pick<InboundMessage, 'text' | 'scene' | 'receivedAt'>
+
 export interface MessageAttachment {
   type: 'image' | 'file' | 'audio' | 'video' | 'unknown'
   url?: string

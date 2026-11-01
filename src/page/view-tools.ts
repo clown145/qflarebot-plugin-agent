@@ -23,11 +23,12 @@ function renderTools() {
       )
     : all
 
+  const disabledCount = all.filter((tool) => disabled.has(tool.name)).length
   $('toolCount').textContent = all.length
-    ? '（' + (all.length - disabled.size) + '/' + all.length + ' 已启用）'
+    ? '（' + (all.length - disabledCount) + '/' + all.length + ' 已启用）'
     : ''
-  $('toolEnableAll').disabled = toolsBusy || disabled.size === 0
-  $('toolDisableAll').disabled = toolsBusy || all.length === 0 || disabled.size === all.length
+  $('toolEnableAll').disabled = toolsBusy || disabledCount === 0
+  $('toolDisableAll').disabled = toolsBusy || all.length === 0 || disabledCount === all.length
 
   const box = $('toolList')
   box.innerHTML = ''
@@ -148,7 +149,17 @@ async function saveAllTools(disabledList) {
   toolsBusy = true
   renderTools()
   try {
-    await postJson('/api/tools', { disabled: disabledList })
+    const disabled = new Set(disabledList)
+    const enabled = new Set(state.tools?.enabled ?? [])
+    // 只开启本次页面展示过的工具；安装新插件或新增工具后不会自动获得许可。
+    for (const tool of state.tools?.list ?? []) {
+      if (tool.source?.type !== 'plugin') continue
+      if (disabled.has(tool.name)) enabled.delete(tool.name)
+      else enabled.add(tool.name)
+    }
+    for (const name of disabled) enabled.delete(name)
+    await postJson('/api/tools', { disabled: disabledList, enabled: [...enabled] })
+    state.tools.enabled = [...enabled]
     state.tools.disabled = [...disabledList]
     notify('工具开关已保存', 'success')
   } catch (e) {

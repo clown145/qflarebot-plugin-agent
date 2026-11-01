@@ -357,7 +357,7 @@ function safeJsonObject(raw: string): unknown {
 /**
  * 读工具开关。
  *
- * **没有行就返回全开，且不建行**：读一次算 1 行查询（读额度是写的 50 倍），
+ * **没有行时保留内置工具，插件工具默认关闭，且不建行**：读一次算 1 行查询（读额度是写的 50 倍），
  * 而写一次要占写入额度；更关键的是「从没进过管理页」是绝大多数部署的常态，
  * 为了读一个空设置去写库，等于让每个新装的机器人都白花一次写入。
  *
@@ -365,16 +365,16 @@ function safeJsonObject(raw: string): unknown {
  * 手工改库、老版本写坏的数据都不该让整轮对话失败（读设置就抛错会直接断掉 run）。
  */
 export async function getToolSettings(db: PluginDB): Promise<ToolSettings> {
-  const row = await db.first<{ disabled_json: string; config_json: string }>(
-    `SELECT disabled_json, config_json FROM {tool_settings} WHERE id = ?`,
+  const row = await db.first<{ disabled_json: string; config_json: string; enabled_json: string }>(
+    `SELECT disabled_json, config_json, enabled_json FROM {tool_settings} WHERE id = ?`,
     TOOL_SETTINGS_ID,
   )
-  if (!row) return { disabled: [], config: {} }
-  // 两列分别解析后合成一个对象：normalizeToolSettings 两种形状都吃，
-  // 这里显式拼清楚，避免「以为它自己会读第二列」
+  if (!row) return { disabled: [], enabled: [], config: {} }
+  // 三列分别解析；旧库升级时 enabled_json 的默认值为空数组。
   const base = normalizeToolSettings(row.disabled_json)
   const configPart = normalizeToolSettings({ config: safeJsonObject(row.config_json) })
-  return { disabled: base.disabled, config: configPart.config ?? {} }
+  const enabled = normalizeToolSettings({ enabled: safeJsonObject(row.enabled_json) }).enabled ?? []
+  return { disabled: base.disabled, enabled, config: configPart.config ?? {} }
 }
 
 /**
@@ -391,15 +391,17 @@ export async function getToolSettings(db: PluginDB): Promise<ToolSettings> {
 export async function setToolSettings(db: PluginDB, settings: ToolSettings): Promise<void> {
   const normalized = normalizeToolSettings(settings)
   await db.run(
-    `INSERT INTO {tool_settings} (id, disabled_json, config_json, updated_at)
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO {tool_settings} (id, disabled_json, config_json, enabled_json, updated_at)
+     VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        disabled_json = excluded.disabled_json,
        config_json = excluded.config_json,
+       enabled_json = excluded.enabled_json,
        updated_at = excluded.updated_at`,
     TOOL_SETTINGS_ID,
     JSON.stringify(normalized.disabled),
     JSON.stringify(normalized.config ?? {}),
+    JSON.stringify(normalized.enabled ?? []),
     Date.now(),
   )
 }

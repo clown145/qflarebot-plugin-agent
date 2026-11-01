@@ -81,9 +81,9 @@ Agent 会把片段拼进 system prompt 末尾，模型就能看到你的指令�
 
 ## 缓存影响
 
-片段拼在 system prompt **末尾**，属于稳定内容 —— 只要你不改它，前缀缓存就命中。
+片段拼在 system prompt **末尾**；内容与顺序保持稳定，才能保留这部分前缀的缓存复用机会。
 
-**但如果你的插件每轮都改片段，会把整段 system 的缓存击穿**，所有对话都变贵。
+如果插件每轮都改片段，会阻断从变化位置开始的前缀复用。
 所以：注册是**显式动作**，不要放进每轮都会跑的路径里。
 
 ## 排序
@@ -91,7 +91,7 @@ Agent 会把片段拼进 system prompt 末尾，模型就能看到你的指令�
 按 `priority` 降序，**同优先级按插件名升序**。
 
 同优先级必须按名字而不是写入时间排：否则同样的片段集合每轮顺序可能不同，
-system 前缀就抖了，缓存全废。
+system 前缀就会变化，影响缓存复用。
 
 ## 实测
 
@@ -142,9 +142,9 @@ export default definePlugin({
 
 说明需要回答“做什么、什么时候用、输入什么、返回什么”，参数的含义和单位写进 Schema 的 `description`；不能指望模型只看方法名猜用途。T2I 已绑定现有 `t2i.renderBase64`，并提供图片附件的结果映射。
 
-转换函数中的 `ctx` 是提供者自己的数据库、配置和服务上下文；`actor` 是框架签发的原始发起人，`caller.plugin` 是消费 Agent。模型只能填写 `input`，不能填写调用者身份。目录来自构建生成的 manifest，部署后自动发现。
+转换函数中的 `ctx` 是提供者自己的数据库、配置和服务上下文；`actor` 是框架签发的原始发起人，`caller.plugin` 是消费 Agent。模型只能填写 `input`，不能填写调用者身份。目录来自构建生成的 manifest，部署后自动发现并显示在管理目录，默认关闭；管理员在 Agent 工具页开启后才向模型提供。
 
-框架 ID 是 `weather.query`，本 Agent 暴露为 `plugin.weather.query`；长名称超过 64 字符时附摘要避免截断碰撞。Agent 只需可选依赖 `core.tools`，无需逐个依赖提供者。T2I 已接入 `t2i.render`，可直接请求 Agent 把内容渲染成图片。
+框架 ID 是 `weather.query`，本 Agent 暴露为 `plugin.weather.query`；长名称超过 64 字符时附摘要避免截断碰撞。Agent 只需可选依赖 `core.tools`，无需逐个依赖提供者。T2I 已接入 `t2i.render`，开启该工具后可请求 Agent 把内容渲染成图片。
 
 ## 权限与结果
 
@@ -177,3 +177,9 @@ export default definePlugin({
 Agent 根据副作用映射本地等级：只读 1、工作区写入 2、外部写入与危险操作 3；保留 `plugin:use` scope，旧自定义等级只会继续收窄。危险操作还需确认，确认不会绕过角色或等级限制。
 
 框架提供 `GET /admin/tools` 和 `PUT /admin/tools/policy` 管理全局策略；本 Agent 的 `/api/tools` 返回框架接入是否可用及当前目录。插件处于同一 isolate，这套入口不是恶意代码的隔离沙箱。
+
+## 默认开关
+
+本 Agent 对所有插件来源的工具采用明确开启名单，包含现代 `core.tools` 工具与旧静态服务适配工具。`registerTool()`、人格白名单、提供者安装成功都不会自动开启能力。
+
+管理页可见不代表模型可用；工具页显示关闭项并允许管理员开启。`POST /api/tools` 的 `enabled` 是明确开启的工具名数组，`disabled` 优先。省略 `enabled` 保留已有选择，`enabled: []` 关闭全部插件工具。旧库通过列迁移取得空开启名单，升级后需重新选择插件工具；不会从旧版“未禁用”推断授权。这个开关控制本 Agent，框架全局工具策略继续独立生效。

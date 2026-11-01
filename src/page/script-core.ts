@@ -59,7 +59,7 @@ let state = {
   modelStatus: {},
   personas: {},
   bindings: [],
-  tools: { list: [], disabled: [] },
+  tools: { list: [], disabled: [], enabled: [] },
   skills: [],
   schedules: [],
   audits: [],

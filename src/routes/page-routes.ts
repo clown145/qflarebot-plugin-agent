@@ -13,7 +13,7 @@ import type { Route } from '@qqbot/sdk'
 import type { AgentConfig } from '../config/index.js'
 import type { LLMService } from '../llm/contract.js'
 import { listAllSchedules, listDailyStats, listToolAudit, getToolSettings } from '../store/d1.js'
-import { toToolCatalog } from '../tools/catalog.js'
+import { canonicalDisabledTools, toToolCatalog } from '../tools/catalog.js'
 import { buildRegistry } from '../agent/run.js'
 import { listSkills } from '../skills/store.js'
 import { listPersonaBindings } from '../persona.js'
@@ -61,18 +61,17 @@ export function createPageRoutesPage(): Route<AgentConfig>[] {
           listAllSchedules(ctx.db, 50).catch(() => []),
           ctx.config.enable_audit ? listToolAudit(ctx.db, 30).catch(() => []) : Promise.resolve([]),
           listPersonaBindings(ctx.db, 50).catch(() => []),
-          getToolSettings(ctx.db).catch(() => ({ disabled: [] as string[], config: {} })),
+          getToolSettings(ctx.db).catch(() => ({
+            disabled: [] as string[], enabled: [] as string[], config: {},
+          })),
           listSkills(ctx.db).catch(() => []),
         ])
 
         // 工具栏要**未过滤**的完整列表：关掉的工具也得出现，否则页面上
-        // 再也点不到「重新开启」。这里同步建一次 registry（buildRegistry 是纯函数、
-        // 不碰网络），r2 探测用 false 代替——页面只需要工具清单与权限级别，
-        // 而真实探测一次要多一个 R2 往返。
-        const catalogTools = toToolCatalog(
-          (await buildRegistry(ctx, config, false)).list(),
-          toolSettings,
-        )
+        // 再也点不到「重新开启」。这里只建目录，r2 探测用 false 代替——
+        // 页面只需要工具清单与权限级别，不必额外做一次 R2 往返。
+        const registered = (await buildRegistry(ctx, config, false)).list()
+        const catalogTools = toToolCatalog(registered, toolSettings)
 
         return Response.json({
           config: {
@@ -117,7 +116,8 @@ export function createPageRoutesPage(): Route<AgentConfig>[] {
           // 工具栏：完整清单 + 哪些被关掉
           tools: {
             list: catalogTools,
-            disabled: toolSettings.disabled,
+            disabled: canonicalDisabledTools(registered, toolSettings.disabled, toolSettings.enabled),
+            enabled: toolSettings.enabled ?? [],
           },
           // 技能目录。页面只列 id/name/description；正文按需用 /api/skills/:id 取，
           // 避免一次把所有 SKILL.md（可能各几十 KB）全拖到页面上。

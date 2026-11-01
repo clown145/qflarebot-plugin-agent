@@ -12,6 +12,7 @@ import { scopeSql, flattenForExec, tablePrefix } from '@qqbot/sdk/sqlScope'
 import { DatabaseSync } from 'node:sqlite'
 import { COLUMN_MIGRATIONS, ensureColumnMigrations, type MigrationLogger } from './migrate.js'
 import { SCHEMA_STATEMENTS } from './schema.js'
+import { getToolSettings, setToolSettings } from './d1.js'
 import { createTestDb } from './sqlite-test-db.js'
 
 function recordingLogger(): MigrationLogger & { warns: string[]; infos: string[] } {
@@ -129,7 +130,7 @@ describe('ensureColumnMigrations（真实 SQLite）', () => {
       async run(sql, ...params) {
         if (sql.includes('ALTER TABLE')) {
           // 抢先者：用原生句柄直接补上，于是我们的 ALTER 会撞 duplicate column
-          t.raw.exec(`ALTER TABLE p_agent_tool_settings ADD COLUMN config_json TEXT NOT NULL DEFAULT '{}'`)
+          t.raw.exec(t.scope(sql))
         }
         return db.run(sql, ...params)
       },
@@ -152,7 +153,7 @@ describe('ensureColumnMigrations（真实 SQLite）', () => {
 
     expect(result.failed).toContain('tool_settings.config_json')
     expect(result.added).toEqual([])
-    expect(logger.warns).toHaveLength(1)
+    expect(logger.warns).toHaveLength(COLUMN_MIGRATIONS.length)
     expect(logger.warns[0]).toContain('探测失败')
     t.close()
   })
@@ -172,7 +173,7 @@ describe('ensureColumnMigrations（真实 SQLite）', () => {
     const result = await ensureColumnMigrations(db, logger)
 
     expect(result.failed).toContain('tool_settings.config_json')
-    expect(logger.warns).toHaveLength(1)
+    expect(logger.warns).toHaveLength(COLUMN_MIGRATIONS.length)
     expect(logger.warns[0]).toContain('补列失败')
     t.close()
   })
@@ -190,7 +191,7 @@ describe('ensureColumnMigrations（真实 SQLite）', () => {
     const first = await ensureColumnMigrations(t.db, recordingLogger())
     const second = await ensureColumnMigrations(t.db, recordingLogger())
 
-    expect(first.added).toEqual(['tool_settings.config_json'])
+    expect(first.added).toEqual(['tool_settings.config_json', 'tool_settings.enabled_json'])
     expect(second.added).toEqual([])
     expect(second.present).toContain('tool_settings.config_json')
     expect(columnsOf(t, 'tool_settings').filter((name) => name === 'config_json')).toHaveLength(1)
@@ -388,3 +389,20 @@ async function runOnBoot(
   if (!onBoot) throw new Error('插件的 hooks.onBoot 不见了——升级路径失去兜底')
   await onBoot(ctx as never)
 }
+
+
+it('旧开关记录迁移后插件工具默认关闭，明确开启名单可往返保存', async () => {
+  const t = createLegacyDb()
+  try {
+    await t.db.run('INSERT INTO {tool_settings} (id, disabled_json, updated_at) VALUES (?, ?, ?)', 'default', '["http.request"]', 1)
+    await ensureColumnMigrations(t.db, recordingLogger())
+    const settings = await getToolSettings(t.db)
+    expect(settings).toMatchObject({ disabled: ['http.request'], enabled: [] })
+    await setToolSettings(t.db, { ...settings, enabled: ['plugin.t2i.render'] })
+    expect(await getToolSettings(t.db)).toMatchObject({ disabled: ['http.request'], enabled: ['plugin.t2i.render'] })
+    await ensureColumnMigrations(t.db, recordingLogger())
+    expect((await getToolSettings(t.db)).enabled).toEqual(['plugin.t2i.render'])
+  } finally {
+    t.close()
+  }
+})

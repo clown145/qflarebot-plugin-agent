@@ -70,6 +70,8 @@ export const COLUMN_MIGRATIONS: readonly ColumnMigration[] = [
   // v0.2.0：工具自己的配置（搜索 Key 等）从配置文件搬进 D1 的这一列。
   // 默认值 '{}' 让老库的行自动获得一个空配置，不必回填。
   { table: 'tool_settings', column: 'config_json', definition: `TEXT NOT NULL DEFAULT '{}'` },
+  // 插件工具改为显式开启；旧记录不凭 enabled 缺省值推断授权。
+  { table: 'tool_settings', column: 'enabled_json', definition: `TEXT NOT NULL DEFAULT '[]'` },
 ]
 
 /** 补列结果。测试与日志用 */

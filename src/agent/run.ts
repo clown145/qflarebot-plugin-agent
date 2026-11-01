@@ -175,8 +175,7 @@ async function runLoopOnce(input: {
   // 被设计成同步、好测。探测结果在 isolate 内缓存，正常对话不会多出往返。
   const r2Ready = config.enable_tools && config.enable_vfs ? await hasR2(ctx) : false
 
-  // 工具栏开关：管理页里逐个关掉的工具。读失败不该让整轮对话失败——
-  // 退回「全开」是安全的（权限层仍然管着每个工具能不能真用）。
+  // 工具栏开关：读取失败时保留内置工具的默认行为，插件工具保持关闭。
   const toolSettings = await getToolSettings(ctx.db).catch(() => undefined)
 
   // 人格的工具白名单与全局开关**叠加**：先按人格收窄，再减掉全局关掉的。
@@ -196,6 +195,7 @@ async function runLoopOnce(input: {
     persona.allowedTools,
     toolSettings?.config ?? {},
     message.toolInvocation ?? null,
+    new Set(toolSettings?.enabled ?? []),
   )
 
   // 技能：**渐进披露**。
@@ -279,10 +279,22 @@ async function runLoopOnce(input: {
     // 摘要只在 summary 模式下带：truncate / off 的用户不该多花一次 DO 读
     ...(summary ? { summary } : {}),
   })
+  // 正文可能经过 /skill 处理，且与展示用的 displayText 不同，必须保存首次装配值。
+  // 旧检查点没有这份记录时不补造，完成后仍沿用旧历史回放。
+  const historyInput = input.checkpoint
+    ? input.checkpoint.historyInput
+    : {
+        text: effectiveMessage.text,
+        scene: effectiveMessage.scene,
+        receivedAt: effectiveMessage.receivedAt,
+      }
 
   return runAgentLoop({
     checkpoint: input.checkpoint,
-    onCheckpoint: input.onCheckpoint,
+    onCheckpoint: async state => {
+      if (historyInput) state.historyInput = historyInput
+      await input.onCheckpoint?.(state)
+    },
     deadline: input.deadline,
     llm,
     registry,
@@ -564,6 +576,7 @@ export async function executeRun(
         role: 'user',
         userId: message.userId,
         userName: message.userName,
+        ...(checkpoint?.historyInput ? { input: checkpoint.historyInput } : {}),
         ...(message.passiveMessageId ? { messageId: message.passiveMessageId } : {}),
         ...(message.attachments.length ? { attachments: message.attachments } : {}),
         content: message.displayText || message.text,
@@ -721,6 +734,8 @@ export async function buildRegistry(
   /** 每个工具自己的配置（管理页在工具详情里填的），如 `{ 'search.web': { apiKey } }` */
   toolConfig: Record<string, Record<string, string>> = {},
   invocation?: ToolInvocation | null,
+  /** 明确开启的插件工具；管理目录仍展示所有项，运行时才应用。 */
+  enabledTools: ReadonlySet<string> = new Set(),
 ): Promise<ToolRegistry> {
   if (!config.enable_tools) return createToolRegistry([])
 
@@ -776,7 +791,7 @@ export async function buildRegistry(
   const enabled = allowed.filter(tool => {
     // 管理目录保留停用项，运行时才收窄。
     if (invocation === undefined && disabledTools.size === 0) return true
-    return !isToolDisabled(tool, disabledTools)
+    return !isToolDisabled(tool, disabledTools, enabledTools)
   })
 
   return createToolRegistry(enabled)

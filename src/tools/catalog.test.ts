@@ -179,7 +179,7 @@ describe('normalizeToolSettings 容错', () => {
     })
   })
 
-  it('null / 非数组一律当成全开', () => {
+  it('null / 非数组使用默认开关', () => {
     expect(normalizeToolSettings(null)).toMatchObject({ disabled: [] })
     expect(normalizeToolSettings(undefined)).toMatchObject({ disabled: [] })
     expect(normalizeToolSettings(42)).toMatchObject({ disabled: [] })
@@ -187,12 +187,12 @@ describe('normalizeToolSettings 容错', () => {
     expect(normalizeToolSettings({})).toMatchObject({ disabled: [] })
   })
 
-  it('数组里全是数字时也当成全开（不是有效的工具名列表）', () => {
+  it('数组里全是数字时使用默认开关（不是有效的工具名列表）', () => {
     expect(normalizeToolSettings([1, 2, 3])).toMatchObject({ disabled: [] })
     expect(normalizeToolSettings('[7,8]')).toMatchObject({ disabled: [] })
   })
 
-  it('disabled 不是数组时当成全开（手改库写错字段名是常见情况）', () => {
+  it('disabled 不是数组时不禁用内置工具（手改库写错字段名是常见情况）', () => {
     expect(normalizeToolSettings({ disabled: 'a' })).toMatchObject({ disabled: [] })
     expect(normalizeToolSettings({ enabled: ['a'] })).toMatchObject({ disabled: [] })
   })
@@ -234,7 +234,7 @@ function fakeToolDb(): {
   writes: number
 } {
   const calls: Array<{ sql: string; params: unknown[] }> = []
-  const rows = new Map<string, { disabled_json: string; config_json?: string; updated_at: number }>()
+  const rows = new Map<string, { disabled_json: string; config_json?: string; enabled_json?: string; updated_at: number }>()
   let writes = 0
 
   const db = {
@@ -244,7 +244,9 @@ function fakeToolDb(): {
       if (sql.includes('{tool_settings}')) {
         rows.set(String(params[0]), {
           disabled_json: String(params[1]),
-          updated_at: Number(params[2]),
+          config_json: String(params[2]),
+          enabled_json: String(params[3]),
+          updated_at: Number(params[4]),
         })
       }
       return { changes: 1 }
@@ -258,7 +260,7 @@ function fakeToolDb(): {
       if (!sql.includes('{tool_settings}')) return null
       const row = rows.get(String(params[0]))
       if (!row) return null
-      return { disabled_json: row.disabled_json, config_json: row.config_json ?? '{}' }
+      return { disabled_json: row.disabled_json, config_json: row.config_json ?? '{}', enabled_json: row.enabled_json ?? '[]' }
     },
     async exec() {},
     table: (name: string) => `p_agent_${name}`,
@@ -268,14 +270,14 @@ function fakeToolDb(): {
 }
 
 describe('D1 工具开关', () => {
-  it('没有行时返回全开，而且不写库', async () => {
+  it('没有行时插件工具默认关闭，而且不写库', async () => {
     const { db, calls, writes } = fakeToolDb()
     const settings = await getToolSettings(db)
 
     expect(settings).toMatchObject({ disabled: [] })
     expect(writes).toBe(0)
     // 只按主键查一行，没有二级索引可走
-    expect(calls[0]?.sql).toContain('SELECT disabled_json, config_json FROM {tool_settings}')
+    expect(calls[0]?.sql).toContain('SELECT disabled_json, config_json, enabled_json FROM {tool_settings}')
     expect(calls[0]?.params).toEqual(['default'])
   })
 
@@ -285,7 +287,7 @@ describe('D1 工具开关', () => {
     expect(await getToolSettings(db)).toMatchObject({ disabled: ['http.request'] })
   })
 
-  it('库里是坏 JSON 时返回全开而不是抛错', async () => {
+  it('库里是坏 JSON 时返回默认开关而不是抛错', async () => {
     const { db, rows } = fakeToolDb()
     rows.set('default', { disabled_json: '{"disabled":', updated_at: 1 })
     expect(await getToolSettings(db)).toMatchObject({ disabled: [] })
@@ -306,9 +308,10 @@ describe('D1 工具开关', () => {
     expect(calls[0]?.sql).toContain('ON CONFLICT(id) DO UPDATE')
     expect(calls[0]?.params[0]).toBe('default')
     expect(calls[0]?.params[1]).toBe('["http.request"]')
-    // 第三列是每工具配置（JSON），第四列才是时间戳
+    // 第三、四列是配置与明确开启名单，第五列才是时间戳
     expect(calls[0]?.params[2]).toBe('{}')
-    expect(typeof calls[0]?.params[3]).toBe('number')
+    expect(calls[0]?.params[3]).toBe('[]')
+    expect(typeof calls[0]?.params[4]).toBe('number')
   })
 
   it('set → get 往返一致', async () => {

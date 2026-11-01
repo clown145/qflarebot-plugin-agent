@@ -71,7 +71,7 @@ const config = {
   show_typing: false,
 }
 
-function harness(chat: LLMService['chat'], providers: PluginDefinition<any>[]) {
+async function harness(chat: LLMService['chat'], providers: PluginDefinition<any>[], enable = true) {
   const store = createTestDb()
   cleanups.push(() => store.close())
   // D1 接口适配真实 SQLite。SQL 展开和隔离全部由框架 createScopedDB 处理。
@@ -150,6 +150,10 @@ function harness(chat: LLMService['chat'], providers: PluginDefinition<any>[]) {
     }
   }
   const first = fresh()
+  const enabledTools = new Set(enable ? await Promise.all(
+    (await first.ctx.service<PluginToolRegistry>('core.tools').list()).map(modelToolName),
+  ) : [])
+  await setToolSettings(first.ctx.db, { disabled: [], enabled: [...enabledTools] })
   const authorize = async () => {
     first.factory.bindSession(
       createMockSession({ userId: 'u1', targetId: 'g1', scene: 'group', memberRole: 'admin' }),
@@ -183,7 +187,7 @@ function harness(chat: LLMService['chat'], providers: PluginDefinition<any>[]) {
       claim.runId!,
       claim.message!,
     )
-  return { ...first, store, env, agent, storage, llm, snapshot, fresh, authorize, reply, run }
+  return { ...first, store, env, agent, storage, llm, snapshot, fresh, authorize, reply, run, enabledTools }
 }
 
 function provider(
@@ -231,7 +235,7 @@ describe('真实跨插件调用', () => {
           })
         : result(),
     )
-    const h = harness(chat, [t2i])
+    const h = await harness(chat, [t2i])
     // T2I 声明 25 秒，聊天入口会让出到 cron；随后恢复执行同一个待调用工具。
     const session = createMockSession({
       event: 'qq.group.at_message',
@@ -265,7 +269,7 @@ describe('真实跨插件调用', () => {
     expect(JSON.stringify(chat.mock.calls)).not.toContain(claim.message!.toolInvocation!.token)
   })
 
-  it.each(['unchanged', 'upgraded', 'disabled'] as const)(
+  it.each(['unchanged', 'upgraded', 'disabled', 'agent_disabled'] as const)(
     '两个提供者之间恢复：%s，不重做已完成的写操作',
     async mode => {
       let now = Date.now()
@@ -303,7 +307,7 @@ describe('真实跨插件调用', () => {
             })
           : result(),
       )
-      const h = harness(chat, [writer, reader])
+      const h = await harness(chat, [writer, reader])
       const claim = await h.agent.submit(await h.authorize())
       expect(await h.run(h.ctx, h.agent, claim, now + 24_000)).toMatchObject({ suspended: true })
       expect((await h.agent.checkpoint(claim.runId!))?.toolTraces).toHaveLength(1)
@@ -311,6 +315,7 @@ describe('真实跨插件调用', () => {
       Object.assign(restarted, { ctx: { storage: h.storage } })
       const resumed = await restarted.poll()
       if (mode === 'disabled') h.snapshot.plugins.reader = { enabled: false }
+      if (mode === 'agent_disabled') await setToolSettings(h.ctx.db, { disabled: [], enabled: [] })
       const fresh = h.fresh([
         writer,
         mode === 'upgraded' ? provider('reader', read, 'none', 2) : reader,
@@ -343,7 +348,7 @@ describe('真实跨插件调用', () => {
         tool_calls: [{ id: 'write', name: 'plugin.writer.query', arguments: '{}' }],
       }),
     )
-    const h = harness(chat, [provider('writer', write, 'external_write')])
+    const h = await harness(chat, [provider('writer', write, 'external_write')])
     const inbound = await h.authorize()
     const base = {
       llm: h.llm,
@@ -355,6 +360,7 @@ describe('真实跨插件调用', () => {
         undefined,
         {},
         inbound.toolInvocation,
+        h.enabledTools,
       ),
       logger,
       model: 'chat',
@@ -394,6 +400,7 @@ describe('真实跨插件调用', () => {
       undefined,
       {},
       inbound.toolInvocation,
+      h.enabledTools,
     )
     await expect(runAgentLoop({ ...base, registry, checkpoint: saved })).rejects.toThrow(
       '结果尚未确认',
@@ -402,7 +409,7 @@ describe('真实跨插件调用', () => {
   })
 
   it('真实目录遵守 Agent 开关和人格白名单，无凭据的定时任务看不到外部工具', async () => {
-    const h = harness(
+    const h = await harness(
       async () => result(),
       [provider('reader', async () => ({ status: 'success' }))],
     )
@@ -411,14 +418,14 @@ describe('真实跨插件调用', () => {
       disabled?: Set<string>,
       allowed?: string[],
       invocation = inbound.toolInvocation,
-    ) => buildRegistry(h.ctx, config, false, disabled, allowed, {}, invocation)
+    ) => buildRegistry(h.ctx, config, false, disabled, allowed, {}, invocation, h.enabledTools)
     expect((await build()).get('plugin.reader.query')).toBeDefined()
     expect(
       (await build(new Set(['plugin.reader.query']))).get('plugin.reader.query'),
     ).toBeUndefined()
     expect((await build(undefined, [])).list()).toEqual([])
     expect(
-      (await buildRegistry(h.ctx, config, false, undefined, undefined, {}, null)).get(
+      (await buildRegistry(h.ctx, config, false, undefined, undefined, {}, null, h.enabledTools)).get(
         'plugin.reader.query',
       ),
     ).toBeUndefined()
@@ -439,7 +446,7 @@ describe('真实跨插件调用', () => {
         tool_calls: [{ id: 'write', name: 'plugin.writer.query', arguments: '{}' }],
       }),
     )
-    const h = harness(chat, [p])
+    const h = await harness(chat, [p])
     const claim = await h.agent.submit(await h.authorize())
     expect((await h.run(h.ctx, h.agent, claim)).ok).toBe(false)
     expect(h.reply).toHaveBeenCalledWith(expect.stringContaining('结果尚未确认'))
@@ -449,7 +456,7 @@ describe('真实跨插件调用', () => {
   })
 
   it('旧注册入口保留兼容，但自报的提供者不能越过框架服务依赖', async () => {
-    const h = harness(async () => result(), [])
+    const h = await harness(async () => result(), [])
     const { upsertPluginTool } = await import('../../src/plugin-tools.js')
     await upsertPluginTool(h.ctx.db, 'forged', {
       name: 'query',
@@ -474,7 +481,7 @@ describe('真实跨插件调用', () => {
 
   it('框架允许的写工具仍受 Agent 本地只读权限约束', async () => {
     const write = vi.fn(async () => ({ status: 'success' as const }))
-    const h = harness(async () => result(), [provider('writer', write, 'external_write')])
+    const h = await harness(async () => result(), [provider('writer', write, 'external_write')])
     const inbound = await h.authorize()
     const registry = await buildRegistry(
       h.ctx,
@@ -484,6 +491,7 @@ describe('真实跨插件调用', () => {
       undefined,
       {},
       inbound.toolInvocation,
+      h.enabledTools,
     )
     expect(registry.get('plugin.writer.query')?.definition.permission.level).toBe(3)
     const outcome = await registry.execute('plugin.writer.query', {
@@ -506,7 +514,7 @@ describe('真实跨插件调用', () => {
 
   it('长名称稳定映射且没有截断碰撞', async () => {
     const owner = 'a'.repeat(48)
-    const h = harness(async () => result(), [provider(owner, async () => ({ status: 'success' }))])
+    const h = await harness(async () => result(), [provider(owner, async () => ({ status: 'success' }))])
     const descriptor = (await h.ctx.service<PluginToolRegistry>('core.tools').list())[0]!
     const first = await modelToolName({
       ...descriptor,
@@ -521,4 +529,24 @@ describe('真实跨插件调用', () => {
     expect(first).toHaveLength(64)
     expect(first).not.toBe(second)
   })
+})
+
+
+it.each(['default', 'settings_unavailable'] as const)('真实聊天入口在 %s 时不向模型提供插件工具', async mode => {
+  const execute = vi.fn(async () => ({ status: 'success' as const }))
+  const chat = vi.fn(async (_request: LLMChatRequest) => result())
+  const h = await harness(chat, [provider('reader', execute)], mode !== 'default')
+  const claim = await h.agent.submit(await h.authorize())
+  if (mode === 'settings_unavailable') {
+    const first = h.ctx.db.first.bind(h.ctx.db)
+    vi.spyOn(h.ctx.db, 'first').mockImplementation(async (sql, ...params) => {
+      if (sql.includes('{tool_settings}')) throw new Error('模拟设置暂时无法读取')
+      return first(sql, ...params)
+    })
+  }
+  expect(await h.run(h.ctx, h.agent, claim)).toMatchObject({ ok: true })
+  const names = chat.mock.calls[0]![0].tools?.map(tool => tool.name)
+  expect(names).toContain('time.now')
+  expect(names).not.toContain('plugin.reader.query')
+  expect(execute).not.toHaveBeenCalled()
 })

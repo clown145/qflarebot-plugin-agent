@@ -5,6 +5,7 @@ import { defaultConfig, type AgentConfig } from '../config/index.js'
 import { makeObject } from '../do/agent-test-object.js'
 import { LEASE_MS } from '../do/agent-object.js'
 import { createTestDb } from '../store/sqlite-test-db.js'
+import { deleteSkill, upsertSkill } from '../skills/store.js'
 import { executeRun } from './run.js'
 import { runAgentLoop, LoopYieldError, type LoopCheckpoint, type LoopOptions } from './loop.js'
 import { createToolRegistry } from '../tools/registry.js'
@@ -31,21 +32,33 @@ describe('长任务分段执行', () => {
     const chat = vi.fn(async (_request: LLMChatRequest) => {
       now += 10_000
       return chat.mock.calls.length === 1
-        ? result({ text: '', tool_calls: [{ id: 'create-1', name: 'schedule.create', arguments: JSON.stringify({ delay_seconds: 60, prompt: '喝水' }) }], usage: { input_tokens: 10 } })
+        ? result({
+          text: '',
+          tool_calls: [{ id: 'create-1', name: 'schedule.create', arguments: JSON.stringify({ delay_seconds: 60, prompt: '喝水' }) }],
+          thought_signatures: [{ part_index: 0, part_kind: 'function_call', signature: 'gemini-signature', tool_call_id: 'create-1', tool_name: 'schedule.create' }],
+          usage: { input_tokens: 10 },
+        })
         : result({ usage: { input_tokens: 20 } })
     })
     const llm = llmWith(chat)
-    const config = { ...defaultConfig, enable_schedule: true, enable_vfs: false }
+    const config = { ...defaultConfig, enable_schedule: true, enable_vfs: false, enable_skills: true, expose_datetime: true }
     const ctx = createMockContext<AgentConfig>(plugin, { config, db: store.db, services: { llm } })
+    await upsertSkill(store.db, { id: 'reminders', content: '---\ndescription: 创建提醒\n---\n按用户要求创建提醒。' })
+    const input = { ...message, text: '/skill reminders 提醒我喝水' }
     const reply = vi.fn(async () => true)
-    const claimed = await agent.submit(message)
+    const claimed = await agent.submit(input)
     const deps = { ctx, config, logger, llm, agent, reply }
-    expect(await executeRun({ ...deps, leaseId: claimed.leaseId, deadline: now + 24_000 }, claimed.runId!, message)).toMatchObject({ suspended: true, replied: false })
+    expect(await executeRun({ ...deps, leaseId: claimed.leaseId, deadline: now + 24_000 }, claimed.runId!, input)).toMatchObject({ suspended: true, replied: false })
     expect(await agent.runStatus(claimed.runId!)).toBe('pending')
     expect((await store.db.all('SELECT id FROM {schedules}')).length).toBe(1)
     expect(reply).not.toHaveBeenCalled()
     const checkpoint = await agent.checkpoint(claimed.runId!)
-    expect(checkpoint).toMatchObject({ steps: 1, usedToolCalls: 1 })
+    expect(checkpoint).toMatchObject({
+      steps: 1, usedToolCalls: 1,
+      historyInput: { text: '提醒我喝水', scene: message.scene, receivedAt: message.receivedAt },
+    })
+    // 恢复时技能已不存在，也必须按检查点里的首次正文写历史。
+    await deleteSkill(store.db, 'reminders')
     // 重建 DO 实例、重新认领，模拟下一次 cron 的独立调用。
     const restarted = makeObject().obj
     Object.assign(restarted, { ctx: { storage } })
@@ -54,9 +67,22 @@ describe('长任务分段执行', () => {
     expect(await executeRun({ ...deps, agent: restarted, leaseId: resumed.leaseId, deadline: now + 55_000 }, resumed.runId!, resumed.message!)).toMatchObject({ ok: true })
     expect(chat).toHaveBeenCalledTimes(2)
     expect(chat.mock.calls[1]?.[0].messages).toEqual(expect.arrayContaining([expect.objectContaining({ role: 'tool', tool_call_id: 'create-1' })]))
+    const resumedMessages = chat.mock.calls[1]![0].messages
+    expect(resumedMessages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'create-1' })
+    expect(resumedMessages.find(message => message.role === 'assistant' && message.tool_calls?.length)).toMatchObject({
+      tool_calls: [{ id: 'create-1', name: 'schedule.create', arguments: JSON.stringify({ delay_seconds: 60, prompt: '喝水' }) }],
+      thought_signatures: [{ part_index: 0, part_kind: 'function_call', signature: 'gemini-signature', tool_call_id: 'create-1', tool_name: 'schedule.create' }],
+    })
     expect((await store.db.all('SELECT id FROM {schedules}')).length).toBe(1)
     expect((await restarted.checkpoint(resumed.runId!))?.result).toMatchObject({ steps: 2, toolCalls: 1, usage: { inputTokens: 30 } })
     expect(reply).toHaveBeenCalledTimes(1)
+    const nextMessage = { ...message, text: '继续', receivedAt: now }
+    const next = await restarted.submit(nextMessage)
+    expect(await executeRun({ ...deps, agent: restarted, leaseId: next.leaseId }, next.runId!, nextMessage)).toMatchObject({ ok: true })
+    const originalUser = chat.mock.calls[0]![0].messages.find(message => message.role === 'user')
+    const replayedUser = chat.mock.calls[2]![0].messages.find(message => message.role === 'user')
+    expect(replayedUser).toEqual(originalUser)
+    expect(replayedUser?.content).not.toContain('/skill')
   })
 
   it('租约接管后旧执行者不能续租、保存进度或提交历史', async () => {

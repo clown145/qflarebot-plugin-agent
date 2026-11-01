@@ -130,16 +130,7 @@ export function buildMessages(
 
   // 本轮的动态上下文（时间/会话/说话人）附在**这条 user 消息**上，
   // 而不是塞进 system —— 理由见 buildSystemReminder 的注释（缓存）。
-  messages.push({
-    role: 'user',
-    content: withReminder(
-      buildUserContent(message, options.supportsVision),
-      buildSystemReminder(message, options.timezone, {
-        senderId: options.exposeSenderId ?? false,
-        datetime: options.exposeDatetime ?? false,
-      }),
-    ),
-  })
+  messages.push(buildUserMessage(message, options))
 
   // 兜底修一次配对：历史里可能出现「有 assistant.toolCalls 但工具结果没存下来」
   // （目前 run.ts 只存纯文本，不会产生这种数据；但一旦开始存 toolCalls，
@@ -229,7 +220,7 @@ function buildSystemPrompt(
  * 系统给的即时上下文，而不是用户在说话。
  */
 function buildSystemReminder(
-  message: InboundMessage,
+  message: Pick<InboundMessage, 'userId' | 'userName' | 'receivedAt' | 'scene'>,
   timezone: string,
   // 默认值要和配置的默认值一致：两个都关。
   // 这里的默认值只影响「调用方没传」的情况（主要是一些老测试），
@@ -276,6 +267,26 @@ function buildSystemReminder(
   return ['<system_reminder>', ...lines, '</system_reminder>'].join('\n')
 }
 
+/** 首次发送与历史回放共用格式；同一条消息的昵称、时间和正文不随轮次改写。 */
+function buildUserMessage(
+  message: Pick<
+    InboundMessage,
+    'text' | 'attachments' | 'userId' | 'userName' | 'receivedAt' | 'scene'
+  >,
+  options: ContextOptions,
+): ModelMessage {
+  return {
+    role: 'user',
+    content: withReminder(
+      buildUserContent(message, options.supportsVision),
+      buildSystemReminder(message, options.timezone, {
+        senderId: options.exposeSenderId ?? false,
+        datetime: options.exposeDatetime ?? false,
+      }),
+    ),
+  }
+}
+
 function toModelMessage(row: HistoryRow, options: ContextOptions): ModelMessage {
   if (row.role === 'assistant') {
     const thinking = row.reasoning !== undefined ? { reasoning: row.reasoning } : {}
@@ -289,7 +300,7 @@ function toModelMessage(row: HistoryRow, options: ContextOptions): ModelMessage 
     // 两条消息，而历史按条数占 DO 配额；更要紧的是那些 tool 结果当年可能被截断过，
     // 还原成协议消息会让模型以为拿到了完整结果。折中成一段说明，
     // 既让模型知道「上次调过什么」，又不伪造协议结构。
-    const lines = traces.map((trace) => {
+    const lines = traces.map(trace => {
       const ok = trace.status === 'success' ? '成功' : `失败（${trace.status}）`
       return `- ${trace.name}(${trace.args}) → ${ok}：${trace.result}`
     })
@@ -299,8 +310,22 @@ function toModelMessage(row: HistoryRow, options: ContextOptions): ModelMessage 
       ...thinking,
     }
   }
-  // 老历史没有身份和附件，保持可读；新历史按当轮的视觉能力回放。
-  const content = buildUserContent({ text: row.content, attachments: row.attachments ?? [] }, options.supportsVision)
+  if (row.input) {
+    return buildUserMessage(
+      {
+        ...row.input,
+        userId: row.userId ?? '',
+        userName: row.userName ?? '',
+        attachments: row.attachments ?? [],
+      },
+      options,
+    )
+  }
+  // 旧记录缺少原始输入，保留之前的回放方式，不用完成时间冒充接收时间。
+  const content = buildUserContent(
+    { text: row.content, attachments: row.attachments ?? [] },
+    options.supportsVision,
+  )
   const reminder = row.userId
     ? `<system_reminder>\n- 当时的说话人：${speakerLabel(row.userId, row.userName, options.exposeSenderId)}\n</system_reminder>`
     : ''

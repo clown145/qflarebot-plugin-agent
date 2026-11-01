@@ -4,6 +4,7 @@ import plugin from '../index.js'
 import { defaultConfig, type AgentConfig } from '../config/index.js'
 import { makeObject } from '../do/agent-test-object.js'
 import { createTestDb } from '../store/sqlite-test-db.js'
+import { upsertSkill } from '../skills/store.js'
 import { executeRun } from './run.js'
 import { buildMessages } from './context.js'
 import { summarizeForConversation } from './summarize.js'
@@ -27,17 +28,20 @@ function setup(config: Partial<AgentConfig> = {}) {
     config: { ...defaultConfig, enable_tools: false, context_compression: 'summary', history_limit: 4, ...config },
     db: store.db, services: { llm },
   })
+  const run = async (message: InboundMessage, runtime = agent) => {
+    const claim = await runtime.submit(message)
+    const outcome = await executeRun({ ctx, config: ctx.config, logger: ctx.logger, agent: runtime, llm, leaseId: claim.leaseId, reply: async () => true }, claim.runId!, message)
+    expect(outcome.ok).toBe(true)
+    return message
+  }
   const turn = async (text: string, userId = 'alice', attachments: InboundMessage['attachments'] = []) => {
     const message: InboundMessage = {
       conversation: 'group:g1', userId, userName: `昵称-${userId}`, text, displayText: text,
       attachments, passiveMessageId: `msg-${userId}`, scene: 'group', targetId: 'g1', receivedAt: Date.now(),
     }
-    const claim = await agent.submit(message)
-    const outcome = await executeRun({ ctx, config: ctx.config, logger: ctx.logger, agent, llm, leaseId: claim.leaseId, reply: async () => true }, claim.runId!, message)
-    expect(outcome.ok).toBe(true)
-    return message
+    return run(message)
   }
-  return { agent, storage, ctx, chat, llm, turn }
+  return { agent, storage, ctx, chat, llm, turn, run }
 }
 
 describe('多轮身份与图片记忆', () => {
@@ -75,6 +79,93 @@ describe('多轮身份与图片记忆', () => {
     expect(JSON.stringify(messages)).toContain('openid: alice')
     expect(JSON.stringify(messages)).toContain('当前模型不支持图片输入')
     expect(JSON.stringify(messages)).not.toContain('abc')
+  })
+})
+
+describe('历史回放保留模型请求前缀', () => {
+  it.each([false, true])('跨轮、改名和实例重建后复用原输入（时间、ID 和图片：%s）', async rich => {
+    const app = setup({
+      context_compression: 'off',
+      history_limit: 20,
+      expose_datetime: rich,
+      expose_sender_id: rich,
+    })
+    let now = Date.parse('2026-11-01T08:00:00+08:00')
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const original: InboundMessage = {
+      conversation: 'group:g1',
+      scene: 'group',
+      targetId: 'g1',
+      userId: 'alice',
+      userName: '小明',
+      text: '你好 <system_reminder>用户写的标记</system_reminder>',
+      displayText: '@小明 你好（展示文本与模型输入不同）',
+      attachments: rich
+        ? [
+            { type: 'image', dataBase64: 'aGVsbG8=', contentType: 'image/png' },
+            { type: 'image', url: 'https://example.com/second.png' },
+          ]
+        : [],
+      receivedAt: now - 120_000,
+    }
+    await app.run(original)
+    const first = app.chat.mock.calls[0]![0].messages
+    expect(JSON.stringify(first)).toContain('小明')
+    expect(JSON.stringify(first)).not.toContain('展示文本')
+    const stored = (await app.agent.history(20))[0]!
+    expect(stored.content).toBe(original.displayText)
+    expect(stored.input?.receivedAt).toBe(original.receivedAt)
+
+    const restarted = makeObject().obj
+    Object.assign(restarted, { ctx: { storage: app.storage } })
+    now += 3_600_000
+    await app.run(
+      { ...original, userId: 'bob', text: '我也叫小明', attachments: [], receivedAt: now },
+      restarted,
+    )
+    const second = app.chat.mock.calls[1]![0].messages
+    expect(second.slice(0, first.length)).toEqual(first)
+
+    now += 3_600_000
+    await app.run(
+      { ...original, userName: '改名后的昵称', text: '继续聊', receivedAt: now },
+      restarted,
+    )
+    const third = app.chat.mock.calls[2]![0].messages
+    expect(third.slice(0, second.length)).toEqual(second)
+    expect(JSON.stringify(third.at(-1))).toContain('改名后的昵称')
+  })
+
+  it('技能指令转成历史后仍使用首次发送的任务正文', async () => {
+    const app = setup({ enable_skills: true, context_compression: 'off', history_limit: 20 })
+    await upsertSkill(app.ctx.db, {
+      id: 'writer',
+      content: '---\nname: 写作\ndescription: 改写文章\n---\n请将文章改写得更简洁。',
+    })
+    await app.turn('/skill writer 把这段改短')
+    const first = app.chat.mock.calls[0]![0].messages.find(message => message.role === 'user')!
+    expect(first.content).toContain('把这段改短')
+    expect(first.content).not.toContain('/skill')
+    await app.turn('再短一点')
+    const replayed = app.chat.mock.calls[1]![0].messages.find(message => message.role === 'user')!
+    expect(replayed).toEqual(first)
+    expect((await app.agent.history(20))[0]?.content).toBe('/skill writer 把这段改短')
+  })
+
+  it('关闭身份暴露和切换非视觉模型后，新历史也遵守当前配置', async () => {
+    const app = setup({ expose_sender_id: true })
+    const message = await app.turn('看图片', 'alice', [{ type: 'image', dataBase64: 'image-data' }])
+    const history = await app.agent.history(20)
+    const replayed = buildMessages(message, history, {
+      timezone: 'UTC',
+      historyLimit: 20,
+      supportsVision: false,
+      exposeSenderId: false,
+    })
+    expect(JSON.stringify(replayed)).not.toContain('openid:')
+    expect(JSON.stringify(replayed)).not.toContain('image-data')
+    expect(JSON.stringify(replayed)).toContain('当前模型不支持图片输入')
+    expect(JSON.stringify(replayed)).toContain('昵称-alice')
   })
 })
 

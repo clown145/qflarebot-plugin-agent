@@ -67,7 +67,13 @@ interface PageActions {
   }): Promise<void>
 }
 
-async function setup(options: { hold?: boolean } = {}) {
+interface ToolsState {
+  list: Array<{ name: string; source?: { type: string }; permission: { level: number } }>
+  disabled: string[]
+  enabled?: string[]
+}
+
+async function setup(options: { hold?: boolean; tools?: ToolsState } = {}) {
   let config = structuredClone({
     ...defaultConfig,
     model: 'chat',
@@ -93,10 +99,13 @@ async function setup(options: { hold?: boolean } = {}) {
       }
       return Response.json({ ok: true, overriddenKeys: Object.keys(body.patch ?? {}) })
     }
+    if (path === '/api/tools' && init?.method === 'POST') {
+      return fail ? Response.json({ error: 'service unavailable' }, { status: 503 }) : Response.json({ ok: true })
+    }
     const response = Response.json({
       config: structuredClone(config),
       modelStatus: { models: ['chat', 'reasoner'] },
-      tools: { list: [{ name: 'time.now', permission: { level: 1 } }], disabled: [] },
+      tools: options.tools ?? { list: [{ name: 'time.now', permission: { level: 1 } }], disabled: [], enabled: [] },
       skills: [{ id: 'report', name: 'Report' }],
       bindings: [], schedules: [], audits: [], stats: [],
     })
@@ -310,4 +319,33 @@ describe('管理页的保存与草稿保护', () => {
     await flush()
     expect(document.activeElement).toBe(byId('resetPrompt'))
   })
+})
+
+it('插件工具开关提交明确开启名单，保存失败保留之前的开关', async () => {
+  const app = await setup({
+    tools: {
+      list: [
+        { name: 'time.now', source: { type: 'builtin' }, permission: { level: 1 } },
+        { name: 'plugin.t2i.render', source: { type: 'plugin' }, permission: { level: 1 } },
+        { name: 'plugin.weather.query', source: { type: 'plugin' }, permission: { level: 1 } },
+      ],
+      disabled: ['plugin.t2i.render', 'plugin.weather.query'],
+      enabled: [],
+    },
+  })
+  const control = () =>
+    document.querySelector<HTMLButtonElement>('[aria-label="plugin.t2i.render"]')!
+  expect(control().getAttribute('aria-checked')).toBe('false')
+  control().click()
+  await flush()
+  const saved = app.fetch.mock.calls.find(([path]) => path === '/api/tools')!
+  expect(JSON.parse(String(saved[1]?.body))).toEqual({
+    disabled: ['plugin.weather.query'],
+    enabled: ['plugin.t2i.render'],
+  })
+  expect(control().getAttribute('aria-checked')).toBe('true')
+  app.setFail(true)
+  control().click()
+  await flush()
+  expect(control().getAttribute('aria-checked')).toBe('true')
 })

@@ -33,7 +33,7 @@
 
 import { PluginDurableObject } from '@qqbot/sdk'
 import type { StoredSummary } from '../agent/context-size.js'
-import type { InboundMessage, MessageAttachment, RunRecord, RunStatus } from '../types.js'
+import type { HistoryUserInput, InboundMessage, MessageAttachment, RunRecord, RunStatus } from '../types.js'
 import { readValue, writeValue, deleteValue, type Storage } from './large-value.js'
 import { historySummary } from '../agent/history.js'
 import type { LoopCheckpoint } from '../agent/loop.js'
@@ -81,6 +81,8 @@ export const MAX_ATTEMPTS = 3
 const MAX_HISTORY_ROWS = 120
 
 export interface HistoryRow {
+  /** 新历史保留首次装配的输入；旧记录缺省时使用兼容回放。 */
+  input?: HistoryUserInput
   id?: string
   userId?: string
   userName?: string

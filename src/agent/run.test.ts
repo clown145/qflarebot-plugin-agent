@@ -145,6 +145,7 @@ describe('executeRun', () => {
       role: 'user',
       userId: 'u1',
       userName: '小明',
+      input: { text: '@小明 你好', scene: 'group', receivedAt: expect.any(Number) },
       content: '@小明 你好',
       toolCallsJson: null,
       createdAt: expect.any(Number),
