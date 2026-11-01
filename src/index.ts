@@ -778,8 +778,6 @@ async function handleMessage(
       conversation: message.conversation,
       runId: claimed.runId,
     })
-    // 只提示一次，不 await 任务本身
-    await reply('这个问题要多花点时间，我处理完会直接回复你。').catch(() => false)
     // waitUntil 只能使用原请求剩余的后台窗口，不能重置平台的 30 秒时限。
     // 达到执行条数上限后，剩余消息保留为 pending，由后续入站或 cron 兜底。
     if (outcome === 'timeout') ctx.waitUntil(running.catch(() => undefined))
