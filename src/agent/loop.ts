@@ -1,47 +1,48 @@
 /**
- * agent loop：模型调用 → 工具执行 → 结果回填 → 再调用，直到模型给出最终答复。
- *
- * 结构照搬 serverless-agent 的 `src/core/agent-tool-loop.ts`（182 行）。
- * 原文的骨架：
- *
- * ```text
- * for (let index = 0; index < maxModelSteps; index++) {
- *   response = provider.complete(...)
- *   if (no toolCalls) { finishRun(); return }
- *   messages.push(assistant + toolCalls)
- *   for (toolCall of response.toolCalls) {
- *     if (!reserveToolCall(limit)) { failRun(); return }
- *     execution = executeAgentToolCall(...)
- *     sentMessageTool ||= execution.sentMessage
- *     messages.push(execution.resultMessage)
- *   }
- * }
- * failRun('maximum model reasoning steps exceeded')
- * ```
- *
- * 逐条对齐了这个骨架，包括：
- * - **两个独立的限额**：模型步数 + 工具调用数，各自的计数与错误文案分开
- * - **`sentMessageTool` 累加**：工具发过消息就不再补最终回复
- * - **超过步数上限时抛错**，而不是静默返回空
- *
- * 相对原文的差异：
- * - 原文每步写 `run_steps` 到 D1（`recordModelStep` / `recordToolRequestedStep` /
- *   `recordToolCompletedStep`），这里改成 `logger` + 可选的 `onStep` 回调。
- *   按免费版 10 万行/日算，逐步落库只够 5,000 次对话。
- * - 原文的 `waiting_for_device`（RayNeo 设备异步回传）没有搬——那是私有硬件协议。
- * - 原文从 `context.provider` 拿模型，这里走 plugin-llm 的 `llm` 服务。
+ * 模型调用 → 工具执行 → 回填结果。模型与工具前后保存检查点，跨执行预算接续。
+ * 已完成的工具不重做；中断时结果未知的写操作停止自动恢复，只读操作允许重试。
+ * 循环结构参考 serverless-agent；平台调度、持久化与租约由本插件负责。
  */
 import type { Logger } from '@qqbot/sdk'
 import { callLLM, LLMCallError, type LLMCallOptions } from '../llm/client.js'
 import { compactMessages, estimateMessagesTokens } from './context-size.js'
 import type { SummaryInput } from '../do/agent-object.js'
 import type { LLMService } from '../llm/contract.js'
-import type { HistoryToolTrace, ModelMessage, ModelResponse } from '../types.js'
+import type { HistoryToolTrace, ModelMessage, ModelResponse, ModelToolCall } from '../types.js'
 import { executeAgentToolCall } from './tool-executor.js'
 import type { ToolRegistry, ToolExecuteInput } from '../tools/registry.js'
 import { toModelTools } from '../tools/registry.js'
 
+export interface LoopCheckpoint {
+  toolBindings?: Record<string, { id: string; revision: string }>
+  version: 1
+  model?: string
+  modelRetries?: number
+  messages: ModelMessage[]
+  steps: number
+  usedToolCalls: number
+  repliedByTool: boolean
+  usage: { inputTokens: number; outputTokens: number }
+  compactedRounds: number
+  droppedForSummary: SummaryInput[]
+  contextTokens: number
+  toolTraces: HistoryToolTrace[]
+  outbound: import('../tools/types.js').OutboundMedia[]
+  pending: ModelToolCall[]
+  inFlight?: { id: string; name: string; sideEffect: string }
+  result?: LoopResult
+  /** 发送前登记，避免平台中断后再次发送同一条消息。 */
+  delivery?: { media: number; text: boolean }
+}
+
+export class LoopYieldError extends Error {
+  constructor() { super('本次执行预算已用完，已保存进度等待接续'); this.name = 'LoopYieldError' }
+}
+
 export interface LoopOptions {
+  checkpoint?: LoopCheckpoint | null
+  onCheckpoint?: (checkpoint: LoopCheckpoint) => Promise<void>
+  deadline?: number
   llm: LLMService
   registry: ToolRegistry
   logger: Logger
@@ -155,30 +156,6 @@ export class LoopCancelledError extends Error {
 }
 
 /**
- * 工具调用限额。照搬原文 `tool-call-limit.ts`（26 行）——
- * 原文把这个状态做成独立模块，因为「预留」和「检查」是两步：
- * 先 reserve，成功了才执行。这里保留同样的语义。
- */
-interface ToolCallLimitState {
-  maxToolCallsPerRun: number
-  usedToolCalls: number
-}
-
-function createToolCallLimitState(maxToolCallsPerRun: number): ToolCallLimitState {
-  return { maxToolCallsPerRun, usedToolCalls: 0 }
-}
-
-function reserveToolCall(state: ToolCallLimitState): boolean {
-  if (state.usedToolCalls >= state.maxToolCallsPerRun) return false
-  state.usedToolCalls += 1
-  return true
-}
-
-function toolCallLimitExceededMessage(state: ToolCallLimitState): string {
-  return `单次对话最多调用 ${state.maxToolCallsPerRun} 次工具，已经用完。可以让我少做几步，或者把任务拆开。`
-}
-
-/**
  * 判断这次错误能不能重试。与 `describeLoopError` 同一套判据，
  * 但只关心「值不值得再来一次」。
  */
@@ -210,13 +187,17 @@ async function callLLMWithRetry(
   logger: Logger,
   step: number,
   checkCancelled: () => Promise<void>,
+  checkBudget: (delayMs?: number) => void,
+  retriesUsed: number,
+  saveRetry: (attempt: number) => Promise<void>,
 ): Promise<ModelResponse> {
   const attempts = Math.max(0, Math.trunc(retry?.times ?? 0))
   const delayMs = retry?.delayMs ?? 0
 
-  for (let attempt = 0; ; attempt += 1) {
+  for (let attempt = retriesUsed; ; attempt += 1) {
     // 重试等待期间也可能被 /stop；不要再发下一次模型请求。
     if (attempt > 0) await checkCancelled()
+    checkBudget()
     try {
       return await callLLM(llm, request)
     } catch (error) {
@@ -225,6 +206,8 @@ async function callLLMWithRetry(
       // 的回复——而用户说的正是「别说了」。这里把它归一成取消语义。
       if (request.signal?.aborted) throw new LoopCancelledError()
       if (attempt >= attempts || !isRetryableError(error)) throw error
+      await saveRetry(attempt + 1)
+      checkBudget(delayMs)
       const described = error instanceof LLMCallError ? error.message : String(error)
       logger.warn('模型调用可重试错误，重试这一次调用', {
         step,
@@ -261,172 +244,123 @@ export async function throwIfCancelled(
 
 export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   const { llm, registry, logger, model, maxModelSteps, requestTimeoutMs, toolContext } = options
+  const state: LoopCheckpoint = options.checkpoint ? structuredClone(options.checkpoint) : {
+    version: 1, model, messages: [...options.messages], steps: 0, usedToolCalls: 0,
+    repliedByTool: false, usage: { inputTokens: 0, outputTokens: 0 },
+    compactedRounds: 0, droppedForSummary: [], contextTokens: 0,
+    toolTraces: [], outbound: [], pending: [],
+  }
+  const bindings = Object.fromEntries(registry.list().flatMap(t => t.definition.binding ? [[t.definition.name, t.definition.binding]] : []))
+  state.toolBindings ??= options.checkpoint ? {} : bindings
+  const tools = toModelTools(registry.list().filter(t => !t.definition.binding || state.toolBindings?.[t.definition.name]?.revision === t.definition.binding.revision))
+  const allowedToolNames = new Set(tools.map(t => t.name))
+  const persist = async () => { await options.onCheckpoint?.(state) }
+  const budget = (operationMs: number) => {
+    if (options.deadline !== undefined && Date.now() + operationMs + 1_500 > options.deadline) throw new LoopYieldError()
+  }
+  // 在第一次网络请求之前也保存，硬中断后沿用同一份上下文。
+  await persist()
 
-  const messages = [...options.messages]
-  const tools = toModelTools(registry.list())
-  const allowedToolNames = new Set(tools.map((t) => t.name))
-  const toolCallLimit = createToolCallLimitState(options.maxToolCalls)
-
-  let steps = 0
-  let repliedByTool = false
-  let inputTokens = 0
-  let outputTokens = 0
-  let compactedRounds = 0
-  // 被压缩丢掉的轮次（摊平成文本），交给调用方去生成摘要。
-  // 这里只收集不处理：生成摘要要调模型，而 loop 跑在 30 秒事件预算里。
-  const droppedForSummary: SummaryInput[] = []
-  let contextTokens = 0
-  const toolTraces: HistoryToolTrace[] = []
-  const outbound: import('../tools/types.js').OutboundMedia[] = []
-
-  for (let index = 0; index < maxModelSteps; index += 1) {
-    steps = index + 1
-    await options.onStep?.(steps)
-
-    // 取消检查放在**每步开头**（onStep 之后、模型调用之前）：
-    // 用户按 `/stop` 时，执行流可能正停在两次模型调用之间等工具结果，
-    // 没有这一步检查它就会继续把剩下的步数跑完，用户等来的是一条完整的回答。
-    //
-    // 这里是**第二级**取消判定：跨 isolate 传不了对象，所以每步问一次 DO
-    // storage 里这个 run 的状态。`signal` 那一级负责打断正在飞的模型调用。
+  while (true) {
     await throwIfCancelled(options)
+    if (state.result) return state.result
 
-    // 每步之前压一次。工具结果会不断堆进 messages，只在装配时压一次等于没压。
-    //
-    // system 消息单独拎出来算 token：它每轮都在，但不能被丢。
+    // 模型响应先持久化，再逐个执行工具；恢复时跳过已有结果的工具。
+    while (state.pending.length) {
+      const toolCall = state.pending[0]!
+      await throwIfCancelled(options)
+      const tool = registry.get(toolCall.name)
+      if (state.inFlight && state.inFlight.sideEffect !== 'none') {
+        throw new LoopLimitError(`上次执行工具 ${state.inFlight.name} 时被中断，结果尚未确认。为避免重复操作，已停止自动重试，请先核对操作结果。`)
+      }
+      const pinned = state.toolBindings[toolCall.name]
+      if (pinned && (!tool?.definition.binding || pinned.id !== tool.definition.binding.id || pinned.revision !== tool.definition.binding.revision)) {
+        throw new LoopLimitError(`工具 ${pinned.id} 已停用、权限变化或版本更新，已停止这次调用，请重新发起任务。`)
+      }
+      budget(tool?.definition.timeoutMs ?? 1_000)
+      if (!state.inFlight) {
+        if (state.usedToolCalls >= options.maxToolCalls) {
+          throw new LoopLimitError(`单次对话最多调用 ${options.maxToolCalls} 次工具，已经用完。可以让我少做几步，或者把任务拆开。`)
+        }
+        state.usedToolCalls++
+        state.inFlight = { id: toolCall.id, name: toolCall.name, sideEffect: tool?.definition.sideEffect ?? 'none' }
+        await persist()
+      }
+      const execution = await executeAgentToolCall({ registry, toolCall, allowedToolNames, context: { ...toolContext, stepId: String(state.steps), signal: options.signal, deadline: options.deadline }, logger })
+      if (execution.result.status === 'unknown') {
+        await persist()
+        throw new LoopLimitError(`工具 ${toolCall.name} 的操作结果尚未确认，已停止自动重试，请先核对结果。`)
+      }
+      state.repliedByTool ||= execution.sentMessage
+      if (execution.result.outbound) {
+        state.outbound.push(execution.result.outbound)
+        state.repliedByTool = true
+      }
+      if (execution.result.artifacts?.length) state.outbound.push(...execution.result.artifacts)
+      state.toolTraces.push(toToolTrace(toolCall.name, toolCall.arguments, execution.result))
+      state.messages.push(execution.resultMessage)
+      state.pending.shift()
+      delete state.inFlight
+      await persist()
+      await throwIfCancelled(options)
+    }
+
+    if (state.steps >= maxModelSteps) {
+      throw new LoopLimitError(`一次对话最多推理 ${maxModelSteps} 步，已经用完。可以让我少做几步，或者把任务拆开。`)
+    }
+    budget(requestTimeoutMs)
+    await options.onStep?.(state.steps + 1)
+    await throwIfCancelled(options)
     const compaction = options.compaction
     if (compaction && compaction.mode !== 'off') {
-      const systemMessages = messages.filter((m) => m.role === 'system')
-      const systemTokens = estimateMessagesTokens(systemMessages)
-      const nonSystem = messages.filter((m) => m.role !== 'system')
-      const compacted = compactMessages(nonSystem, {
-        maxTokens: compaction.maxTokens,
-        systemTokens,
-      })
-      // 两种情况都要把压缩结果写回 messages：
-      // 1) 丢了整轮（droppedRounds > 0）——消息数组变了；
-      // 2) 没丢轮、但把单轮里的超大工具结果截断了（truncatedToolResults > 0）——
-      //    消息条数不变、内容变了。
-      // 只判断丢轮的话，「同一轮工具循环里截断大结果」算出来却写不回去，
-      // 端到端等于没生效。
-      //
-      const truncatedToolResults = compacted.truncatedToolResults
-      if (compacted.droppedRounds > 0 || truncatedToolResults > 0) {
-        compactedRounds += compacted.droppedRounds
-        // 只留 user / assistant 的文本：tool 结果可能几十 KB，
-        // 存进 DO 的待摘要槽会白白撑大体积，摘要也不需要逐字复述它。
+      const system = state.messages.filter(m => m.role === 'system')
+      const systemTokens = estimateMessagesTokens(system)
+      const compacted = compactMessages(state.messages.filter(m => m.role !== 'system'), { maxTokens: compaction.maxTokens, systemTokens })
+      if (compacted.droppedRounds || compacted.truncatedToolResults) {
+        state.compactedRounds += compacted.droppedRounds
         for (const message of compacted.droppedMessages) {
           if (message.role === 'tool' || message.role === 'system') continue
-          const content = typeof message.content === 'string' ? message.content : ''
-          if (content.trim()) droppedForSummary.push({ role: message.role, content })
+          const content = typeof message.content === 'string' ? message.content :
+            (message.content ?? []).map(p => p.type === 'text' ? p.text : '[图片]').join('\n')
+          if (content.trim()) state.droppedForSummary.push({ role: message.role, content, ...(message.historyId ? { id: message.historyId } : {}) })
         }
-        // 就地替换：保持 system 在前
-        messages.length = 0
-        messages.push(...systemMessages, ...compacted.messages)
-        logger.info('上下文已压缩', {
-          droppedRounds: compacted.droppedRounds,
-          truncatedToolResults,
-          tokensBefore: compacted.tokensBefore,
-          tokensAfter: compacted.tokensAfter,
-        })
+        state.messages = [...system, ...compacted.messages]
+        logger.info('上下文已压缩', { droppedRounds: compacted.droppedRounds, tokensBefore: compacted.tokensBefore, tokensAfter: compacted.tokensAfter })
       }
-      contextTokens = compacted.tokensAfter + systemTokens
-    } else {
-      contextTokens = estimateMessagesTokens(messages.filter((m) => m.role !== 'system'))
-    }
-
-    const response = await callLLMWithRetry(
-      llm,
-      {
-        model,
-        messages,
-        ...(tools.length ? { tools } : {}),
-        timeoutMs: requestTimeoutMs,
-        ...(options.signal ? { signal: options.signal } : {}),
-      },
-      options.retry,
-      logger,
-      steps,
-      () => throwIfCancelled(options),
-    )
-
-    // 模型可能在取消轮询的下一次 tick 之前返回，不能直接发送结果或执行工具。
+      state.contextTokens = compacted.tokensAfter + systemTokens
+    } else state.contextTokens = estimateMessagesTokens(state.messages)
+    await persist()
+    const response = await callLLMWithRetry(llm, {
+      model: state.model ?? model, messages: state.messages, ...(tools.length ? { tools } : {}),
+      timeoutMs: requestTimeoutMs, ...(options.signal ? { signal: options.signal } : {}),
+    }, options.retry, logger, state.steps + 1, () => throwIfCancelled(options),
+    (delayMs = 0) => budget(requestTimeoutMs + delayMs), state.modelRetries ?? 0,
+    async attempt => { state.modelRetries = attempt; await persist() })
     await throwIfCancelled(options)
-
-    inputTokens += response.usage?.inputTokens ?? 0
-    outputTokens += response.usage?.outputTokens ?? 0
-
-    // 记录模型步（原文 recordModelStep）
-    logger.debug('模型返回', {
-      step: steps,
-      toolCalls: response.toolCalls.length,
-      hasContent: Boolean(response.content),
-    })
-
-    // 没有工具调用 = 模型给出最终答复，loop 结束
-    if (response.toolCalls.length === 0) {
-      return {
+    delete state.modelRetries
+    state.steps++
+    state.usage.inputTokens += response.usage?.inputTokens ?? 0
+    state.usage.outputTokens += response.usage?.outputTokens ?? 0
+    logger.debug('模型返回', { step: state.steps, toolCalls: response.toolCalls.length, hasContent: Boolean(response.content) })
+    if (!response.toolCalls.length) {
+      state.result = {
         ...(response.content ? { reply: response.content } : {}),
         ...(response.reasoning !== undefined ? { reasoning: response.reasoning } : {}),
-        repliedByTool,
-        steps,
-        toolCalls: toolCallLimit.usedToolCalls,
-        usage: { inputTokens, outputTokens },
-        compactedRounds,
-        droppedForSummary,
-        contextTokens,
-        toolTraces,
-        outbound,
+        repliedByTool: state.repliedByTool, steps: state.steps, toolCalls: state.usedToolCalls,
+        usage: state.usage, compactedRounds: state.compactedRounds,
+        droppedForSummary: state.droppedForSummary, contextTokens: state.contextTokens,
+        toolTraces: state.toolTraces, outbound: state.outbound,
       }
-    }
-
-    // 把 assistant 的工具调用意图写回消息（原文 messages.push({role:'assistant', toolCalls}))
-    messages.push({
-      role: 'assistant',
-      content: response.content ?? '',
-      toolCalls: response.toolCalls,
-      ...(response.reasoning !== undefined ? { reasoning: response.reasoning } : {}),
-      ...(response.thoughtSignatures ? { thoughtSignatures: response.thoughtSignatures } : {}),
-      ...(response.reasoningSignatures ? { reasoningSignatures: response.reasoningSignatures } : {}),
-    })
-
-    for (const toolCall of response.toolCalls) {
-      await throwIfCancelled(options)
-      // 先预留再执行（原文 reserveToolCall 的语义）
-      if (!reserveToolCall(toolCallLimit)) {
-        throw new LoopLimitError(toolCallLimitExceededMessage(toolCallLimit))
-      }
-
-      const execution = await executeAgentToolCall({
-        registry,
-        toolCall,
-        allowedToolNames,
-        context: toolContext,
-        logger,
+    } else {
+      state.messages.push({ role: 'assistant', content: response.content ?? '', toolCalls: response.toolCalls,
+        ...(response.reasoning !== undefined ? { reasoning: response.reasoning } : {}),
+        ...(response.thoughtSignatures ? { thoughtSignatures: response.thoughtSignatures } : {}),
+        ...(response.reasoningSignatures ? { reasoningSignatures: response.reasoningSignatures } : {}),
       })
-
-      await throwIfCancelled(options)
-
-      repliedByTool = repliedByTool || execution.sentMessage
-
-      // 工具产出要发给用户的富媒体（图片/文件），收集起来交给回复通道
-      if (execution.result.outbound) {
-        outbound.push(execution.result.outbound)
-        // 已经发了媒体，就不再补一条纯文本回复
-        repliedByTool = true
-      }
-
-      // 记一条摘要进历史（截断，避免把 DO storage 配额吃光）
-      toolTraces.push(toToolTrace(toolCall.name, toolCall.arguments, execution.result))
-
-      // 工具结果回填给模型
-      messages.push(execution.resultMessage)
+      state.pending = [...response.toolCalls]
     }
+    await persist()
   }
-
-  throw new LoopLimitError(
-    `一次对话最多推理 ${maxModelSteps} 步，已经用完。可以让我少做几步，或者把任务拆开。`,
-  )
 }
 
 /**

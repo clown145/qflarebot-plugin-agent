@@ -1,7 +1,8 @@
 import { fileURLToPath } from 'node:url'
-import { defineConfig } from 'vitest/config'
+import { configDefaults, defineConfig } from 'vitest/config'
 
 export default defineConfig({
+  test: { exclude: [...configDefaults.exclude, 'tests/integration/**'] },
   resolve: {
     alias: {
       // Node 里没有 cloudflare:workers（SDK 的 PluginDurableObject 要继承它），

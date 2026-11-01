@@ -1,9 +1,6 @@
 # 给其他插件用的接口
 
-本插件通过 `ctx.service('agent')` 对外提供两块扩展能力：
-
-1. **提示词**：往 system prompt 里插一段话
-2. **工具**：把自己的函数交给模型调用
+本插件通过 `ctx.service('agent')` 提供提示词扩展。工具扩展改用框架的 `definePlugin.tools` / `core.tools`，同一份能力可供所有 Agent 使用。
 
 ## 用法
 
@@ -35,6 +32,7 @@ interface AgentPromptService {
 
 export default definePlugin({
   name: 'weather',
+  depends: { agent: 'optional' },
   commands: {
     setup: {
       async handler({ ctx }) {
@@ -42,7 +40,7 @@ export default definePlugin({
           const agent = ctx.service<AgentPromptService>('agent')
           await agent.registerPrompt(
             ctx.plugin.name,                              // 用你自己的插件名
-            '回答天气问题时，先调用 weather.query，不要凭记忆猜。',
+            '回答天气问题时，先调用 plugin.weather.query，不要凭记忆猜。',
             0,                                            // priority，越大越靠前
           )
           return '已接入 Agent 的提示词'
@@ -101,141 +99,81 @@ system 前缀就抖了，缓存全废。
 
 ---
 
-# 工具扩展：把自己的函数交给模型调用
+# 工具扩展：框架统一协议
 
-除了提示词，别的插件还可以注册**工具** —— 模型能直接调用你的函数。
-
-## 两步
-
-### 1. 注册工具元数据
+要求框架 SDK 契约 v5。提供者优先复用已暴露的服务方法，补上用途、输入与结果说明，无需依赖任何特定 Agent：
 
 ```ts
-const agent = ctx.service<AgentService>('agent')
-await agent.registerTool(ctx.plugin.name, {
-  name: 'query',                       // 短名，不需要前缀
-  description: '查询某个城市当前的天气',  // 必填，模型靠它判断何时该用
-  inputSchema: {
-    type: 'object',
-    properties: { city: { type: 'string', description: '城市名' } },
-    required: ['city'],
-  },
-  level: 2,                            // 可选，Agent 会强制抬到至少 2
-  timeoutMs: 10_000,                   // 可选，1–30 秒
-})
-```
+import { definePlugin } from '@qqbot/sdk'
 
-### 2. 通过 `services` 暴露执行函数
-
-```ts
 export default definePlugin({
   name: 'weather',
+  apiVersion: 5,
   services: {
-    tools: () => ({
-      query: async (input) => {
-        const { city } = input as { city: string }
-        return { city, temp: 21 }
+    weather: ctx => ({
+      async query(city: string) {
+        return { city, weather: await ctx.kv.getJSON(`weather:${city}`) }
       },
     }),
   },
+  tools: {
+    query: {
+      service: 'weather',
+      method: 'query',
+      description: '读取某城市最近缓存的天气，用于回答天气问题。返回 city 和 weather；weather 为 null 表示暂无数据，不能当作实时天气。',
+      inputSchema: {
+        type: 'object', required: ['city'], additionalProperties: false,
+        properties: {
+          city: { type: 'string', description: '城市名称，例如上海。', minLength: 1 },
+        },
+      },
+      permission: 'member',
+      sideEffect: 'none',
+      version: 1,
+      timeoutMs: 10_000,
+      mapInput: ({ input }) => [(input as { city: string }).city],
+      mapOutput: output => ({ status: 'success', output }),
+    },
+  },
 })
 ```
 
-服务名约定是 **`tools`**，对象的 key 是**工具短名**（不是 `plugin.weather.query`）。
+`service/method` 只公开明确选择的方法，原 `services` 工厂和方法签名保留。`mapInput` 将模型输入转为位置参数（省略时默认 `[input]`）；`mapOutput` 必须明确解释旧方法的返回值和错误，避免把业务失败当成功。框架复用同一请求内的服务实例，保留 `this`。没有现成方法时也可直接使用 `handler`，两种方式二选一。
 
-> **key 怎么写都能匹配上**：Agent 会依次尝试「你写的原始 key」→「规整后的 key
-> （`weather.query` → `weather_query`）」→「把服务对象里的 key 规整后比对」。
-> 这一层是补过一个真 bug 的：早期只按规整后的名字取，而服务对象用的是原始 key，
-> 于是 `service[meta.name]` 恒为 `undefined`，工具**静默消失**。
+说明需要回答“做什么、什么时候用、输入什么、返回什么”，参数的含义和单位写进 Schema 的 `description`；不能指望模型只看方法名猜用途。T2I 已绑定现有 `t2i.renderBase64`，并提供图片附件的结果映射。
 
-## 为什么元数据和执行函数分两处
+转换函数中的 `ctx` 是提供者自己的数据库、配置和服务上下文；`actor` 是框架签发的原始发起人，`caller.plugin` 是消费 Agent。模型只能填写 `input`，不能填写调用者身份。目录来自构建生成的 manifest，部署后自动发现。
 
-| 部分 | 存哪 | 为什么 |
-| --- | --- | --- |
-| 元数据（名字/描述/schema） | D1 | 构建工具列表时要**同步**拿到；模型得先知道有哪些工具 |
-| 执行函数 | 你的 `services` | 函数没法序列化 |
+框架 ID 是 `weather.query`，本 Agent 暴露为 `plugin.weather.query`；长名称超过 64 字符时附摘要避免截断碰撞。Agent 只需可选依赖 `core.tools`，无需逐个依赖提供者。T2I 已接入 `t2i.render`，可直接请求 Agent 把内容渲染成图片。
 
-宿主对 `services` 的约定是「工厂**每个请求**调用一次」。所以 Agent 只能在构建注册表
-的那一刻去取执行函数 —— 元数据必须提前存好。
+## 权限与结果
 
-> **两条都必须做。** 只注册元数据不暴露执行函数，Agent 拿不到函数会**跳过这个工具**
-> （而不是注册一个每次调用都报错的工具）。
+- 框架执行前复核提供者/消费者启用状态、群范围、场景、用户权限、工具策略、Schema 和 revision。
+- `permission` 使用 `member` / `group_admin` / `bot_admin`。Agent 管理页显示这一权限，现有总开关、单工具开关、人格白名单和危险操作确认继续收窄能力。
+- 返回 `status: success/failed/permission_denied/cancelled/timeout/unknown`，失败带 `{ code, message, retryable }`，不会把失败对象包装为成功。
+- 图片等通过 `artifacts: [{ type: 'image', url: 'https://…' }]` 或 base64 返回。Agent 保存附件并由回复通道交付，仍可同时发送模型的文字说明。
+- 超时默认 10 秒、上限 30 秒。输入最大 64 KiB、结果最大 2.5 MB/10 个附件。提供者应遵守 signal/deadline。
+- v1 Schema 是显式子集；不支持 `$ref`、`format` 等约束，不支持的声明会被拒绝。完整契约见框架仓库 `docs/tools.md`。
 
-## 名字规则
+## 恢复
 
-对外暴露成 **`plugin.<你的插件名>.<工具名>`**，强制带前缀：
-- 防止你注册一个叫 `http.request` 的工具来冒充内置工具
-- 两个插件撞名时天然区分
+聊天入口签发的调用凭据与入站消息一起保存，24 小时内可以由新 Worker 请求继续执行；不会进入 LLM 提示词或展示历史。cron 恢复的是原始身份，不能把 scheduler 当成管理员重新授权。
 
-工具名会被规整：只留字母数字、下划线、连字符，其余转下划线。
-模型侧的 function name 字符集有限，中文和空格会让 provider 直接 400。
+检查点绑定工具 ID/revision 和稳定调用 ID。已完成结果直接复用；工具更新、停用或权限变化时停止旧调用。写操作超时或中断而结果未知时停止自动重试，并提示核对结果。框架传递稳定幂等键，但跨请求的持久幂等仍由提供者实现。
 
-## 权限
+以下情况不能调用新的框架工具：旧框架没有 `core.tools`、没有原始凭据的旧任务、独立触发的新定时任务。内置工具继续可用，旧静态服务接线保留兼容路径。凭据过期后旧任务不能继续调用外部工具，需要用户重新发起。工具 handler 内递归公开工具调用暂不支持；多个 Agent 之间的任务委派不在这一版范围。
 
-插件工具**最低 level 2**（提供者说 level 1 也不作数）——否则任何插件都能把
-「发 HTTP 请求」这类能力降到人人可用。
+## 从旧注册方式迁移
 
-工具使用通用 scope `plugin:use`，它已在各角色基线里。**各插件的权限差异由
-`level` 表达**，不需要每个插件一个 scope（那样的话 scope 不在基线里，
-工具注册了也永远 `permission_denied`）。
+1. 保留原有服务方法，在 `definePlugin.tools` 中补充说明、Schema 和 service/method 绑定；需要时转换参数和结果。
+2. 将旧 Agent 数字 level 转为明确的框架权限；返回结构化结果，声明真实副作用等级。
+3. 不再需要为了提供工具而依赖 Agent；如果仍需提示词扩展，可保留该依赖。
+4. 用新 SDK/CLI 构建，提交并部署包含 tools 的 manifest；先升级框架，再升级 Agent 和提供者。
 
-> 工具的启用/关闭也走 Agent 管理页的「工具」面板，和内置工具一起管理。
+旧 `registerTool()` 保留写入能力并记录弃用提示，不会打断旧启动钩子；重复注册不重置禁用状态。旧的静态 `depends` 接线继续可执行，但无法借自报 owner 获得动态服务权限。原本未声明依赖、只能登记却无法执行的旧工具仍需迁移，框架不会根据旧表自动公开所有方法。
 
-## 限制
+现代声明优先，旧记录只收窄禁用状态和自定义等级，不覆盖新用途或 Schema。框架停用的现代工具也不能通过旧适配器绕回。旧长名称开关继续有效；截断名称有碰撞时禁用所有候选，白名单需要明确选择新名称，不能自动扩大权限。工具页可以重新启用旧禁用项。`unregisterTool` / `listTools` 只操作旧记录，卸载现代工具请修改提供者声明或框架策略。
 
-| 项 | 上限 | 为什么 |
-| --- | --- | --- |
-| 单插件工具数 | 20 | 防止一个插件把模型淹了 |
-| 全部插件工具数 | 50 | 同上 |
-| description | 500 字符 | 它**每轮都进上下文**，太长会持续烧 token |
-| 调用超时 | 30 秒 | 一个坏插件不能拖死整个 run |
+Agent 根据副作用映射本地等级：只读 1、工作区写入 2、外部写入与危险操作 3；保留 `plugin:use` scope，旧自定义等级只会继续收窄。危险操作还需确认，确认不会绕过角色或等级限制。
 
-## 失败处理
-
-| 情况 | 行为 |
-| --- | --- |
-| 你被卸载/停用（服务取不到） | 你的工具**不注册**，不是每次调用报错 |
-| 元数据在但执行函数缺失 | 跳过那个工具 |
-| 执行抛错 | 返回可读的 `failed`，`retryable: false`（插件内部错误是否可重试我们知道不了，保守设为不可重试，避免模型反复重试） |
-| 执行超时 | 返回 `timeout`，run 继续 |
-
-任何一个插件出问题都**只影响它自己的工具**。
-
-## 已知限制：第三方插件的工具当前不可用（框架约束，不是 bug）
-
-宿主的 `ctx.service(name)` 只认**本插件 manifest 里 `depends` 声明过的服务**：
-
-```ts
-// packages/runtime/src/context.ts
-if (!Object.hasOwn(plugin.manifest.depends ?? {}, serviceName)) {
-  throw new Error(`插件 ${name} 没有在 depends 中声明服务 ${serviceName}`)
-}
-```
-
-而 Agent 无法为「任意第三方插件」声明依赖——`depends` 是**静态清单**，
-写死在 manifest 里，插件名在安装别的插件之前不可能知道。所以：
-
-| 场景 | 现状 |
-| --- | --- |
-| 提供者把执行函数挂在 `services: { tools: () => … }` | **取不到**：`tools` 不在 Agent 的 depends 里，`ctx.service('tools')` 抛错 |
-| 提供者按插件名暴露（`services: { weather: () => … }`） | 同样取不到：`weather` 也不在 depends 里 |
-| 元数据注册成功（D1 里看得到） | ✅ 这一步是好的，管理页能看到 |
-| 模型实际调用 | ❌ 执行函数取不到，工具不注册 |
-
-代码的行为是**明确失败而不是伪造可用性**：
-
-- 注册表里不出现这个工具（模型看不到，不会尝试调用后被拒）；
-- 日志里记一条 `第三方插件工具当前不可用：宿主只允许取 depends 里声明的服务…`
-  （按 owner 做 10 分钟节流，不会刷屏），带 owner 与内部错误原因；
-- 有元数据但执行函数缺失时，另记一条 `插件工具没有对应的执行函数，已跳过`，
-  并带上该服务对象实际有哪些 key。
-
-### 会有解吗
-
-需要宿主支持「动态/通配服务声明」，例如 `depends: { "tools:*": "optional" }`
-或运行时的插件间事件总线。在那之前，**Agent 能可靠使用的外部工具只有内置的那些**，
-以及未来如果宿主把工具扩展做成协议而不是 `services` 的时候。
-
-如果你要接入自定义能力，目前可行的替代：
-1. 用内置的 `http.request` / `vfs.*` 组合（不需要新插件）；
-2. 把你的逻辑做成 Agent 的**提示词片段**（`registerPrompt`）来引导模型用内置工具；
-3. 等宿主把这条链路补上。
+框架提供 `GET /admin/tools` 和 `PUT /admin/tools/policy` 管理全局策略；本 Agent 的 `/api/tools` 返回框架接入是否可用及当前目录。插件处于同一 isolate，这套入口不是恶意代码的隔离沙箱。

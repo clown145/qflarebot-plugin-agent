@@ -103,13 +103,14 @@ describe('文档事实与代码一致', () => {
     expect(text).toContain('interface AgentPromptService')
   })
 
-  it('plugin-api.md 如实说明第三方工具受 depends 限制（不伪造可用性）', () => {
+  it('plugin-api.md 说明统一入口、旧接口迁移与恢复边界', () => {
     const text = doc('plugin-api.md')
-    expect(text).toContain('depends')
-    expect(text).toContain('已知限制')
-    // 服务名约定与 key 映射规则要写清楚（两处都踩过 bug）
-    expect(text).toContain('tools')
-    expect(text).toContain('规整')
+    expect(text).toContain('definePlugin.tools')
+    expect(text).toContain('core.tools')
+    expect(text).toContain('registerTool()')
+    expect(text).toContain('revision')
+    expect(text).toContain('24 小时')
+    expect(text).toContain('独立触发的新定时任务')
   })
 
   it('tools.md 写明 SSRF 不解析 DNS、不防 rebinding', () => {

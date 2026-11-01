@@ -75,6 +75,8 @@ export interface ToolConfigField {
 }
 
 export interface ToolDefinition {
+  binding?: { id: string; revision: string }
+  frameworkPermission?: import('@qqbot/sdk').PermissionTier
   name: string
   title?: string
   description: string
@@ -94,6 +96,8 @@ export interface ToolDefinition {
 
 /** 工具执行时能拿到的上下文。对应原文的 ToolExecutionContext */
 export interface ToolExecutionContext {
+  signal?: AbortSignal
+  deadline?: number
   db: PluginDB
   logger: Logger
   /** 会话标识（群 openid / 用户 openid） */
@@ -121,6 +125,8 @@ export type ToolResultStatus =
   | 'permission_denied'
   | 'needs_confirmation'
   | 'timeout'
+  | 'unknown'
+  | 'cancelled'
 
 /**
  * 工具想让机器人**发出去**的富媒体。
@@ -156,11 +162,14 @@ export interface ToolResult {
    * loop 不再补一条纯文本回复（否则用户会收到「图 + 一句重复的话」）。
    */
   outbound?: OutboundMedia
+  artifacts?: OutboundMedia[]
 }
 
 export type ToolExecutor = (context: ToolExecutionContext) => Promise<ToolResult>
 
 export interface RegisteredTool {
+  /** 迁移旧工具名及停用状态；不进入模型的工具定义。 */
+  compatibility?: { aliases: string[]; disabled: boolean }
   definition: ToolDefinition
   source: ToolSource
   execute: ToolExecutor

@@ -39,6 +39,8 @@ export type ToolRegistry = {
 }
 
 export interface ToolExecuteInput {
+  signal?: AbortSignal
+  deadline?: number
   db: PluginDB
   logger: Logger
   conversationId: string
@@ -78,6 +80,8 @@ export function createToolRegistry(tools: RegisteredTool[]): ToolRegistry {
 
       const startedAt = Date.now()
       const context: ToolExecutionContext = {
+        signal: input.signal,
+        deadline: input.deadline,
         db: input.db,
         logger: input.logger,
         conversationId: input.conversationId,
@@ -162,6 +166,8 @@ async function executeToolSafely(
   logger: Logger,
 ): Promise<ToolResult> {
   try {
+    // 框架统一处理超时和取消，并区分结果未知的写操作，不能再用外层 race 覆盖它。
+    if (tool.definition.binding) return await tool.execute(context)
     return await withTimeout(
       tool.execute(context),
       tool.definition.timeoutMs,
@@ -170,7 +176,10 @@ async function executeToolSafely(
   } catch (error) {
     const message = error instanceof Error ? error.message : '工具执行失败'
     logger.error('工具执行异常', { tool: tool.definition.name, error: message })
-    return failed('tool_execution_error', message, true)
+    if ((tool.definition.binding || tool.source.type === 'plugin') && tool.definition.sideEffect !== 'none') {
+      return { status: 'unknown', error: { code: 'outcome_unknown', message, retryable: false } }
+    }
+    return failed('tool_execution_error', message, !tool.definition.binding)
   }
 }
 

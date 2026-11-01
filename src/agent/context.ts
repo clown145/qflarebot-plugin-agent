@@ -23,6 +23,7 @@ import type { BeginDialogTurn } from '../persona.js'
 import { fixMessages, summaryMessages, type StoredSummary } from './context-size.js'
 import { buildActiveSkillPrompt, buildSkillCatalogPrompt } from '../skills/context.js'
 import type { LoadedSkill, SkillCatalogItem } from '../skills/store.js'
+import { speakerLabel } from './history.js'
 
 export interface ContextOptions {
   systemPrompt?: string
@@ -124,7 +125,7 @@ export function buildMessages(
   // 历史：只取最近 N 条。条数越多越贵，history_limit 默认 20
   const recent = options.historyLimit > 0 ? history.slice(-options.historyLimit) : []
   for (const row of recent) {
-    messages.push(toModelMessage(row))
+    messages.push({ ...toModelMessage(row, options), ...(row.id ? { historyId: row.id } : {}) })
   }
 
   // 本轮的动态上下文（时间/会话/说话人）附在**这条 user 消息**上，
@@ -241,7 +242,7 @@ function buildSystemReminder(
   const lines: string[] = []
 
   if (expose.datetime) {
-    const now = new Date()
+    const now = new Date(message.receivedAt)
     let localTime = now.toISOString()
     try {
       localTime = new Intl.DateTimeFormat('zh-CN', {
@@ -262,14 +263,11 @@ function buildSystemReminder(
   //
   // 为什么 ID 要单独开关：它是按机器人隔离的匿名标识，用户自己看不见、
   // 跨机器人也不通用。默认开着每轮都占上下文，还可能被模型念到群里去。
-  // 但关掉它，模型在群里就分不清哪句话是谁说的 —— 需要「记住某个人」
-  // 或者「按人区分」时才该打开。
+  // 关闭时用稳定的成员标签区分同名成员，历史和摘要也沿用这个标签。
   //
   // 注意这里给的**不是 QQ 号**：QQ 官方机器人接口只提供 openid。
-  if (expose.senderId && message.userId) {
-    lines.push(
-      `- 正在和你说话的人：${message.userName || '(无昵称)'}（openid: ${message.userId}）`,
-    )
+  if (message.userId) {
+    lines.push(`- 正在和你说话的人：${speakerLabel(message.userId, message.userName, expose.senderId)}`)
   } else if (message.userName) {
     lines.push(`- 正在和你说话的人：${message.userName}`)
   }
@@ -278,7 +276,7 @@ function buildSystemReminder(
   return ['<system_reminder>', ...lines, '</system_reminder>'].join('\n')
 }
 
-function toModelMessage(row: HistoryRow): ModelMessage {
+function toModelMessage(row: HistoryRow, options: ContextOptions): ModelMessage {
   if (row.role === 'assistant') {
     const thinking = row.reasoning !== undefined ? { reasoning: row.reasoning } : {}
     const traces = parseToolTraces(row.toolCallsJson)
@@ -301,7 +299,12 @@ function toModelMessage(row: HistoryRow): ModelMessage {
       ...thinking,
     }
   }
-  return { role: 'user', content: row.content }
+  // 老历史没有身份和附件，保持可读；新历史按当轮的视觉能力回放。
+  const content = buildUserContent({ text: row.content, attachments: row.attachments ?? [] }, options.supportsVision)
+  const reminder = row.userId
+    ? `<system_reminder>\n- 当时的说话人：${speakerLabel(row.userId, row.userName, options.exposeSenderId)}\n</system_reminder>`
+    : ''
+  return { role: 'user', content: withReminder(content, reminder) }
 }
 
 /**
@@ -402,7 +405,7 @@ function neutralizeParts(parts: ModelContentPart[]): ModelContentPart[] {
   )
 }
 
-function buildUserContent(message: InboundMessage, supportsVision: boolean): ModelContent {
+function buildUserContent(message: Pick<InboundMessage, 'text' | 'attachments'>, supportsVision: boolean): ModelContent {
   const images = message.attachments.filter((a) => a.type === 'image')
 
   // 没有图片，或者模型不吃图片：退回纯文本，把图片地址写进正文

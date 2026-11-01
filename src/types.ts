@@ -13,6 +13,8 @@ export type ConversationKey = string
 
 /** 归一化后的入站消息：平台差异在入站适配里消化掉，loop 只看这个 */
 export interface InboundMessage {
+  /** 框架签发，随任务持久化。禁止放进模型提示词或日志。 */
+  toolInvocation?: import('@qqbot/sdk').ToolInvocation
   /** 会话键，同一个会话的 run 串行处理 */
   conversation: ConversationKey
   /** 用户 openid */
@@ -50,7 +52,7 @@ export interface MessageAttachment {
 }
 
 /** 模型消息。对齐 serverless-agent 的 ModelMessage，也贴近 plugin-llm 的 ChatMessage */
-export type ModelMessage =
+export type ModelMessage = (
   | { role: 'system'; content: string }
   | { role: 'user'; content: ModelContent }
   | {
@@ -62,6 +64,7 @@ export type ModelMessage =
       reasoningSignatures?: LLMReasoningSignature[]
     }
   | { role: 'tool'; toolCallId: string; toolName: string; content: string }
+) & { /** 仅内部用于摘要去重，不发送给模型服务。 */ historyId?: string }
 
 export type ModelContentPart =
   | { type: 'text'; text: string }
@@ -125,5 +128,7 @@ export interface RunRecord {
   inputJson: string
   /** 已经跑了多少步，防止失控 */
   steps: number
+  /** 每次认领的新令牌，阻止旧执行者覆盖接管者的进度。 */
+  leaseId?: string
   error?: string
 }

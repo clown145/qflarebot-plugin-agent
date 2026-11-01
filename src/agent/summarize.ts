@@ -9,7 +9,7 @@
  * - 一次摘要就是一整次模型调用，几百毫秒到几十秒，插在回复路径上很可能把预算吃光，
  *   用户就什么都收不到 —— 比「暂时没有摘要」糟糕得多。
  *
- * cron 没有事件预算（墙钟上限 15 分钟，整轮自己控制在 20 秒），是更合适的位置。
+ * cron 没有事件预算（墙钟上限 15 分钟，整轮自己控制在 55 秒），是更合适的位置。
  * AstrBot 可以在 loop 内部同步摘要，因为它常驻运行、没有这个窗口；
  * 本项目不能照搬那个位置。
  *
@@ -17,7 +17,7 @@
  *
  * 拿不到模型 / 调用失败 / 返回空：把待摘要内容**放回去**，下一轮 cron 再试。
  * 期间对话照常用 truncate 保底，用户察觉不到异常（只是暂时没有摘要）。
- * 重试次数不设上限，但每次失败都是「放回队列尾部」——
+ * 重试次数不设上限，但每次失败都会放回队列头部——
  * 如果模型一直坏着，这些内容就一直等着，不会丢。
  */
 import type { Logger } from '@qqbot/sdk'
@@ -25,14 +25,15 @@ import type { StoredSummary } from './context-size.js'
 import { buildSummaryRequest, SUMMARY_INSTRUCTION } from './context-size.js'
 import { callLLM } from '../llm/client.js'
 import type { LLMService } from '../llm/contract.js'
-import type { SummaryInput } from '../do/agent-object.js'
+import type { SummaryBatch } from '../do/agent-object.js'
 import type { ModelMessage } from '../types.js'
 
 /** 摘要要用的能力（从 DO stub 抽出来，测试里给个假的即可） */
 export interface SummaryStore {
-  takePendingSummary(): Promise<{ messages: SummaryInput[]; coveredMessages: number } | null>
-  saveSummary(summary: StoredSummary): Promise<void>
-  restorePendingSummary(pending: { messages: SummaryInput[]; coveredMessages: number }): Promise<void>
+  summary?(): Promise<StoredSummary | null>
+  takePendingSummary(): Promise<SummaryBatch | null>
+  saveSummary(summary: StoredSummary, batch?: SummaryBatch): Promise<void>
+  restorePendingSummary(pending: SummaryBatch): Promise<void>
 }
 
 /** 摘要超时：比正对话短。摘要失败不影响用户，宁可早点放弃留给下一轮 */
@@ -51,22 +52,22 @@ export async function summarizeForConversation(input: {
   /** 已有摘要：新摘要要把它一起带上，否则更早的内容会被覆盖掉 */
   existing: StoredSummary | null
 }): Promise<boolean> {
-  const { store, llm, model, logger, existing } = input
+  const { store, llm, model, logger } = input
 
   const pending = await store.takePendingSummary()
   if (!pending || pending.messages.length === 0) return false
-
-  // 已有摘要 + 新丢弃的轮次，一起喂给模型：摘要要**累积**，
-  // 不能只摘要最新的那批——否则更早的约定会被新摘要覆盖掉。
-  const carried: ModelMessage[] = existing
-    ? [{ role: 'user', content: `（已有摘要，请合并进新摘要）\n${existing.content}` }]
-    : []
-  const fresh: ModelMessage[] = pending.messages.map((message) => ({
-    role: message.role,
-    content: message.content,
-  }))
-
   try {
+    const existing = store.summary ? await store.summary() : input.existing
+
+    // 已有摘要 + 新丢弃的轮次，一起喂给模型：摘要要**累积**，
+    // 不能只摘要最新的那批——否则更早的约定会被新摘要覆盖掉。
+    const carried: ModelMessage[] = existing
+      ? [{ role: 'user', content: `（已有摘要，请合并进新摘要）\n${existing.content}` }]
+      : []
+    const fresh: ModelMessage[] = pending.messages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    }))
     const request = buildSummaryRequest([...carried, ...fresh])
     const response = await callLLM(llm, {
       model,
@@ -83,11 +84,14 @@ export async function summarizeForConversation(input: {
       return false
     }
 
+    const ids = pending.messages.flatMap(m => m.id ? [m.id] : []).sort()
+    const through = ids.at(-1) ?? existing?.coveredThrough
     await store.saveSummary({
+      ...(through ? { coveredThrough: through } : {}),
       content,
       generatedAt: Date.now(),
       coveredMessages: (existing?.coveredMessages ?? 0) + pending.coveredMessages,
-    })
+    }, pending)
     logger.info('会话摘要已更新', {
       coveredMessages: pending.coveredMessages,
       totalCovered: (existing?.coveredMessages ?? 0) + pending.coveredMessages,

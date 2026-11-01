@@ -23,7 +23,7 @@
  *
  * DO 按 **GB-秒**计费（128 MB × 墙上时间）：一次 8 秒的对话 ≈ 1 GB-s，
  * 免费版 13,000 GB-s/日能撑上万次。状态放 DO 的 SQLite storage 后，
- * **每条消息完全不碰 D1 额度**。
+ * 逐步状态不占 D1 额度；跨会话恢复索引单独登记到 D1。
  *
  * ## 串行化语义
  *
@@ -33,7 +33,10 @@
 
 import { PluginDurableObject } from '@qqbot/sdk'
 import type { StoredSummary } from '../agent/context-size.js'
-import type { InboundMessage, RunRecord, RunStatus } from '../types.js'
+import type { InboundMessage, MessageAttachment, RunRecord, RunStatus } from '../types.js'
+import { readValue, writeValue, deleteValue, type Storage } from './large-value.js'
+import { historySummary } from '../agent/history.js'
+import type { LoopCheckpoint } from '../agent/loop.js'
 
 /**
  * 待摘要的一条消息。
@@ -43,8 +46,16 @@ import type { InboundMessage, RunRecord, RunStatus } from '../types.js'
  * 摘要只需要 role 与文本。
  */
 export interface SummaryInput {
+  id?: string
   role: 'user' | 'assistant'
   content: string
+}
+
+export interface SummaryBatch {
+  messages: SummaryInput[]
+  coveredMessages: number
+  token?: string
+  expiresAt?: number
 }
 
 /** 租约时长。执行者挂了之后，租约到期可以被别人接管 */
@@ -70,6 +81,11 @@ export const MAX_ATTEMPTS = 3
 const MAX_HISTORY_ROWS = 120
 
 export interface HistoryRow {
+  id?: string
+  userId?: string
+  userName?: string
+  messageId?: string
+  attachments?: MessageAttachment[]
   role: 'user' | 'assistant'
   content: string
   /** assistant 的原始推理内容；可选以兼容已有历史，回填时保留空字符串。 */
@@ -83,6 +99,7 @@ export interface AcquireResult {
   /** 是否抢到执行权 */
   acquired: boolean
   runId?: string
+  leaseId?: string
   /** 抢到时带出的入站消息，省一次读 */
   message?: InboundMessage
   /** 没抢到时：当前租约还有多久过期（毫秒），用来决定 cron 什么时候再来 */
@@ -136,32 +153,37 @@ export class Agent extends PluginDurableObject {
    * `acquired: false` 表示这个会话已经有人在跑，run 进了队列，等 cron 兜底。
    */
   async submit(message: InboundMessage, rateLimit?: RateLimitConfig): Promise<AcquireResult> {
-    const now = Date.now()
+    return this.ctx.storage.transaction(async storage => {
+      const now = Date.now()
 
-    // 频率限制在入队**之前**判定：被限的 run 不该进队列，
-    // 否则用户等一会儿会突然收到一批过期回复。
-    if (rateLimit && rateLimit.perMinute > 0) {
-      const limited = await this.consumeRateWindow(now, rateLimit.perMinute)
-      if (limited) return limited
-    }
+      // 频率限制在入队**之前**判定：被限的 run 不该进队列，
+      // 否则用户等一会儿会突然收到一批过期回复。
+      if (rateLimit && rateLimit.perMinute > 0) {
+        const limited = await this.consumeRateWindow(now, rateLimit.perMinute, storage)
+        if (limited) return limited
+      }
 
-    const runId = crypto.randomUUID()
+      const runId = crypto.randomUUID()
 
-    const run: RunRecord = {
-      id: runId,
-      conversation: message.conversation,
-      status: 'pending',
-      attempts: 0,
-      createdAt: now,
-      updatedAt: now,
-      inputJson: JSON.stringify(message),
-      steps: 0,
-    }
+      const run: RunRecord = {
+        id: runId,
+        conversation: message.conversation,
+        status: 'pending',
+        attempts: 0,
+        createdAt: now,
+        updatedAt: now,
+        inputJson: JSON.stringify(message).length <= 16_384 ? JSON.stringify(message) : '',
+        steps: 0,
+      }
 
-    await this.ctx.storage.put(`run:${runId}`, run)
-    await this.ctx.storage.put(queueKey(await nextSequence(this.ctx.storage), runId), runId)
+      if (!run.inputJson) {
+        await writeValue(storage, `input:${runId}`, message)
+      }
+      await storage.put(`run:${runId}`, run)
+      await storage.put(queueKey(await nextSequence(storage), runId), runId)
 
-    return this.claim(now)
+      return this.claim(now, storage)
+    })
   }
 
   /**
@@ -170,7 +192,9 @@ export class Agent extends PluginDurableObject {
    * 返回 `null` 表示没活干（或都被别人占着）。
    */
   async poll(): Promise<AcquireResult> {
-    return this.claim(Date.now())
+    return this.ctx.storage.transaction(async storage => {
+      return this.claim(Date.now(), storage)
+    })
   }
 
   /**
@@ -186,10 +210,11 @@ export class Agent extends PluginDurableObject {
   private async consumeRateWindow(
     now: number,
     perMinute: number,
+    storage: Storage,
   ): Promise<AcquireResult | null> {
     const WINDOW_MS = 60_000
     const windowStart = Math.floor(now / WINDOW_MS) * WINDOW_MS
-    const stored = await this.ctx.storage.get<RateWindow>('rate')
+    const stored = await storage.get<RateWindow>('rate')
 
     // 换窗口了就重置。旧窗口的计数没有保留价值——
     // 固定窗口不需要历史，这也是它比滑动窗口省的地方
@@ -207,15 +232,15 @@ export class Agent extends PluginDurableObject {
 
     // 计数写回。注意这是**每次 submit 一次写**，但 DO storage 的写不进 D1/KV 额度，
     // 且本来 claim() 就要写 lock/run/queue，这里只是多一个 key
-    await this.ctx.storage.put('rate', { windowStart, count: current.count + 1 } satisfies RateWindow)
+    await storage.put('rate', { windowStart, count: current.count + 1 } satisfies RateWindow)
     return null
   }
 
   /**
    * 认领：先看有没有过期租约（前一个执行者挂了），再按 FIFO 取 pending。
    */
-  private async claim(now: number): Promise<AcquireResult> {
-    const lock = await this.ctx.storage.get<{ runId: string; expiresAt: number }>('lock')
+  private async claim(now: number, storage: Storage = this.ctx.storage): Promise<AcquireResult> {
+    const lock = await storage.get<{ runId: string; expiresAt: number }>('lock')
 
     if (lock && lock.expiresAt > now) {
       return { acquired: false, retryAfterMs: lock.expiresAt - now }
@@ -223,33 +248,33 @@ export class Agent extends PluginDurableObject {
 
     // 租约过期：把那个 run 退回 pending（尝试次数已经在上次认领时加过）
     if (lock) {
-      const stale = await this.ctx.storage.get<RunRecord>(`run:${lock.runId}`)
+      const stale = await storage.get<RunRecord>(`run:${lock.runId}`)
       if (stale && stale.status === 'running') {
-        await this.ctx.storage.put(`run:${stale.id}`, {
+        await storage.put(`run:${stale.id}`, {
           ...stale,
           status: 'pending',
           lockedUntil: undefined,
           updatedAt: now,
         } satisfies RunRecord)
-        await this.ctx.storage.put(
-          queueKey(await nextSequence(this.ctx.storage), stale.id),
+        await storage.put(
+          `queue:0000000000000000:${stale.id}`,
           stale.id,
         )
       }
-      await this.ctx.storage.delete('lock')
+      await storage.delete('lock')
     }
 
-    const queue = await this.ctx.storage.list<string>({ prefix: 'queue:', limit: 20 })
+    const queue = await storage.list<string>({ prefix: 'queue:', limit: 20 })
     if (queue.size === 0) return { acquired: false }
 
     for (const [key, runId] of [...queue.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
-      await this.ctx.storage.delete(key)
+      const run = await storage.get<RunRecord>(`run:${runId}`)
+      await storage.delete(key)
 
       if (!run || run.status !== 'pending') continue
 
       if (run.attempts >= MAX_ATTEMPTS) {
-        await this.ctx.storage.put(`run:${run.id}`, {
+        await storage.put(`run:${run.id}`, {
           ...run,
           status: 'failed',
           error: `超过最大重试次数（${MAX_ATTEMPTS}）`,
@@ -258,20 +283,23 @@ export class Agent extends PluginDurableObject {
         continue
       }
 
+      const leaseId = crypto.randomUUID()
       const claimed: RunRecord = {
         ...run,
         status: 'running',
         attempts: run.attempts + 1,
+        leaseId,
         lockedUntil: now + LEASE_MS,
         updatedAt: now,
       }
-      await this.ctx.storage.put(`run:${run.id}`, claimed)
-      await this.ctx.storage.put('lock', { runId: run.id, expiresAt: now + LEASE_MS })
+      await storage.put(`run:${run.id}`, claimed)
+      await storage.put('lock', { runId: run.id, leaseId, expiresAt: now + LEASE_MS })
 
       return {
         acquired: true,
         runId: run.id,
-        message: JSON.parse(run.inputJson) as InboundMessage,
+        leaseId,
+        message: run.inputJson ? JSON.parse(run.inputJson) as InboundMessage : await readValue<InboundMessage>(storage, `input:${run.id}`),
       }
     }
 
@@ -287,47 +315,51 @@ export class Agent extends PluginDurableObject {
    */
   async release(
     runId: string,
-    result: { ok: boolean; error?: string; history?: HistoryRow[]; claimNext?: boolean },
+    result: { ok: boolean; error?: string; history?: HistoryRow[]; claimNext?: boolean; leaseId?: string },
   ): Promise<AcquireResult> {
-    const now = Date.now()
-    const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
+    return this.ctx.storage.transaction(async storage => {
+      const now = Date.now()
+      const run = await storage.get<RunRecord>(`run:${runId}`)
 
-    // 被取消的 run **保留 cancelled 状态**。
-    //
-    // 执行流被 `/stop` 打断后仍会走一次 `release()` 收尾（否则锁永远不释放）。
-    // 如果这里无条件改写成 failed/completed，那个「用户主动取消」的事实就丢了：
-    // 排障时看起来像一次执行失败，`prune` 的 cancelled 分支也永远走不到。
-    const cancelled = run?.status === 'cancelled'
-    if (run) {
-      await this.ctx.storage.put(`run:${runId}`, {
-        ...run,
-        status: cancelled ? 'cancelled' : result.ok ? 'completed' : 'failed',
-        error: result.error,
-        lockedUntil: undefined,
-        updatedAt: now,
-      } satisfies RunRecord)
-    }
+      // 被取消的 run **保留 cancelled 状态**。
+      //
+      // 执行流被 `/stop` 打断后仍会走一次 `release()` 收尾（否则锁永远不释放）。
+      // 如果这里无条件改写成 failed/completed，那个「用户主动取消」的事实就丢了：
+      // 排障时看起来像一次执行失败，`prune` 的 cancelled 分支也永远走不到。
+      if (result.leaseId && run?.leaseId !== result.leaseId) return { acquired: false }
+      if (run?.status === 'completed' || run?.status === 'failed') return { acquired: false }
+      const cancelled = run?.status === 'cancelled'
+      if (run) {
+        await storage.put(`run:${runId}`, {
+          ...run,
+          status: cancelled ? 'cancelled' : result.ok ? 'completed' : 'failed',
+          error: result.error,
+          lockedUntil: undefined,
+          updatedAt: now,
+        } satisfies RunRecord)
+      }
 
-    // 被 `/agent reset` / `/stop` 取消的 run 不写历史：用户明确清了记忆，
-    // 这一轮是旧上下文的产物。队列里被取消的 run 同样不再执行（claim 只认 pending）。
-    if (!cancelled && result.history?.length) {
-      await this.appendHistory(result.history)
-    }
+      // 被 `/agent reset` / `/stop` 取消的 run 不写历史：用户明确清了记忆，
+      // 这一轮是旧上下文的产物。队列里被取消的 run 同样不再执行（claim 只认 pending）。
+      if (!cancelled && result.history?.length) {
+        await this.appendHistory(result.history, storage)
+      }
 
-    // **只删自己的锁**。
-    //
-    // 以前无条件 `delete('lock')`：执行者 A 的租约过期后 B 接手同一个 run（甚至
-    // 新 run）拿到了锁，A 跑完收尾时把 B 的锁删掉——于是同会话可以并发执行，
-    // 串行化保证直接失效，用户收到两条回复且历史交错。
-    await this.releaseLockIfOwned(runId)
+      // **只删自己的锁**。
+      //
+      // 以前无条件 `delete('lock')`：执行者 A 的租约过期后 B 接手同一个 run（甚至
+      // 新 run）拿到了锁，A 跑完收尾时把 B 的锁删掉——于是同会话可以并发执行，
+      // 串行化保证直接失效，用户收到两条回复且历史交错。
+      await this.releaseLockIfOwned(runId, storage)
 
-    // 队列里还有活就立刻认领下一个并返回给调用方——调用方（事件处理器）
-    // 可以接着跑，不必等 cron。
-    //
-    // 这是「不需要定期唤醒」的关键：上一版跑完就撒手，队列里的 run 只能靠
-    // cron 每分钟轮询捡，而 DO 按 GB-秒计费，空转唤醒是纯浪费。
-    // 调用方没有继续执行的预算时，下一条保持 pending，不能先认领再丢下。
-    return result.claimNext === false ? { acquired: false } : this.claim(now)
+      // 队列里还有活就立刻认领下一个并返回给调用方——调用方（事件处理器）
+      // 可以接着跑，不必等 cron。
+      //
+      // 这是「不需要定期唤醒」的关键：上一版跑完就撒手，队列里的 run 只能靠
+      // cron 每分钟轮询捡，而 DO 按 GB-秒计费，空转唤醒是纯浪费。
+      // 调用方没有继续执行的预算时，下一条保持 pending，不能先认领再丢下。
+      return result.claimNext === false ? { acquired: false } : this.claim(now, storage)
+    })
   }
 
   /**
@@ -340,25 +372,26 @@ export class Agent extends PluginDurableObject {
    * 用户收到两条回复、历史写两遍。
    *
    * 返回 false 表示锁已经不属于这个 run（被 reset / 被他人接管），
-   * 调用方应当知道自己的续租失效了（但不该因此抛错中断对话）。
+   * 调用方必须停止执行，避免与新的租约持有者重复操作。
    */
-  async renewLease(runId: string): Promise<boolean> {
-    const lock = await this.ctx.storage.get<{ runId: string; expiresAt: number }>('lock')
-    if (!lock || lock.runId !== runId) return false
+  async renewLease(runId: string, leaseId?: string): Promise<boolean> {
+    return this.ctx.storage.transaction(async storage => {
+      const lock = await storage.get<{ runId: string; leaseId?: string; expiresAt: number }>('lock')
+      if (!lock || lock.runId !== runId || (leaseId && lock.leaseId !== leaseId)) return false
 
-    const now = Date.now()
-    const expiresAt = now + LEASE_MS
-    await this.ctx.storage.put('lock', { runId, expiresAt })
-
-    const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
-    // run 已不在 running（被取消/被清理）时只续锁没有意义，如实返回 false
-    if (!run || run.status !== 'running') return false
-    await this.ctx.storage.put(`run:${runId}`, {
-      ...run,
-      lockedUntil: expiresAt,
-      updatedAt: now,
-    } satisfies RunRecord)
-    return true
+      const now = Date.now()
+      const expiresAt = now + LEASE_MS
+      const run = await storage.get<RunRecord>(`run:${runId}`)
+      // run 已不在 running（被取消/被清理）时只续锁没有意义，如实返回 false
+      if (!run || run.status !== 'running') return false
+      await storage.put('lock', { ...lock, expiresAt })
+      await storage.put(`run:${runId}`, {
+        ...run,
+        lockedUntil: expiresAt,
+        updatedAt: now,
+      } satisfies RunRecord)
+      return true
+    })
   }
 
   /**
@@ -378,11 +411,11 @@ export class Agent extends PluginDurableObject {
    * 竞态的形态：执行者 A 的租约过期 → B 认领下一个 run 并写入自己的锁 →
    * A 这时才跑完收尾。无条件删锁会让 B 的锁消失，同会话立刻可以并发执行。
    */
-  private async releaseLockIfOwned(runId: string): Promise<void> {
-    const lock = await this.ctx.storage.get<{ runId: string }>('lock')
+  private async releaseLockIfOwned(runId: string, storage: Storage = this.ctx.storage): Promise<void> {
+    const lock = await storage.get<{ runId: string }>('lock')
     if (!lock) return
     if (lock.runId !== runId) return
-    await this.ctx.storage.delete('lock')
+    await storage.delete('lock')
   }
 
   /**
@@ -392,40 +425,66 @@ export class Agent extends PluginDurableObject {
    * 与 `release` 的区别：不写历史、状态回 pending、保留 attempts 计数。
    */
   async retryLater(runId: string, reason: string): Promise<AcquireResult> {
-    const now = Date.now()
-    const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
+    return this.ctx.storage.transaction(async storage => {
+      const now = Date.now()
+      const run = await storage.get<RunRecord>(`run:${runId}`)
 
-    if (run) {
-      await this.ctx.storage.put(`run:${runId}`, {
-        ...run,
-        status: 'pending',
-        error: reason,
-        lockedUntil: undefined,
-        updatedAt: now,
-      } satisfies RunRecord)
-      await this.ctx.storage.put(queueKey(await nextSequence(this.ctx.storage), run.id), run.id)
-    }
+      if (run) {
+        await storage.put(`run:${runId}`, {
+          ...run,
+          status: 'pending',
+          error: reason,
+          lockedUntil: undefined,
+          updatedAt: now,
+        } satisfies RunRecord)
+        await storage.put(queueKey(await nextSequence(storage), run.id), run.id)
+      }
 
-    await this.releaseLockIfOwned(runId)
+      await this.releaseLockIfOwned(runId, storage)
 
-    // **不立刻重新认领**：退回的 run 会马上被捡回来，等于无限重试，
-    // 而上游限流这类错误需要等一会儿再试。交给 cron 或下一次用户消息触发。
-    return { acquired: false }
+      // **不立刻重新认领**：退回的 run 会马上被捡回来，等于无限重试，
+      // 而上游限流这类错误需要等一会儿再试。交给 cron 或下一次用户消息触发。
+      return { acquired: false }
+    })
   }
 
   // ------------------------------------------------------------ 历史
 
-  async history(limit: number): Promise<HistoryRow[]> {
-    // `slice(-0)` 等于 `slice(0)`，所以 limit=0 会返回**全部历史**而不是空——
-    // 而配置允许 `history_limit: 0`（表示「不给历史」）。这个边界必须在读之前挡掉：
-    // 调用方传 0 的本意是「不要历史」，返回全部正好是反的，上下文会被灌满。
-    if (!Number.isFinite(limit) || limit <= 0) return []
-
-    const all = await this.ctx.storage.list<HistoryRow>({ prefix: 'msg:' })
-    const rows = [...all.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([, v]) => v)
-    return rows.slice(-limit)
+  async history(limit: number, summarize?: boolean): Promise<HistoryRow[]> {
+    return this.ctx.storage.transaction(async storage => {
+      if (summarize !== undefined) await storage.put('meta:summarize', summarize)
+      const all = await storage.list({ prefix: 'msg:' })
+      const summary = await storage.get<StoredSummary>('summary')
+      const keys = [...all.keys()].sort().filter(key => !summarize || !summary?.coveredThrough || key > summary.coveredThrough)
+      const keep = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0
+      let split = Math.max(0, keys.length - keep)
+      // 条数上限可能切在一轮中间。把孤立的 assistant 一起交给摘要，
+      // 避免后面的 fixMessages 丢掉它、摘要游标又越过这条记录。
+      if (summarize) {
+        while (split < keys.length) {
+          const first = await readValue<HistoryRow>(storage, keys[split]!)
+          if (first?.role !== 'assistant') break
+          split++
+        }
+      }
+      if (summarize) {
+        const dropped: SummaryInput[] = []
+        const stagedThrough = await storage.get<string>('summary:stagedThrough')
+        for (const key of keys.slice(0, split)) {
+          if (stagedThrough && key <= stagedThrough) continue
+          const row = await readValue<HistoryRow>(storage, key)
+          if (row) dropped.push(historySummary({ ...row, id: key }))
+        }
+        await this.stageSummaryInStorage(storage, dropped)
+      }
+      // 只还原需要的行；被裁掉的图片不应全部驻留在 Worker 内存里。
+      const rows: HistoryRow[] = []
+      for (const key of keys.slice(split)) {
+        const row = await readValue<HistoryRow>(storage, key)
+        if (row) rows.push({ ...row, id: key })
+      }
+      return rows
+    })
   }
 
   /**
@@ -441,44 +500,47 @@ export class Agent extends PluginDurableObject {
    * 3. 最后才删历史。
    */
   async reset(): Promise<void> {
-    // 1) 打断：把正在跑的那个 run 标成已取消，`release()` 见到 cancelled 就跳过写历史
-    const lock = await this.ctx.storage.get<{ runId: string }>('lock')
-    if (lock) {
-      const run = await this.ctx.storage.get<RunRecord>(`run:${lock.runId}`)
-      if (run && run.status === 'running') {
-        await this.ctx.storage.put(`run:${lock.runId}`, {
-          ...run,
-          status: 'cancelled',
-          lockedUntil: undefined,
-          updatedAt: Date.now(),
-        } satisfies RunRecord)
+    return this.ctx.storage.transaction(async storage => {
+      // 1) 打断：把正在跑的那个 run 标成已取消，`release()` 见到 cancelled 就跳过写历史
+      const lock = await storage.get<{ runId: string }>('lock')
+      if (lock) {
+        const run = await storage.get<RunRecord>(`run:${lock.runId}`)
+        if (run && run.status === 'running') {
+          await storage.put(`run:${lock.runId}`, {
+            ...run,
+            status: 'cancelled',
+            lockedUntil: undefined,
+            updatedAt: Date.now(),
+          } satisfies RunRecord)
+        }
+        await storage.delete('lock')
       }
-      await this.ctx.storage.delete('lock')
-    }
 
-    // 2) 清队列
-    const queued = await this.ctx.storage.list<string>({ prefix: 'queue:' })
-    if (queued.size) {
-      await this.ctx.storage.delete([...queued.keys()])
-    }
-    // 队列里对应的 run 记录也标成取消，避免留下 pending 的孤儿
-    const runs = await this.ctx.storage.list<RunRecord>({ prefix: 'run:' })
-    const cancelled: Record<string, RunRecord> = {}
-    for (const [key, run] of runs) {
-      if (run.status === 'pending') {
-        cancelled[key] = { ...run, status: 'cancelled', updatedAt: Date.now() }
+      // 2) 清队列
+      const queued = await storage.list<string>({ prefix: 'queue:' })
+      for (const key of queued.keys()) await storage.delete(key)
+      // 队列里对应的 run 记录也标成取消，避免留下 pending 的孤儿
+      const runs = await storage.list<RunRecord>({ prefix: 'run:' })
+      const cancelled: Record<string, RunRecord> = {}
+      for (const [key, run] of runs) {
+        if (run.status === 'pending') {
+          cancelled[key] = { ...run, status: 'cancelled', updatedAt: Date.now() }
+        }
       }
-    }
-    if (Object.keys(cancelled).length) await this.ctx.storage.put(cancelled)
+      for (const [key, run] of Object.entries(cancelled)) await storage.put(key, run)
 
-    // 3) 删历史
-    const all = await this.ctx.storage.list({ prefix: 'msg:' })
-    if (all.size) await this.ctx.storage.delete([...all.keys()])
+      // 3) 删历史
+      const all = await storage.list({ prefix: 'msg:' })
+      for (const key of all.keys()) await deleteValue(storage, key)
 
-    // 4) 摘要也一起清。不清的话 `/reset` 之后第一句话就带着旧记忆，
-    //    比完全不支持摘要更糟——用户以为清空、实际没清。
-    await this.ctx.storage.delete('summary')
-    await this.ctx.storage.delete('summary:pending')
+      // 4) 摘要也一起清。不清的话 `/reset` 之后第一句话就带着旧记忆，
+      //    比完全不支持摘要更糟——用户以为清空、实际没清。
+      await storage.delete('summary')
+      await deleteValue(storage, 'summary:pending')
+      await deleteValue(storage, 'summary:inflight')
+      await storage.delete('summary:stagedThrough')
+      for (const key of (await storage.list({ prefix: 'checkpoint:' })).keys()) await deleteValue(storage, key)
+    })
   }
 
   // ------------------------------------------------------------ 摘要（summary 压缩模式）
@@ -503,39 +565,109 @@ export class Agent extends PluginDurableObject {
    * 合并而非覆盖：同一会话可能在摘要生成前又压缩了两次，
    * 把待摘要的旧轮**接在前面**，保证时间顺序不乱。
    */
-  async stageSummary(messages: SummaryInput[], coveredMessages: number): Promise<void> {
-    if (messages.length === 0) return
-    const existing = await this.ctx.storage.get<{ messages: SummaryInput[]; coveredMessages: number }>('summary:pending')
-    const merged = existing ? [...existing.messages, ...messages] : messages
-    await this.ctx.storage.put('summary:pending', {
-      messages: merged,
-      coveredMessages: (existing?.coveredMessages ?? 0) + coveredMessages,
+  async stageSummary(messages: SummaryInput[], _coveredMessages: number, owner?: { runId: string; leaseId?: string }): Promise<void> {
+    await this.ctx.storage.transaction(async storage => {
+      if (owner) {
+        const run = await storage.get<RunRecord>(`run:${owner.runId}`)
+        if (!run || run.status !== 'running' || (owner.leaseId && run.leaseId !== owner.leaseId)) return
+      }
+      await this.stageSummaryInStorage(storage, messages)
     })
   }
 
-  /**
-   * 取走待摘要的数据。**取走即清空**，避免两个执行者同时摘要同一批内容
-   * （cron 是每分钟一次，理论上不会重叠；但 isolate 可能被并发唤醒）。
-   */
-  async takePendingSummary(): Promise<{ messages: SummaryInput[]; coveredMessages: number } | null> {
-    const pending = await this.ctx.storage.get<{ messages: SummaryInput[]; coveredMessages: number }>('summary:pending')
-    if (!pending) return null
-    await this.ctx.storage.delete('summary:pending')
-    return pending
+  private async stageSummaryInStorage(storage: Storage, messages: SummaryInput[]): Promise<void> {
+    const through = await storage.get<string>('summary:stagedThrough')
+    const fresh = messages.filter(m => !m.id || !through || m.id > through)
+    if (!fresh.length) return
+    const existing = await readValue<SummaryBatch>(storage, 'summary:pending')
+    const merged = [...(existing?.messages ?? []), ...fresh]
+    await writeValue(storage, 'summary:pending', { messages: merged, coveredMessages: merged.length })
+    const ids = fresh.flatMap(m => m.id ? [m.id] : []).sort()
+    if (ids.length) await storage.put('summary:stagedThrough', ids[ids.length - 1]!)
   }
 
-  /** 写入生成好的摘要 */
-  async saveSummary(summary: StoredSummary): Promise<void> {
-    await this.ctx.storage.put('summary', summary)
+  /** 领取后保留原批次；执行者中断时租约到期可重新领取。 */
+  async takePendingSummary(): Promise<SummaryBatch | null> {
+    return this.ctx.storage.transaction(async storage => {
+      const inflight = await readValue<SummaryBatch>(storage, 'summary:inflight')
+      if (inflight && (inflight.expiresAt ?? 0) > Date.now()) return null
+      let batch = inflight
+      if (!batch) {
+        const pending = await readValue<SummaryBatch>(storage, 'summary:pending')
+        if (!pending?.messages.length) return null
+        // 每批最多 40 条，避免等待摘要的积压一次塞满模型上下文。
+        const messages = pending.messages.slice(0, 40)
+        batch = { messages, coveredMessages: messages.length }
+        const remaining = pending.messages.slice(messages.length)
+        if (remaining.length) await writeValue(storage, 'summary:pending', { messages: remaining, coveredMessages: remaining.length })
+        else await deleteValue(storage, 'summary:pending')
+      }
+      batch = { ...batch, token: crypto.randomUUID(), expiresAt: Date.now() + LEASE_MS }
+      await writeValue(storage, 'summary:inflight', batch)
+      return batch
+    })
   }
 
-  /** 摘要生成失败：把待摘要内容放回去，下次 cron 再试 */
-  async restorePendingSummary(pending: { messages: SummaryInput[]; coveredMessages: number }): Promise<void> {
-    const existing = await this.ctx.storage.get<{ messages: SummaryInput[]; coveredMessages: number }>('summary:pending')
-    // 放回时排在**最前面**：这批更旧，应该先被摘要
-    await this.ctx.storage.put('summary:pending', {
-      messages: existing ? [...pending.messages, ...existing.messages] : pending.messages,
-      coveredMessages: (existing?.coveredMessages ?? 0) + pending.coveredMessages,
+  /** 带领取令牌提交，reset 或另一个执行者接管后旧摘要不得写回。 */
+  async saveSummary(summary: StoredSummary, batch?: SummaryBatch): Promise<void> {
+    await this.ctx.storage.transaction(async storage => {
+      if (batch?.token) {
+        const current = await readValue<SummaryBatch>(storage, 'summary:inflight')
+        if (current?.token !== batch.token) return
+      }
+      await storage.put('summary', summary)
+      if (batch?.token) await deleteValue(storage, 'summary:inflight')
+    })
+  }
+
+  async restorePendingSummary(batch: SummaryBatch): Promise<void> {
+    await this.ctx.storage.transaction(async storage => {
+      if (batch.token) {
+        const current = await readValue<SummaryBatch>(storage, 'summary:inflight')
+        if (current?.token !== batch.token) return
+        await deleteValue(storage, 'summary:inflight')
+      }
+      const existing = await readValue<SummaryBatch>(storage, 'summary:pending')
+      const messages = [...batch.messages, ...(existing?.messages ?? [])]
+      await writeValue(storage, 'summary:pending', { messages, coveredMessages: messages.length })
+    })
+  }
+
+  async nextWakeAt(retentionMs: number): Promise<number | null> {
+    const runs = [...(await this.ctx.storage.list<RunRecord>({ prefix: 'run:' })).values()]
+    if (runs.some(r => r.status === 'pending' || r.status === 'running') ||
+        await this.ctx.storage.get('summary:pending') || await this.ctx.storage.get('summary:inflight')) return Date.now() + 60_000
+    return runs.length ? Math.max(Date.now() + 1_000, Math.min(...runs.map(r => r.updatedAt + retentionMs + 1))) : null
+  }
+
+  async checkpoint(runId: string): Promise<LoopCheckpoint | null> {
+    return this.ctx.storage.transaction(async storage => (await readValue<LoopCheckpoint>(storage, `checkpoint:${runId}`)) ?? null)
+  }
+
+  async saveCheckpoint(runId: string, checkpoint: LoopCheckpoint, leaseId?: string): Promise<boolean> {
+    return this.ctx.storage.transaction(async storage => {
+      const run = await storage.get<RunRecord>(`run:${runId}`)
+      if (!run || run.status !== 'running' || (leaseId && run.leaseId !== leaseId)) return false
+      await writeValue(storage, `checkpoint:${runId}`, checkpoint)
+      return true
+    })
+  }
+
+  async ownsLease(runId: string, leaseId: string): Promise<boolean> {
+    const lock = await this.ctx.storage.get<{ runId: string; leaseId?: string; expiresAt: number }>('lock')
+    const run = await this.ctx.storage.get<RunRecord>(`run:${runId}`)
+    return lock?.runId === runId && lock.leaseId === leaseId && lock.expiresAt > Date.now() && run?.status === 'running'
+  }
+
+  /** 主动让出预算不算执行失败；同一个 run 继续，不能落到后来的消息后面。 */
+  async suspend(runId: string, leaseId?: string): Promise<void> {
+    await this.ctx.storage.transaction(async storage => {
+      const run = await storage.get<RunRecord>(`run:${runId}`)
+      if (!run || run.status !== 'running' || (leaseId && run.leaseId !== leaseId)) return
+      await storage.put(`run:${runId}`, { ...run, status: 'pending', attempts: Math.max(0, run.attempts - 1), lockedUntil: undefined, updatedAt: Date.now() })
+      await storage.put(`queue:0000000000000000:${runId}`, runId)
+      const lock = await storage.get<{ runId: string; leaseId?: string }>('lock')
+      if (lock?.runId === runId && (!leaseId || lock.leaseId === leaseId)) await storage.delete('lock')
     })
   }
 
@@ -559,31 +691,33 @@ export class Agent extends PluginDurableObject {
    * 而那个 run 仍在跑（比如跨事件预算的那条执行链）。只认锁会让 `/stop` 偶发无效。
    */
   async stop(): Promise<{ stopped: boolean }> {
-    const now = Date.now()
+    return this.ctx.storage.transaction(async storage => {
+      const now = Date.now()
 
-    const stopRun = async (runId: string): Promise<boolean> => {
-      const key = `run:${runId}`
-      const run = await this.ctx.storage.get<RunRecord>(key)
-      if (!run || run.status !== 'running') return false
-      await this.ctx.storage.put(key, {
-        ...run,
-        status: 'cancelled',
-        updatedAt: now,
-      } satisfies RunRecord)
-      return true
-    }
+      const stopRun = async (runId: string): Promise<boolean> => {
+        const key = `run:${runId}`
+        const run = await storage.get<RunRecord>(key)
+        if (!run || (run.status !== 'running' && !(run.status === 'pending' && await storage.get(`checkpoint:${runId}`)))) return false
+        await storage.put(key, {
+          ...run,
+          status: 'cancelled',
+          updatedAt: now,
+        } satisfies RunRecord)
+        return true
+      }
 
-    const lock = await this.ctx.storage.get<{ runId: string }>('lock')
-    if (lock && (await stopRun(lock.runId))) return { stopped: true }
+      const lock = await storage.get<{ runId: string }>('lock')
+      if (lock && (await stopRun(lock.runId))) return { stopped: true }
 
-    // 兜底：没有锁（或锁指向的 run 已经不在 running）时，扫一遍 run 记录。
-    // 数量很小：终态 run 会被 prune 掉，同一会话同时最多一两个 running。
-    const runs = await this.ctx.storage.list<RunRecord>({ prefix: 'run:' })
-    for (const run of runs.values()) {
-      if (run.status === 'running' && (await stopRun(run.id))) return { stopped: true }
-    }
+      // 兜底：没有锁（或锁指向的 run 已经不在 running）时，扫一遍 run 记录。
+      // 数量很小：终态 run 会被 prune 掉，同一会话同时最多一两个 running。
+      const runs = await storage.list<RunRecord>({ prefix: 'run:' })
+      for (const run of runs.values()) {
+        if ((run.status === 'running' || run.status === 'pending') && (await stopRun(run.id))) return { stopped: true }
+      }
 
-    return { stopped: false }
+      return { stopped: false }
+    })
   }
 
   async stats(): Promise<{ history: number; pending: number; locked: boolean }> {
@@ -605,30 +739,28 @@ export class Agent extends PluginDurableObject {
    * 裁剪放在写入路径上（而不是 cron），是因为 DO storage 没有 TTL；
    * 一个长期活跃的群会把历史攒到无限大。每次写最多删几条，成本可预测。
    */
-  private async appendHistory(rows: HistoryRow[]): Promise<void> {
-    const puts: Record<string, HistoryRow> = {}
-    // 用单调序号而不是 createdAt 做排序键：同一次 release 写入的多条消息
-    // 时间戳可能相同（都取 Date.now()），字典序会退化成比较随机 UUID，顺序就乱了
-    let sequence = (await this.ctx.storage.get<number>('meta:msgSeq')) ?? 0
+  private async appendHistory(rows: HistoryRow[], storage: Storage): Promise<void> {
+    let sequence = (await storage.get<number>('meta:msgSeq')) ?? 0
     for (const row of rows) {
-      sequence += 1
-      puts[`msg:${String(sequence).padStart(16, '0')}`] = row
+      sequence++
+      const key = `msg:${String(sequence).padStart(16, '0')}`
+      await writeValue(storage, key, row)
     }
-    await this.ctx.storage.put('meta:msgSeq', sequence)
-    await this.ctx.storage.put(puts)
-
-    const all = await this.ctx.storage.list<HistoryRow>({ prefix: 'msg:' })
-    if (all.size <= MAX_HISTORY_ROWS) return
-
-    const keys = [...all.keys()].sort()
-    const excess = keys.slice(0, all.size - MAX_HISTORY_ROWS)
-    if (excess.length) await this.ctx.storage.delete(excess)
+    await storage.put('meta:msgSeq', sequence)
+    const keys = [...(await storage.list({ prefix: 'msg:' })).keys()].sort()
+    const excess = keys.slice(0, Math.max(0, keys.length - MAX_HISTORY_ROWS))
+    const summarize = await storage.get<boolean>('meta:summarize')
+    for (const key of excess) {
+      const row = await readValue<HistoryRow>(storage, key)
+      if (summarize && row) await this.stageSummaryInStorage(storage, [historySummary({ ...row, id: key })])
+      await deleteValue(storage, key)
+    }
   }
 
   // ------------------------------------------------------------ 清理与恢复
 
   /**
-   * cron 的 10 分钟清理轮：**一次 RPC 做完「认领滞留 run」与「清理终态 run」**。
+   * cron 对到期会话的恢复扫描：**一次 RPC 做完「认领滞留 run」与「清理终态 run」**。
    *
    * 合成一次是因为两边都要按会话遍历：分两次调用等于把 DO 唤醒数翻倍，
    * 而 DO 按 GB-秒计费（免费版 13,000 GB-s/日）。
@@ -638,7 +770,7 @@ export class Agent extends PluginDurableObject {
    * 时顺带认领」在冷会话里等于永远不恢复，排队消息就永久停滞。
    */
   async sweep(olderThanMs: number): Promise<{ claimed: AcquireResult; pruned: number }> {
-    const claimed = await this.claim(Date.now())
+    const claimed = await this.poll()
     const pruned = await this.prune(olderThanMs)
     return { claimed, pruned }
   }
@@ -664,7 +796,14 @@ export class Agent extends PluginDurableObject {
         return run.updatedAt < cutoff
       })
       .map(([key]) => key)
-    if (stale.length) await this.ctx.storage.delete(stale)
+    for (const key of stale) {
+      const runId = key.slice(4)
+      await this.ctx.storage.transaction(async storage => {
+        await deleteValue(storage, `checkpoint:${runId}`)
+        await deleteValue(storage, `input:${runId}`)
+        await storage.delete(key)
+      })
+    }
     return stale.length
   }
 }
@@ -682,7 +821,7 @@ function queueKey(sequence: number, runId: string): string {
 }
 
 /** 取下一个队列序号。DO 单实例内 `put` 串行，所以读-加-写不会竞争 */
-async function nextSequence(storage: DurableObjectStorage): Promise<number> {
+async function nextSequence(storage: Storage): Promise<number> {
   const current = (await storage.get<number>('meta:queueSeq')) ?? 0
   const next = current + 1
   await storage.put('meta:queueSeq', next)

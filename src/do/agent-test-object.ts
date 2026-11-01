@@ -4,16 +4,21 @@ import { Agent } from './agent-object.js'
 /** 内存版 DurableObjectStorage，只实现 Agent 用到的方法 */
 function memoryStorage() {
   const map = new Map<string, unknown>()
-  return {
+  const storage = {
     map,
+    async transaction<T>(callback: (transaction: DurableObjectTransaction) => Promise<T>): Promise<T> {
+      const before = structuredClone(map)
+      try { return await callback(storage as unknown as DurableObjectTransaction) }
+      catch (error) { map.clear(); before.forEach((value, key) => map.set(key, value)); throw error }
+    },
     async get<T>(key: string): Promise<T | undefined> {
-      return map.get(key) as T | undefined
+      return structuredClone(map.get(key)) as T | undefined
     },
     async put(keyOrEntries: string | Record<string, unknown>, value?: unknown) {
       if (typeof keyOrEntries === 'string') {
-        map.set(keyOrEntries, value)
+        map.set(keyOrEntries, structuredClone(value))
       } else {
-        for (const [k, v] of Object.entries(keyOrEntries)) map.set(k, v)
+        for (const [k, v] of Object.entries(keyOrEntries)) map.set(k, structuredClone(v))
       }
     },
     async delete(keyOrKeys: string | string[]) {
@@ -26,9 +31,10 @@ function memoryStorage() {
         .filter(([k]) => k.startsWith(prefix))
         .sort((a, b) => a[0].localeCompare(b[0]))
       const limited = options.limit ? entries.slice(0, options.limit) : entries
-      return new Map(limited) as Map<string, T>
+      return structuredClone(new Map(limited)) as Map<string, T>
     },
   }
+  return storage
 }
 
 export function makeObject() {

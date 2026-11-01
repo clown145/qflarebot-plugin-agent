@@ -7,8 +7,10 @@
 import type { Route } from '@qqbot/sdk'
 import type { AgentConfig } from '../config/index.js'
 import { getToolSettings, setToolSettings } from '../store/d1.js'
-import { normalizeToolSettings, toToolCatalog } from '../tools/catalog.js'
+import { canonicalDisabledTools, normalizeToolSettings, toToolCatalog } from '../tools/catalog.js'
 import { buildRegistry, hasR2 } from '../agent/run.js'
+import { listAllPluginTools, setPluginToolEnabled } from '../plugin-tools.js'
+import { coreTools, loadFrameworkTools } from '../agent/plugin-tool-adapter.js'
 import { resolveConfig } from '../effective-config.js'
 
 export function createToolsRoutes(): Route<AgentConfig>[] {
@@ -25,7 +27,8 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
         return Response.json({
           ok: true,
           tools: toToolCatalog(tools, settings),
-          disabled: settings.disabled,
+          frameworkTools: { available: coreTools(ctx) !== null },
+          disabled: canonicalDisabledTools(tools, settings.disabled),
         })
       },
     },
@@ -51,9 +54,26 @@ export function createToolsRoutes(): Route<AgentConfig>[] {
         // 这是最容易踩的坑——用户点一下开关，搜索 key 就没了，而且不报错。
         const merged = {
           disabled: incoming.disabled,
-          config: incoming.config && Object.keys(incoming.config).length
-            ? incoming.config
-            : (current.config ?? {}),
+          config:
+            incoming.config && Object.keys(incoming.config).length
+              ? incoming.config
+              : (current.config ?? {}),
+        }
+        // 与旧注册表保持一致，否则旧 disabled 标记会让现代工具无法重新开启。
+        const tools = await loadFrameworkTools(ctx)
+        const legacy = await listAllPluginTools(ctx.db)
+        const disabled = new Set(merged.disabled)
+        for (const meta of legacy) {
+          const matches = tools.filter(
+            tool =>
+              tool.definition.name === meta.fullName ||
+              tool.compatibility?.aliases.includes(meta.fullName),
+          )
+          if (!matches.length) continue
+          const enabled =
+            !disabled.has(meta.fullName) &&
+            !matches.some(tool => disabled.has(tool.definition.name))
+          if (meta.enabled !== enabled) await setPluginToolEnabled(ctx.db, meta.fullName, enabled)
         }
         await setToolSettings(ctx.db, merged)
         return Response.json({ ok: true, disabled: merged.disabled })

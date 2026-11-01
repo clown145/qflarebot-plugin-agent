@@ -1,48 +1,4 @@
-/**
- * 插件间工具扩展：别的插件可以把自己的工具交给 Agent 调用。
- *
- * ## 为什么需要
- *
- * 对标 AstrBot 的插件 `@filter.llm_tool` 装饰器风格的能力 —— 任何插件都能
- * 定义一个函数，模型就能调用它。QFlareBot 的插件之间只有 `services`，
- * 但 `services` 返回的对象**可以带方法**（t2i 插件的 `render()` 就是例子），
- * 所以可以做出等价能力。
- *
- * ## 架构：元数据落库，执行走服务
- *
- * 两个部分必须分开：
- *
- * | 部分 | 存哪 | 为什么 |
- * | --- | --- | --- |
- * | **工具元数据**（名字、描述、schema） | D1 | 构建注册表时要**同步**拿到 |
- * | **执行函数** | 提供者的 `services`（每请求工厂） | 函数不能序列化，只能运行时取 |
- *
- * 这个分界也是被宿主的约束逼出来的：`services` 工厂每个请求调用一次，
- * 拿到的对象活不过本次请求，但工具列表每次构建 registry 都要用。
- *
- * ## 调用链
- *
- * ```text
- * 提供者插件                     Agent 插件
- *   services: { tools: () => ({      buildRegistry()
- *     echo: {                          ├─ listPluginTools(db)    ← 读元数据
- *       definition,                    └─ ctx.service(name)      ← 拿执行函数
- *       execute: async (input) => … }    └─ 包成一个 RegisteredTool
- *   }) }
- * ```
- *
- * ## 安全边界
- *
- * 1. **权限由提供者声明，但只能更严**：Agent 不会因为某个插件说「我的工具是
- *    level 1」就真的当 level 1 —— 插件工具一律**至少 level 2**，
- *    且不能绕过 Agent 自己的权限层（`registry.execute` 仍会判）。
- * 2. **名字强制加前缀** `plugin.<插件名>.<工具名>`：防止插件注册一个叫
- *    `http.request` 的工具来冒充内置工具，也避免两个插件撞名。
- * 3. **执行超时由 Agent 兜底**：提供者的 `execute` 可能挂住，
- *    外层用 `timeoutMs` race 掉，不能让一个插件拖死整个 run。
- * 4. **没有 plugins 服务时静默跳过**：提供者可能没装/被停用，
- *    这时工具直接不注册（模型看不到），而不是每次调用都报错。
- */
+/** 旧版工具注册表：兼容静态服务接线，并保留迁移前的禁用与权限设置。 */
 import type { PluginDB } from '@qqbot/sdk'
 import type { JsonSchema, ToolSideEffect } from './tools/types.js'
 import type { PluginToolRegistration } from './agent-service.js'
@@ -51,7 +7,7 @@ export type { PluginToolRegistration }
 
 /** 插件工具元数据。**不含执行函数**——函数没法序列化，运行时从 services 取 */
 export interface PluginToolMeta {
-  /** 提供者插件名（注册时由 Agent 强制写入，不接受自报） */
+  /** 旧注册时填写的提供者名；不作为框架调用的身份凭据 */
   owner: string
   /** 工具短名（不含前缀），如 `echo` */
   name: string
@@ -167,7 +123,6 @@ export async function upsertPluginTool(
        level = excluded.level,
        side_effect = excluded.side_effect,
        timeout_ms = excluded.timeout_ms,
-       enabled = 1,
        updated_at = excluded.updated_at`,
     fullName,
     cleanOwner,

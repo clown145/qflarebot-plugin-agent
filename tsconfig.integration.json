@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@qqbot/runtime/testing": [
+        "../QFlareBot/packages/runtime/src/testing/index.ts"
+      ],
+      "@qflarebot-test/t2i": [
+        "../QFlareBot/plugins/t2i/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "tests/integration",
+    "src/store/node-sqlite.d.ts"
+  ]
+}

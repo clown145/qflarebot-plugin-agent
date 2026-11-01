@@ -29,6 +29,7 @@ jobs:
         with:
           repository: QFlareBot/QFlareBot
           path: QFlareBot
+          ref: ${{ vars.QFLAREBOT_REF || 'da54b159b7a0321c0a54075b33fa2fcc6fd257d1' }}
 
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
@@ -92,3 +93,33 @@ jobs:
           "
 
       - run: npm test
+
+  integration:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: plugin
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: QFlareBot/QFlareBot
+          path: QFlareBot
+          ref: ${{ vars.QFLAREBOT_REF || 'da54b159b7a0321c0a54075b33fa2fcc6fd257d1' }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          package_json_file: QFlareBot/package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      # 集成测试加载真实 runtime/API/projector/T2I，需要完整工作区依赖。
+      - name: 准备框架测试环境
+        working-directory: QFlareBot
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter '@qqbot/plugin-cli...' --filter '@qqbot/projector...' build
+      - run: npm ci
+      - run: npm run typecheck:integration
+      - run: npm run test:integration

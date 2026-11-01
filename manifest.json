@@ -10,7 +10,8 @@
     "proactive"
   ],
   "depends": {
-    "llm": "*"
+    "llm": "*",
+    "core.tools": "optional"
   },
   "conflicts": [],
   "commands": [

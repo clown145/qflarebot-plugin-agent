@@ -1,4 +1,10 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createTestDb } from './store/sqlite-test-db.js'
+import { trackRecovery } from './store/recovery.js'
+import type { PluginDB } from '@qqbot/sdk'
+
+const cleanup: Array<() => void> = []
+afterEach(() => { cleanup.splice(0).forEach(fn => fn()); vi.restoreAllMocks() })
 
 /**
  * cron（`tick`）的行为与成本。
@@ -71,10 +77,13 @@ function mockCtx(
     stalled?: { runId: string; message: unknown } | null
   } = {},
 ) {
+  const store = createTestDb()
+  cleanup.push(() => store.close())
   const calls = {
     kvGet: 0,
     kvPut: 0,
     dbAll: 0,
+    scheduleQueries: 0,
     dbRun: [] as string[],
     durableGet: 0,
     sweep: 0,
@@ -114,12 +123,15 @@ function mockCtx(
       },
     },
     db: {
-      async all() {
+      async all(sql: string, ...params: unknown[]) {
         calls.dbAll += 1
+        if (sql.includes('{recovery}')) return store.db.all(sql, ...params)
+        if (sql.includes('{schedules}')) calls.scheduleQueries++
         return options.dueSchedules ?? []
       },
-      async run(sql: string) {
+      async run(sql: string, ...params: unknown[]) {
         calls.dbRun.push(sql)
+        if (sql.includes('{recovery}')) return store.db.run(sql, ...params)
         return { changes: 1 }
       },
       async first() {
@@ -154,6 +166,8 @@ function mockCtx(
             return []
           },
           async reset() {},
+          async nextWakeAt() { return null },
+          async suspend() {},
         }
       },
     },
@@ -190,6 +204,17 @@ function defaultConfigFields() {
 }
 
 describe('cron 空闲时不浪费额度', () => {
+  it('每分钟恢复持久索引里的会话，不依赖最近会话列表或十分钟清理节流', async () => {
+    const handler = await freshCronHandler()
+    const { ctx, calls } = mockCtx()
+    let now = Date.now()
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    await handler({ ctx, job: 'tick', scheduledAt: now })
+    for (let i = 0; i < 25; i++) await trackRecovery(ctx.db as unknown as PluginDB, `group:${i}`)
+    now += 60_000
+    await handler({ ctx, job: 'tick', scheduledAt: now })
+    expect(calls.sweep).toBe(25)
+  })
   it('没有定时任务、没有已知会话时，一次 DO 都不调', async () => {
     const handler = await freshCronHandler()
     const { ctx, calls } = mockCtx({ enableSchedule: false })
@@ -204,19 +229,19 @@ describe('cron 空闲时不浪费额度', () => {
     const { ctx, calls } = mockCtx({ enableSchedule: false })
     await handler({ ctx, job: 'tick', scheduledAt: Date.now() })
 
-    expect(calls.dbAll).toBe(0)
+    expect(calls.scheduleQueries).toBe(0)
   })
 
-  it('enable_schedule 打开但没到期任务时，只查一次 D1 就退出', async () => {
+  it('enable_schedule 打开但没到期任务时，只查一次 schedules，不唤醒 DO', async () => {
     const handler = await freshCronHandler()
     const { ctx, calls } = mockCtx({ enableSchedule: true, dueSchedules: [] })
     await handler({ ctx, job: 'tick', scheduledAt: Date.now() })
 
-    expect(calls.dbAll).toBe(1)
+    expect(calls.scheduleQueries).toBe(1)
     expect(calls.durableGet).toBe(0)
   })
 
-  it('每轮 cron 都碰 DO 是浪费：只剩「10 分钟一次的清理轮」才扫会话', async () => {
+  it('升级时迁移旧会话，清理完成后不反复唤醒空闲 DO', async () => {
     const handler = await freshCronHandler()
     const { ctx, calls } = mockCtx({
       enableSchedule: false,

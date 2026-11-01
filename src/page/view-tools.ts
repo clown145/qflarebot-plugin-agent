@@ -75,7 +75,9 @@ function renderTools() {
     tags.className = 'item-tags'
     const level = document.createElement('span')
     level.className = 'badge'
-    level.textContent = '级别 ' + (LEVEL_LABEL[tool.permission?.level] ?? tool.permission?.level)
+    level.textContent = tool.frameworkPermission
+      ? '权限 ' + ({ member: '成员', group_admin: '群管理', bot_admin: 'Bot 管理员' }[tool.frameworkPermission] ?? tool.frameworkPermission)
+      : '级别 ' + (LEVEL_LABEL[tool.permission?.level] ?? tool.permission?.level)
     tags.appendChild(level)
     if (tool.sideEffect === 'external_write' || tool.sideEffect === 'dangerous') {
       const effect = document.createElement('span')

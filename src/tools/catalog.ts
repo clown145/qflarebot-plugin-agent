@@ -57,6 +57,7 @@ export interface ToolSettings {
  * 真要看参数，面板里已经有工具定义的源码，加一列反而让接口变慢。
  */
 export interface ToolCatalogItem {
+  frameworkPermission?: import('@qqbot/sdk').PermissionTier
   name: string
   /** 展示名。工具没写 `title` 时退回工具名，见 `toToolCatalogItem` */
   title: string
@@ -93,7 +94,7 @@ export function toToolCatalog(
   const disabled = new Set(normalized.disabled)
   return tools
     .map((tool) => {
-      const item = toToolCatalogItem(tool, !disabled.has(tool.definition.name))
+      const item = toToolCatalogItem(tool, !isToolDisabled(tool, disabled))
       const fields = tool.definition.configFields
       if (!fields?.length) return item
 
@@ -116,6 +117,7 @@ export function toToolCatalog(
 function toToolCatalogItem(tool: RegisteredTool, enabled: boolean): ToolCatalogItem {
   const { definition } = tool
   return {
+    ...(definition.frameworkPermission ? { frameworkPermission: definition.frameworkPermission } : {}),
     name: definition.name,
     // 缺 title 时退回 name：面板直接显示这个字段，否则每处都要写 `?? name`，
     // 漏一处就是一行空白，看不出那里本该有个工具
@@ -155,8 +157,7 @@ export function applyToolSettings(
   settings?: ToolSettings,
 ): RegisteredTool[] {
   const disabled = new Set(normalizeToolSettings(settings).disabled)
-  if (disabled.size === 0) return [...tools]
-  return tools.filter((tool) => !disabled.has(tool.definition.name))
+  return tools.filter((tool) => !isToolDisabled(tool, disabled))
 }
 
 /**
@@ -239,4 +240,34 @@ function parseJsonOrNull(raw: string): unknown {
   } catch {
     return null
   }
+}
+
+
+/** 旧截断名称用于收窄开关；发生碰撞时关闭所有候选，不能意外放开。 */
+export function isToolDisabled(tool: RegisteredTool, disabled: ReadonlySet<string>): boolean {
+  return tool.compatibility?.disabled === true || disabled.has(tool.definition.name) ||
+    (tool.compatibility?.aliases.some(name => disabled.has(name)) ?? false)
+}
+
+/** 白名单只接受唯一的旧名称映射，碰撞时要求管理员选择新的完整名称。 */
+export function filterAllowedTools(tools: RegisteredTool[], allowed: readonly string[]): RegisteredTool[] {
+  const names = new Set(allowed)
+  const counts = new Map<string, number>()
+  for (const tool of tools) {
+    for (const alias of new Set([tool.definition.name, ...tool.compatibility?.aliases ?? []])) {
+      counts.set(alias, (counts.get(alias) ?? 0) + 1)
+    }
+  }
+  return tools.filter(tool => names.has(tool.definition.name) ||
+    tool.compatibility?.aliases.some(alias => names.has(alias) && counts.get(alias) === 1))
+}
+
+/** 管理页提交规范名称，保留当前未安装工具的开关。 */
+export function canonicalDisabledTools(tools: RegisteredTool[], disabled: readonly string[]): string[] {
+  const names = new Set(disabled)
+  const aliases = new Set(tools.flatMap(tool => tool.compatibility?.aliases ?? []))
+  return [...new Set([
+    ...disabled.filter(name => !aliases.has(name)),
+    ...tools.filter(tool => isToolDisabled(tool, names)).map(tool => tool.definition.name),
+  ])]
 }

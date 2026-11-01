@@ -143,6 +143,8 @@ describe('executeRun', () => {
     const history = release.mock.calls[0]?.[1].history ?? []
     expect(history[0]).toEqual({
       role: 'user',
+      userId: 'u1',
+      userName: '小明',
       content: '@小明 你好',
       toolCallsJson: null,
       createdAt: expect.any(Number),

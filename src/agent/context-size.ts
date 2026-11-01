@@ -393,6 +393,8 @@ export const SUMMARY_KEY = 'summary'
 
 /** 一条已生成的会话摘要 */
 export interface StoredSummary {
+  /** 已提交摘要覆盖到的历史消息键。 */
+  coveredThrough?: string
   /** 摘要正文（模型输出） */
   content: string
   /** 这份摘要覆盖到什么时候（毫秒时间戳），用来排障与展示 */

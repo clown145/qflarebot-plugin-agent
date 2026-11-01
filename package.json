@@ -12,7 +12,9 @@
     "sync": "qqbot-plugin build && node -e \"require('node:fs').copyFileSync('dist/manifest.json','manifest.json')\"",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit && tsc -p src/page/tsconfig.json --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p src/page/tsconfig.json --noEmit",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "typecheck:integration": "tsc -p tsconfig.integration.json --noEmit"
   },
   "dependencies": {},
   "devDependencies": {

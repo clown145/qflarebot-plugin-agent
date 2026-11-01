@@ -11,7 +11,7 @@ import plugin from './index.js'
  */
 describe('对 llm 插件的依赖声明', () => {
   it('在 definePlugin 里声明 depends.llm', () => {
-    expect(plugin.depends).toEqual({ llm: '*' })
+    expect(plugin.depends).toEqual({ llm: '*', 'core.tools': 'optional' })
   })
 
   it('depends 的键是服务名 llm，不是插件名', () => {
@@ -32,7 +32,7 @@ describe('对 llm 插件的依赖声明', () => {
     // manifest.json 由 `qqbot-plugin build` 从 definePlugin 生成并比对，
     // 所以这里验证源头的值就够了；构建本身是那道校验
     expect(plugin.name).toBe('agent')
-    expect(plugin.depends).toEqual({ llm: '*' })
+    expect(plugin.depends).toEqual({ llm: '*', 'core.tools': 'optional' })
   })
 
   it('不提供 llm 服务（不是 llm 插件的替代品）', () => {

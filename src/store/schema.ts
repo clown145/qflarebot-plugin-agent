@@ -16,6 +16,14 @@
  */
 
 export const SCHEMA_STATEMENTS = [
+  // 待恢复会话的持久索引。与 KV 的最近会话展示列表无关，不受 20 个会话上限影响。
+  `CREATE TABLE IF NOT EXISTS {recovery} (
+     conversation TEXT PRIMARY KEY,
+     token TEXT NOT NULL,
+     registered_at INTEGER NOT NULL,
+     due_at INTEGER NOT NULL
+   ) WITHOUT ROWID`,
+  `CREATE INDEX IF NOT EXISTS {recovery_due} ON {recovery}(due_at)`,
   // 动态定时任务：模型通过 schedule.create 工具建的提醒
   `CREATE TABLE IF NOT EXISTS {schedules} (
      id TEXT PRIMARY KEY,
