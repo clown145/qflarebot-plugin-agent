@@ -136,6 +136,11 @@ describe('单聊', () => {
 })
 
 describe('不该唤醒的情况', () => {
+  it.each(['/你好', '/skill report 写周报', '你好'])('明确发给别人/全体的消息不被前缀或技能入口重新唤醒：%s', (content) => {
+    expect(decideWake(session({ content, addressedToOthers: true, atMe: false }), config()))
+      .toEqual({ wake: false, reason: 'addressed-to-others' })
+  })
+
   it('机器人自己发的消息', () => {
     expect(decideWake(session({ userId: 'BOT' }), config())).toMatchObject({ wake: false, reason: 'bot-self' })
   })

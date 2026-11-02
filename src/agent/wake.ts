@@ -12,11 +12,11 @@
  *
  * 所以插件必须自己判断「这条该不该理」，否则开了全量消息的群会被刷屏。
  *
- * ## 判定顺序（与 AstrBot 一致，逐条短路）
+ * ## 判定顺序（参考 AstrBot；本插件固定忽略单纯 @全体，不自动唤醒引用回复）
  *
  * 1. 机器人自己发的消息 → 不理（避免自问自答）
- * 2. 空消息（正文与附件都没有）→ 不理
- * 3. **带指令前缀** → 交给指令路径，不进模型（`/agent status` 不该被当成聊天）
+ * 2. 群/频道明确发给别人或全体的消息 → 不理（即使清理后的正文带唤醒前缀）
+ * 3. 空消息（正文与附件都没有）→ 不理；已命中指令的消息由宿主先行消费
  * 4. **私聊**：默认全部唤醒；开了 `friend_needs_wake_prefix` 才要求前缀
  * 5. **群聊 / 频道**：
  *    - **@ 了机器人**（`atMe`）→ 唤醒
@@ -48,7 +48,7 @@ import type { AgentConfig } from '../config/index.js'
 
 /** 唤醒结果：不唤醒时给出原因，便于日志与排障 */
 export type WakeDecision =
-  | { wake: false; reason: 'bot-self' | 'empty' | 'command' | 'not-mentioned' | 'not-woken' }
+  | { wake: false; reason: 'bot-self' | 'empty' | 'command' | 'not-mentioned' | 'not-woken' | 'addressed-to-others' }
   | { wake: true; reason: 'at' | 'prefix' | 'private' | 'skill'; text: string }
 
 /**
@@ -91,6 +91,8 @@ function wakePrefix(config: AgentConfig): string {
  */
 export function decideWake(session: Session, config: AgentConfig): WakeDecision {
   if (isBotSelf(session)) return { wake: false, reason: 'bot-self' }
+  // 必须在 /skill 和普通前缀之前判断；content 已经去掉 @，不能据此重新猜收件人。
+  if (session.addressedToOthers) return { wake: false, reason: 'addressed-to-others' }
 
   const raw = session.content ?? ''
   if (!raw.trim() && !(session.attachments?.length ?? 0)) return { wake: false, reason: 'empty' }

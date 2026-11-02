@@ -592,7 +592,7 @@ async function onChatMessage({
   const decision = decideWake(session, config)
   if (!decision.wake) {
     // not-mentioned 是常态（群全量消息里绝大多数没 @ 机器人），不打日志免得刷屏
-    if (decision.reason !== 'not-mentioned' && decision.reason !== 'command') {
+    if (decision.reason !== 'not-mentioned' && decision.reason !== 'command' && decision.reason !== 'addressed-to-others') {
       ctx.logger.debug('消息不唤醒 Agent', { reason: decision.reason, scene: session.scene })
     }
     return

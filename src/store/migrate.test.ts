@@ -6,7 +6,7 @@
  * 另外有一条**契约测试**直接扫 `COLUMN_MIGRATIONS`：新增的列必须同时出现在
  * `schema.ts` 的建表语句里（新库靠建表、老库靠迁移，两边不能漂）。
  */
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PluginDB } from '@qqbot/sdk'
 import { scopeSql, flattenForExec, tablePrefix } from '@qqbot/sdk/sqlScope'
 import { DatabaseSync } from 'node:sqlite'
@@ -315,6 +315,11 @@ describe('config_json 默认值语义', () => {
  * （vitest 默认即 node 环境，这里显式写上是为了将来若切 jsdom 时不至于静默坏掉）。
  */
 describe('插件 onBoot 的升级路径（端到端）', () => {
+  beforeEach(() => {
+    // 每个用例是独立部署；不能继承另一个数据库的进程内 schemaReady 标记。
+    vi.resetModules()
+  })
+
   it('老库跑一遍 onBoot 后 config_json 被补上，且 getToolSettings 不再报错', async () => {
     const t = createLegacyDb()
     const logger = recordingLogger()

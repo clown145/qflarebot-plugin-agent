@@ -29,6 +29,8 @@ let removeListeners: () => void
 
 beforeEach(() => {
   vi.useFakeTimers()
+  // 标签切换会写入 hash；新用例从同一入口开始，避免继承上一次选中的隐藏面板。
+  history.replaceState(null, '', location.pathname)
   document.body.innerHTML = PAGE_HTML_BODY
   vi.stubGlobal('requestAnimationFrame', () => 0)
   const listeners = vi.spyOn(window, 'addEventListener')
