@@ -29,7 +29,7 @@ jobs:
         with:
           repository: QFlareBot/QFlareBot
           path: QFlareBot
-          ref: ${{ vars.QFLAREBOT_REF || '9136dbaeff68c301480d0049cc2ecb6b50401753' }}
+          ref: ${{ vars.QFLAREBOT_REF || 'd42ff1ee3aa5876cfa6b49ac6b671ce9340779ee' }}
 
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
@@ -107,7 +107,7 @@ jobs:
         with:
           repository: QFlareBot/QFlareBot
           path: QFlareBot
-          ref: ${{ vars.QFLAREBOT_REF || '9136dbaeff68c301480d0049cc2ecb6b50401753' }}
+          ref: ${{ vars.QFLAREBOT_REF || 'd42ff1ee3aa5876cfa6b49ac6b671ce9340779ee' }}
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
         with:
           package_json_file: QFlareBot/package.json
