@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { hydrateImageAttachments } from './media.js'
 import type { MessageAttachment } from '../types.js'
 
@@ -212,6 +212,48 @@ describe('图片体积的两道闸', () => {
   })
 })
 
+describe('下载阶段就执行图片大小限制', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('声明的长度超限时取消响应体，不读取文件', async () => {
+    const pull = vi.fn()
+    const cancel = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), {
+      headers: { 'content-length': '900000' },
+    })))
+    const result = await hydrateImageAttachments([{ type: 'image', url: 'https://example.com/big.png' }])
+    expect(pull).not.toHaveBeenCalled()
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(result.attachments).toEqual([])
+    expect(result.notes.join()).toContain('太大')
+  })
+
+  it('没有长度头或长度头不可信时，读到上限就取消后续流', async () => {
+    const cancel = vi.fn()
+    const pull = vi.fn((controller: ReadableStreamDefaultController<Uint8Array>) => {
+      controller.enqueue(new Uint8Array(400_000))
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), {
+      headers: { 'content-length': '1' },
+    })))
+    const result = await hydrateImageAttachments([{ type: 'image', url: 'https://example.com/big.png' }])
+    expect(pull).toHaveBeenCalledTimes(3)
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(result.attachments).toEqual([])
+    expect(result.notes.join()).toContain('太大')
+  })
+
+  it('泛用二进制 MIME 不盖掉下载响应中的真实图片 MIME', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array([1]), {
+      headers: { 'content-type': 'image/png' },
+    })))
+    const result = await hydrateImageAttachments([
+      { type: 'image', url: 'https://example.com/a.png', contentType: 'application/octet-stream', source: 'quote' },
+    ])
+    expect(result.attachments[0]).toMatchObject({ contentType: 'image/png', source: 'quote' })
+  })
+})
+
 /**
  * 回归：图片下载完全不校验 URL、不逐跳、无超时。
  *
@@ -266,11 +308,11 @@ describe('图片下载的 SSRF 防护与逐跳校验', () => {
   })
 
   it('用 manual 模式逐跳跟随：公网重定向照常拿到图片', async () => {
-    const calls: Array<{ url: string; redirect?: string }> = []
+    const calls: Array<{ url: string; redirect?: string; signal?: AbortSignal }> = []
     vi.stubGlobal(
       'fetch',
-      vi.fn(async (url: string, init?: { redirect?: string }) => {
-        calls.push({ url: String(url), redirect: init?.redirect })
+      vi.fn(async (url: string, init?: { redirect?: string; signal?: AbortSignal }) => {
+        calls.push({ url: String(url), redirect: init?.redirect, signal: init?.signal })
         if (calls.length === 1) {
           return new Response('', { status: 301, headers: { location: 'https://cdn.example.com/b.png' } })
         }
@@ -290,6 +332,8 @@ describe('图片下载的 SSRF 防护与逐跳校验', () => {
       // 每一跳都是 manual，插件自己解析 Location 并校验
       expect(calls.every((c) => c.redirect === 'manual')).toBe(true)
       expect(calls[1]?.url).toBe('https://cdn.example.com/b.png')
+      expect(calls[0]?.signal).toBeInstanceOf(AbortSignal)
+      expect(calls[1]?.signal).toBe(calls[0]?.signal)
     } finally {
       vi.unstubAllGlobals()
     }

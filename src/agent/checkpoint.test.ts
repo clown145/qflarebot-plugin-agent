@@ -64,6 +64,7 @@ describe('长任务分段执行', () => {
     Object.assign(restarted, { ctx: { storage } })
     const resumed = await restarted.poll()
     expect(resumed.runId).toBe(claimed.runId)
+    const saveCheckpoint = vi.spyOn(restarted, 'saveCheckpoint')
     expect(await executeRun({ ...deps, agent: restarted, leaseId: resumed.leaseId, deadline: now + 55_000 }, resumed.runId!, resumed.message!)).toMatchObject({ ok: true })
     expect(chat).toHaveBeenCalledTimes(2)
     expect(chat.mock.calls[1]?.[0].messages).toEqual(expect.arrayContaining([expect.objectContaining({ role: 'tool', tool_call_id: 'create-1' })]))
@@ -74,7 +75,8 @@ describe('长任务分段执行', () => {
       thought_signatures: [{ part_index: 0, part_kind: 'function_call', signature: 'gemini-signature', tool_call_id: 'create-1', tool_name: 'schedule.create' }],
     })
     expect((await store.db.all('SELECT id FROM {schedules}')).length).toBe(1)
-    expect((await restarted.checkpoint(resumed.runId!))?.result).toMatchObject({ steps: 2, toolCalls: 1, usage: { inputTokens: 30 } })
+    expect(saveCheckpoint.mock.calls.at(-1)?.[1].result).toMatchObject({ steps: 2, toolCalls: 1, usage: { inputTokens: 30 } })
+    expect(await restarted.checkpoint(resumed.runId!)).toBeNull()
     expect(reply).toHaveBeenCalledTimes(1)
     const nextMessage = { ...message, text: '继续', receivedAt: now }
     const next = await restarted.submit(nextMessage)

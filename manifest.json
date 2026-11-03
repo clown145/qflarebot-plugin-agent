@@ -1,6 +1,6 @@
 {
   "name": "agent",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "apiVersion": 2,
   "permissions": [
     "net",

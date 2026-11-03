@@ -460,8 +460,9 @@ export default definePlugin<AgentConfig>({
     skill: {
       description: '查看可用技能，或激活一个技能',
       usage: '/skill [<id> [任务]]',
-      async handler({ ctx, argText }) {
-        if (!(await resolveConfig(ctx)).enable_skills) {
+      async handler({ session, ctx, argText }) {
+        const cfg = await resolveConfig(ctx)
+        if (!cfg.enable_skills) {
           return '技能功能没开。请先在插件配置里打开「启用技能」。'
         }
         const arg = argText.trim()
@@ -492,8 +493,9 @@ export default definePlugin<AgentConfig>({
               '用它：/skill ' + skill.id + ' <你的任务>',
             ].join('\n')
           }
-          // 带任务：提示用户改用聊天路径（那里才会真正注入正文）
-          return `请直接发：/@我 /skill ${skill.id} ${task}`
+          // 命令由框架消费后不会再分发给聊天事件；带任务时直接进入同一条入站路径，保留引用和附件。
+          await handleMessage(session, ctx, `/skill ${arg}`, cfg)
+          return undefined
         } catch (error) {
           return error instanceof Error ? error.message : String(error)
         }
@@ -627,7 +629,7 @@ async function admitInbound(
   // 这是**零成本**护栏：纯文本匹配，没有额外请求、没有额外存储。
   const keywords = parseKeywords(config.content_filter_keywords)
   if (keywords.length > 0) {
-    const check = checkContent(text, keywords)
+    const check = checkContent([text, session.quote?.content].filter(Boolean).join('\n'), keywords)
     if (check.blocked) {
       logger.warn('入站内容命中安全关键词，已拒绝', {
         conversation: conversationKey(session),
@@ -673,21 +675,26 @@ async function resolveLlmOrExplain(
 async function prepareInbound(
   session: Session,
   text: string,
-  isolateSessions = false,
+  config: AgentConfig,
+  llm: LLMService,
 ): Promise<InboundMessage> {
-  const message = toInboundMessage(session, isolateSessions)
+  const message = toInboundMessage(session, config.isolate_sessions)
 
   // 事件里拿到的正文可能带 /agent 前缀，剥掉
   const cleaned = text.replace(/^\/agent\s*/i, '').trim()
-  if (cleaned) message.text = cleaned
+  if (cleaned || session.quote) message.text = cleaned
 
   // 取不到图片就把说明拼进正文，别让整条消息失败
   if (message.attachments.some((a) => a.type === 'image')) {
+    // 非视觉模型只保留链接和能力说明，避免白下载、编码并持久化整张图片。
+    const model = await llm.resolve(config.model).catch(() => null)
+    if (!model?.capabilities.includes('image')) return message
     const hydrated = await hydrateImageAttachments(message.attachments)
     message.attachments = hydrated.attachments
     if (hydrated.notes.length) {
-      message.text = `${message.text}\n\n（${hydrated.notes.join('；')}）`.trim()
-      message.displayText = message.text
+      const note = `（${hydrated.notes.join('；')}）`
+      message.text = `${message.text}\n\n${note}`.trim()
+      message.displayText = `${message.displayText}\n\n${note}`.trim()
     }
   }
   return message
@@ -714,7 +721,7 @@ async function handleMessage(
   const llm = await resolveLlmOrExplain(session, ctx)
   if (!llm) return
 
-  const message = await prepareInbound(session, text, config.isolate_sessions)
+  const message = await prepareInbound(session, text, config, llm)
   const tools = config.enable_tools ? coreTools(ctx) : null
   if (tools) {
     try { message.toolInvocation = await tools.capture() }

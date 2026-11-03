@@ -91,6 +91,16 @@ describe('群聊：只认 @机器人 与 唤醒前缀', () => {
     expect(decideWake(quoted, config())).toMatchObject({ wake: true, reason: 'at' })
   })
 
+  it.each([true, false])('仅引用图片，没有文字时仍以当前自身艾特决定唤醒：%s', atMe => {
+    const quoted = session({
+      atMe, content: '',
+      quote: { messageId: 'q1', refIndex: undefined, content: '/skill report', attachments: [{ url: 'https://example.com/a.png' }] },
+    })
+    expect(decideWake(quoted, config())).toEqual(atMe
+      ? { wake: true, reason: 'at', text: '' }
+      : { wake: false, reason: 'not-mentioned' })
+  })
+
   it('没有 @ 也没有前缀时，附件消息也不唤醒', () => {
     expect(
       decideWake(session({ atMe: false, content: '', attachments: [{ url: 'https://x/a.png' }] }), config()),

@@ -16,6 +16,7 @@ import type { LLMService } from '../llm/contract.js'
 import type { ToolRegistry } from '../tools/registry.js'
 import type { RegisteredTool } from '../tools/types.js'
 import { buildMessages } from './context.js'
+import { withQuotedText } from './inbound.js'
 import {
   describeLoopError,
   LoopCancelledError,
@@ -285,6 +286,7 @@ async function runLoopOnce(input: {
     ? input.checkpoint.historyInput
     : {
         text: effectiveMessage.text,
+        ...(effectiveMessage.quotedText !== undefined ? { quotedText: effectiveMessage.quotedText } : {}),
         scene: effectiveMessage.scene,
         receivedAt: effectiveMessage.receivedAt,
       }
@@ -579,7 +581,7 @@ export async function executeRun(
         ...(checkpoint?.historyInput ? { input: checkpoint.historyInput } : {}),
         ...(message.passiveMessageId ? { messageId: message.passiveMessageId } : {}),
         ...(message.attachments.length ? { attachments: message.attachments } : {}),
-        content: message.displayText || message.text,
+        content: withQuotedText(message.displayText || message.text, message.quotedText),
         toolCallsJson: null,
         createdAt: now,
       },

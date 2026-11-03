@@ -24,6 +24,7 @@ import { fixMessages, summaryMessages, type StoredSummary } from './context-size
 import { buildActiveSkillPrompt, buildSkillCatalogPrompt } from '../skills/context.js'
 import type { LoadedSkill, SkillCatalogItem } from '../skills/store.js'
 import { speakerLabel } from './history.js'
+import { withQuotedText } from './inbound.js'
 
 export interface ContextOptions {
   systemPrompt?: string
@@ -271,7 +272,7 @@ function buildSystemReminder(
 function buildUserMessage(
   message: Pick<
     InboundMessage,
-    'text' | 'attachments' | 'userId' | 'userName' | 'receivedAt' | 'scene'
+    'text' | 'quotedText' | 'attachments' | 'userId' | 'userName' | 'receivedAt' | 'scene'
   >,
   options: ContextOptions,
 ): ModelMessage {
@@ -430,20 +431,27 @@ function neutralizeParts(parts: ModelContentPart[]): ModelContentPart[] {
   )
 }
 
-function buildUserContent(message: Pick<InboundMessage, 'text' | 'attachments'>, supportsVision: boolean): ModelContent {
+function buildUserContent(message: Pick<InboundMessage, 'text' | 'quotedText' | 'attachments'>, supportsVision: boolean): ModelContent {
   const images = message.attachments.filter((a) => a.type === 'image')
+  const attachmentNotes = message.attachments.filter(a => a.type !== 'image').map(a =>
+    `（${a.source === 'quote' ? '引用消息' : '当前消息'}附件：${a.filename || a.type} ${a.url ?? ''}；未解析文件内容）`,
+  )
+  const text = [withQuotedText(message.text, message.quotedText), ...attachmentNotes].filter(Boolean).join('\n\n')
 
   // 没有图片，或者模型不吃图片：退回纯文本，把图片地址写进正文
   if (images.length === 0 || !supportsVision) {
     const imageNote = images.length
       ? `\n\n（用户发了 ${images.length} 张图片，但当前模型不支持图片输入：${images.map((i) => i.url ?? '').join(' ')}）`
       : ''
-    return `${message.text}${imageNote}`
+    return `${text}${imageNote}`
   }
 
   const parts: ModelContentPart[] = []
-  if (message.text) parts.push({ type: 'text', text: message.text })
+  if (text) parts.push({ type: 'text', text })
   for (const image of images) {
+    if (message.quotedText !== undefined && (image.dataBase64 || image.url)) {
+      parts.push({ type: 'text', text: image.source === 'quote' ? '引用消息中的图片：' : '当前消息中的图片：' })
+    }
     if (image.dataBase64) {
       parts.push({
         type: 'image',
@@ -454,7 +462,7 @@ function buildUserContent(message: Pick<InboundMessage, 'text' | 'attachments'>,
       parts.push({ type: 'image', url: image.url })
     }
   }
-  return parts.length ? parts : message.text
+  return parts.length ? parts : text
 }
 
 /**

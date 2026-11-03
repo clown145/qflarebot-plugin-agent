@@ -6,23 +6,53 @@
  * 这里 QFlareBot 已经把 QQ 平台的事做完了（验签、事件标准化、msg_seq 配额、
  * 引用、撤回、键盘），插件只需要读 `session` 的字段。
  *
- * 所以这层只有几十行，而不是几千行——这是选插件形态最大的收益之一。
+ * 正文和引用在这里分别归一化，媒体下载与持久化交给已有的后续流程。
  */
-import type { Session } from '@qqbot/sdk'
+import type { Attachment, Session } from '@qqbot/sdk'
 import type { InboundMessage, MessageAttachment, ReplyScene } from '../types.js'
 
-/** 只处理真正带内容的文本消息；事件类（入群、按钮）走各自的处理器 */
+/** 有正文、附件或引用可供处理；是否唤醒仍由当前消息的 @ / 前缀决定。 */
 export function isTextMessage(session: Session): boolean {
-  return Boolean(session.content?.trim()) || (session.attachments?.length ?? 0) > 0
+  return Boolean(session.content?.trim()) || (session.attachments?.length ?? 0) > 0 || Boolean(session.quote)
 }
 
 export function toInboundMessage(session: Session, isolateSessions = false): InboundMessage {
-  const attachments: MessageAttachment[] = (session.attachments ?? []).map((attachment) => ({
-    type: classifyAttachment(attachment.contentType, attachment.filename),
-    url: attachment.url,
-    ...(attachment.contentType ? { contentType: attachment.contentType } : {}),
-    ...(attachment.filename ? { filename: attachment.filename } : {}),
-  }))
+  // 与 AstrBot 的 Reply 附件处理一致：引用图片与当前图片一起进入模型，并按地址去重。
+  // 当前消息优先；重复条目仍可补齐平台只在引用里下发的 MIME / 文件名。
+  const attachments: MessageAttachment[] = []
+  const byUrl = new Map<string, MessageAttachment>()
+  const append = (items: readonly Attachment[], source?: 'quote') => {
+    for (const attachment of items) {
+      const contentType = attachment.contentType?.split(';')[0]?.trim().toLowerCase()
+      const item: MessageAttachment = {
+        type: classifyAttachment(attachment),
+        url: attachment.url,
+        ...(source ? { source } : {}),
+        ...(contentType ? { contentType } : {}),
+        ...(attachment.filename ? { filename: attachment.filename } : {}),
+      }
+      const known = byUrl.get(attachment.url)
+      if (known) {
+        const generic = known.type === 'unknown' || (known.type === 'file' && known.contentType === 'application/octet-stream')
+        if (generic && item.type !== 'unknown') known.type = item.type
+        if (item.contentType && (!known.contentType || known.contentType === 'application/octet-stream')) {
+          known.contentType = item.contentType
+        }
+        if (!known.filename && item.filename) known.filename = item.filename
+      } else {
+        attachments.push(item)
+        byUrl.set(attachment.url, item)
+      }
+    }
+  }
+  append(session.attachments ?? [])
+  append(session.quote?.attachments ?? [], 'quote')
+
+  const quotedText = session.quote
+    ? session.quote.content.trim() || (session.quote.attachments.length
+        ? '（引用消息没有文字，附带的图片或文件见下方）'
+        : '（平台未提供被引用消息的正文或附件）')
+    : undefined
 
   return {
     conversation: conversationKey(session, isolateSessions),
@@ -30,6 +60,7 @@ export function toInboundMessage(session: Session, isolateSessions = false): Inb
     userName: session.userName ?? '',
     text: session.content ?? '',
     displayText: session.displayContent ?? session.content ?? '',
+    ...(quotedText !== undefined ? { quotedText } : {}),
     attachments,
     // 被动回复凭据：msg_id 优先，没有的话用 event_id（事件类）
     ...(session.messageId ? { passiveMessageId: session.messageId } : {}),
@@ -38,6 +69,12 @@ export function toInboundMessage(session: Session, isolateSessions = false): Inb
     targetId: session.targetId,
     receivedAt: Date.now(),
   }
+}
+
+/** 引用单独标注为上下文，不能被当成当前发起人的话或技能指令。 */
+export function withQuotedText(text: string, quotedText?: string): string {
+  if (quotedText === undefined) return text
+  return [text, `[引用消息，仅作上下文]\n${quotedText}\n[/引用消息]`].filter(Boolean).join('\n\n')
 }
 
 /**
@@ -94,15 +131,17 @@ function toReplyScene(scene: Session['scene']): ReplyScene {
   }
 }
 
-function classifyAttachment(contentType?: string, filename?: string): MessageAttachment['type'] {
-  const type = (contentType ?? '').toLowerCase()
+function classifyAttachment(attachment: Attachment): MessageAttachment['type'] {
+  const type = (attachment.contentType ?? '').split(';')[0]!.trim().toLowerCase()
   if (type.startsWith('image/')) return 'image'
   if (type.startsWith('audio/')) return 'audio'
   if (type.startsWith('video/')) return 'video'
-  if (type) return 'file'
+  if (type && type !== 'application/octet-stream') return 'file'
 
   // 没有 contentType 时按扩展名猜。QQ 的图片消息有时不带 content-type
-  const ext = filename?.toLowerCase().split('.').pop()
-  if (ext && ['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) return 'image'
-  return 'unknown'
+  let path = ''
+  try { path = new URL(attachment.url).pathname } catch { /* 非法 URL 由下载层拒绝 */ }
+  if (/\.(?:png|jpe?g|gif|webp|bmp|avif)$/i.test(attachment.filename ?? '') ||
+      /\.(?:png|jpe?g|gif|webp|bmp|avif)$/i.test(path)) return 'image'
+  return type ? 'file' : 'unknown'
 }

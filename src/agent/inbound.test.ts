@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Session } from '@qqbot/sdk'
-import { conversationKey, toInboundMessage } from './inbound.js'
+import { conversationKey, isTextMessage, toInboundMessage, withQuotedText } from './inbound.js'
 
 /**
  * 会话键与「按成员隔离」（对标 AstrBot 的 `unique_session`）。
@@ -49,6 +49,70 @@ describe('conversationKey：默认行为（不隔离）', () => {
     expect(conversationKey(session({ scene: 'guild_dm', targetId: 'user-1' }))).toBe(
       'guild_dm:user-1',
     )
+  })
+})
+
+describe('引用内容进入上下文，当前正文仍独立', () => {
+  it('引用中的指令和艾特保留为原文，不改写当前问题或当前说话人', () => {
+    const message = toInboundMessage(session({
+      content: '/看看这张图',
+      displayContent: '/看看这张图 @朋友',
+      quote: {
+        messageId: 'old', refIndex: undefined, content: '<@everyone> /skill report 原来的话',
+        attachments: [{ url: 'https://example.com/quote.png', contentType: 'image/png' }],
+      },
+    }))
+    expect(message).toMatchObject({
+      text: '/看看这张图', displayText: '/看看这张图 @朋友', userId: 'openid-a',
+      quotedText: '<@everyone> /skill report 原来的话',
+      attachments: [{ type: 'image', source: 'quote', url: 'https://example.com/quote.png' }],
+    })
+    expect(withQuotedText('当前问题', message.quotedText)).toContain('[引用消息，仅作上下文]\n<@everyone> /skill')
+  })
+
+  it('当前和引用的重复附件只保留一份，并用引用元数据补齐图片类型', () => {
+    const message = toInboundMessage(session({
+      attachments: [{ url: 'https://example.com/media' }],
+      quote: {
+        messageId: 'old', refIndex: undefined, content: '', attachments: [
+          { url: 'https://example.com/media', contentType: 'image/png', filename: 'photo.png' },
+          { url: 'https://example.com/second.JPG?signature=abc' },
+          { url: 'https://example.com/report.pdf', contentType: 'application/pdf' },
+        ],
+      },
+    }))
+    expect(message.attachments).toEqual([
+      { type: 'image', url: 'https://example.com/media', contentType: 'image/png', filename: 'photo.png' },
+      { type: 'image', source: 'quote', url: 'https://example.com/second.JPG?signature=abc' },
+      { type: 'file', source: 'quote', url: 'https://example.com/report.pdf', contentType: 'application/pdf' },
+    ])
+  })
+
+  it('只含引用也有内容可供处理，只有引用 ID 时明确说明内容缺失', () => {
+    const s = session({ content: '', quote: { messageId: 'old', refIndex: undefined, content: '', attachments: [] } })
+    expect(isTextMessage(s)).toBe(true)
+    expect(toInboundMessage(s).quotedText).toContain('平台未提供')
+    expect(toInboundMessage(session())).not.toHaveProperty('quotedText')
+    expect(withQuotedText('普通消息')).toBe('普通消息')
+  })
+
+  it('缺少元信息的重复引用不能把已识别的图片降级为未知附件', () => {
+    const url = 'https://example.com/media'
+    const message = toInboundMessage(session({
+      attachments: [{ url, filename: 'photo.png', contentType: 'Application/Octet-Stream; charset=binary' }],
+      quote: { messageId: 'old', refIndex: undefined, content: '', attachments: [{ url }] },
+    }))
+    expect(message.attachments).toEqual([
+      { type: 'image', url, filename: 'photo.png', contentType: 'application/octet-stream' },
+    ])
+  })
+
+  it('通用二进制 MIME 的图片可按文件名识别，真实文件不误当图片', () => {
+    const message = toInboundMessage(session({ attachments: [
+      { url: 'https://example.com/blob', filename: 'photo.webp', contentType: 'application/octet-stream' },
+      { url: 'https://example.com/file.png', contentType: 'application/pdf' },
+    ] }))
+    expect(message.attachments.map(a => a.type)).toEqual(['image', 'file'])
   })
 })
 

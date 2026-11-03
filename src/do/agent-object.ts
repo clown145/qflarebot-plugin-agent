@@ -336,6 +336,7 @@ export class Agent extends PluginDurableObject {
           ...run,
           status: cancelled ? 'cancelled' : result.ok ? 'completed' : 'failed',
           error: result.error,
+          inputJson: '',
           lockedUntil: undefined,
           updatedAt: now,
         } satisfies RunRecord)
@@ -345,6 +346,13 @@ export class Agent extends PluginDurableObject {
       // 这一轮是旧上下文的产物。队列里被取消的 run 同样不再执行（claim 只认 pending）。
       if (!cancelled && result.history?.length) {
         await this.appendHistory(result.history, storage)
+      }
+
+      // 终态不再恢复执行。与历史写入处于同一事务，提交后只保留历史需要的图片，
+      // 不让入站 payload 和每步检查点的副本一直占用空间到 cron 清理。
+      if (run) {
+        await deleteValue(storage, `checkpoint:${runId}`)
+        await deleteValue(storage, `input:${runId}`)
       }
 
       // **只删自己的锁**。

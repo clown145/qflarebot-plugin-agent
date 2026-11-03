@@ -25,6 +25,8 @@ export interface InboundMessage {
   text: string
   /** 展示用正文（保留其他人的 @，见 session.displayContent） */
   displayText: string
+  /** 被引用的原文或缺失说明；只作模型上下文，不参与当前指令/技能解析 */
+  quotedText?: string
   /** 附件（图片等），已转成模型能吃的形状 */
   attachments: MessageAttachment[]
   /** 被动回复凭据：QQ 的 msg_id，群聊 5 分钟 / 单聊 60 分钟内可用来回复 */
@@ -43,10 +45,12 @@ export interface InboundMessage {
 export type ReplyScene = 'group' | 'c2c' | 'guild' | 'guild_dm' | 'unknown'
 
 /** 历史回放所需的原始输入；正文已经过技能指令处理，身份和附件复用历史行。 */
-export type HistoryUserInput = Pick<InboundMessage, 'text' | 'scene' | 'receivedAt'>
+export type HistoryUserInput = Pick<InboundMessage, 'text' | 'quotedText' | 'scene' | 'receivedAt'>
 
 export interface MessageAttachment {
   type: 'image' | 'file' | 'audio' | 'video' | 'unknown'
+  /** 缺省是当前消息附件；引用附件共用下载、队列和历史存储 */
+  source?: 'quote'
   url?: string
   contentType?: string
   filename?: string

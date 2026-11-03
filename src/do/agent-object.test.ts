@@ -1,9 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PluginDurableObject } from '@qqbot/sdk'
 import { Agent, LEASE_MS, MAX_ATTEMPTS } from './agent-object.js'
 import { makeObject } from './agent-test-object.js'
 import type { HistoryRow } from './agent-object.js'
 import type { InboundMessage } from '../types.js'
+import type { LoopCheckpoint } from '../agent/loop.js'
+
+afterEach(() => { vi.restoreAllMocks() })
 
 /**
  * Agent 的双段式调度核心。
@@ -165,6 +168,74 @@ describe('Agent.release', () => {
     const { obj } = makeObject()
     const { runId } = await obj.submit(message())
     await obj.release(runId!, { ok: false, error: '失败' })
+    expect(await obj.history(10)).toEqual([])
+  })
+})
+
+describe('Agent.release 图片回收', () => {
+  async function imageRun() {
+    const { obj, storage } = makeObject()
+    const dataBase64 = 'A'.repeat(160_000)
+    const input = message({ attachments: [{ type: 'image', dataBase64, contentType: 'image/png', source: 'quote' }] })
+    const claim = await obj.submit(input)
+    const checkpoint: LoopCheckpoint = {
+      version: 1,
+      messages: [{ role: 'user', content: [{ type: 'image', data: dataBase64, mediaType: 'image/png' }] }],
+      steps: 1, usedToolCalls: 0, repliedByTool: false,
+      usage: { inputTokens: 0, outputTokens: 0 },
+      compactedRounds: 0, droppedForSummary: [], contextTokens: 0,
+      toolTraces: [], outbound: [], pending: [],
+    }
+    expect(await obj.saveCheckpoint(claim.runId!, checkpoint, claim.leaseId)).toBe(true)
+    return { obj, storage, input, claim, checkpoint }
+  }
+
+  it.each(['completed', 'failed', 'cancelled'] as const)('%s 后删除临时图片，成功历史仍可读取', async status => {
+    const { obj, storage, input, claim } = await imageRun()
+    if (status === 'cancelled') await obj.stop()
+    const row = { ...historyRow('user', '引用这张图'), attachments: input.attachments }
+    await obj.release(claim.runId!, {
+      ok: status === 'completed', leaseId: claim.leaseId,
+      ...(status === 'completed' ? { history: [row] } : {}),
+    })
+    expect(await obj.runStatus(claim.runId!)).toBe(status)
+    expect(await obj.checkpoint(claim.runId!)).toBeNull()
+    expect(await storage.get(`input:${claim.runId}`)).toBeUndefined()
+    expect(await storage.get(`run:${claim.runId}`)).toMatchObject({ inputJson: '' })
+    const history = await obj.history(10)
+    if (status === 'completed') {
+      expect(history[0]?.attachments).toEqual(input.attachments)
+      await obj.reset()
+    } else {
+      expect(history).toEqual([])
+    }
+    expect((await storage.list({ prefix: 'blob:' })).size).toBe(0)
+  })
+
+  it('过期租约不能清除仍在执行的输入和检查点', async () => {
+    const { obj, storage, claim, checkpoint } = await imageRun()
+    const before = structuredClone(storage.map)
+    await obj.release(claim.runId!, { ok: true, leaseId: 'stale-lease' })
+    expect(storage.map).toEqual(before)
+    expect(await obj.checkpoint(claim.runId!)).toEqual(checkpoint)
+    expect(await obj.ownsLease(claim.runId!, claim.leaseId!)).toBe(true)
+  })
+
+  it('回收失败时回滚历史和终态，输入及检查点仍能恢复', async () => {
+    const { obj, storage, input, claim, checkpoint } = await imageRun()
+    const before = structuredClone(storage.map)
+    const originalDelete = storage.delete.bind(storage)
+    vi.spyOn(storage, 'delete').mockImplementation(async key => {
+      if (key === `input:${claim.runId}`) throw new Error('模拟存储失败')
+      return originalDelete(key)
+    })
+    await expect(obj.release(claim.runId!, {
+      ok: true, leaseId: claim.leaseId,
+      history: [{ ...historyRow('user', '引用这张图'), attachments: input.attachments }],
+    })).rejects.toThrow('模拟存储失败')
+    expect(storage.map).toEqual(before)
+    expect(await obj.runStatus(claim.runId!)).toBe('running')
+    expect(await obj.checkpoint(claim.runId!)).toEqual(checkpoint)
     expect(await obj.history(10)).toEqual([])
   })
 })

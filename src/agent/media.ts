@@ -7,7 +7,7 @@
  * QQ 的图片 URL 带签名且**有效期很短**（几分钟到几小时），而 agent loop 可能
  * 在 cron 段才跑到（最坏 5 分钟后）。直接把 URL 交给上游，等模型真要读时可能已经 403。
  *
- * 所以入站时就把图片取回来（此时签名一定有效），转成 base64 存进消息里。
+ * 所以视觉模型的入站消息尽早取图，转成 base64 存进消息里，减少排队期间链接过期的风险。
  *
  * ## 体积限制从哪来
  *
@@ -24,7 +24,7 @@
  *   上游的规矩，不该由我们替它赌。
  *
  * 所以这里用**两道闸**：单张上限挡掉个别大图，总量上限挡掉「4 张中等图叠起来
- * 依然过大」这种组合。超限的图不下载、只留一句说明，整条对话不受影响。
+ * 依然过大」这种组合。超限的图停止读取并跳过、只留一句说明，整条对话不受影响。
  */
 import type { MessageAttachment } from '../types.js'
 import { validateFetchUrl } from '../tools/http/url-safety.js'
@@ -79,34 +79,79 @@ async function downloadImage(url: string): Promise<{
   contentType: string | null
 }> {
   let current = url
+  // 所有重定向共用一次下载预算，不能每跳重新获得 5 秒。
+  const signal = AbortSignal.timeout(IMAGE_TIMEOUT_MS)
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
     const invalid = validateFetchUrl(current)
     if (invalid) throw new Error(`图片地址被拒绝：${invalid}`)
 
     const response = await fetch(current, {
       redirect: 'manual',
-      signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS),
+      signal,
     })
 
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location')
+      await response.body?.cancel()
       if (!location) throw new Error(`图片地址返回 ${response.status} 但没有 Location`)
       current = new URL(location, current).toString()
       continue
     }
 
     if (!response.ok) {
+      await response.body?.cancel()
       // 保留原来的文案（调用方拼进 notes 给模型看），只是前面多了逐跳校验
       throw new HttpStatusError(response.status)
     }
 
     return {
-      bytes: await response.arrayBuffer(),
+      bytes: await readImageBytes(response),
       contentType: response.headers.get('content-type'),
     }
   }
 
   throw new Error(`图片地址重定向超过 ${MAX_REDIRECTS} 次`)
+}
+
+/** 边读边限量，超限立即取消；不能下载完整大文件后才检查大小。 */
+async function readImageBytes(response: Response): Promise<ArrayBuffer> {
+  const declared = Number(response.headers.get('content-length'))
+  if (declared > MAX_IMAGE_BYTES) {
+    await response.body?.cancel()
+    throw new ImageTooLargeError(declared)
+  }
+  if (!response.body) return new ArrayBuffer(0)
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > MAX_IMAGE_BYTES) {
+        await reader.cancel()
+        throw new ImageTooLargeError(size)
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return bytes.buffer
+}
+
+class ImageTooLargeError extends Error {
+  constructor(readonly bytes: number) {
+    super('图片太大')
+    this.name = 'ImageTooLargeError'
+  }
 }
 
 /** 只用来区分「HTTP 状态码不对」与其它错误，文案在 catch 里统一拼 */
@@ -130,6 +175,9 @@ export async function hydrateImageAttachments(
   const rest = attachments.filter((a) => a.type !== 'image')
 
   const notes: string[] = []
+  if (attachments.filter(a => a.type === 'image').length > MAX_IMAGES) {
+    notes.push(`图片超过 ${MAX_IMAGES} 张，其余没有读取`)
+  }
   const hydrated: MessageAttachment[] = []
   /** 已收下图片的原始字节总和（base64 前的口径） */
   let totalBytes = 0
@@ -139,6 +187,10 @@ export async function hydrateImageAttachments(
     // 不折回来就会漏算——一张已有的 700 KB 图 + 三张新图还是可能超限。
     if (image.dataBase64) {
       const rawEstimate = Math.ceil((image.dataBase64.length * 3) / 4)
+      if (rawEstimate > MAX_IMAGE_BYTES) {
+        notes.push(`有一张图片太大（${Math.round(rawEstimate / 1024)} KB），没有读取`)
+        continue
+      }
       if (totalBytes + rawEstimate > MAX_TOTAL_IMAGE_BYTES) {
         notes.push('图片总大小超过上限，最后几张没有读取')
         continue
@@ -157,10 +209,6 @@ export async function hydrateImageAttachments(
       const response = await downloadImage(image.url)
 
       const buffer = response.bytes
-      if (buffer.byteLength > MAX_IMAGE_BYTES) {
-        notes.push(`有一张图片太大（${Math.round(buffer.byteLength / 1024)} KB），没有读取`)
-        continue
-      }
       // 单张合格但累计超限：说明「几张中等图叠起来」已经逼近内存与 CPU 预算
       if (totalBytes + buffer.byteLength > MAX_TOTAL_IMAGE_BYTES) {
         notes.push('图片总大小超过上限，最后几张没有读取')
@@ -171,11 +219,15 @@ export async function hydrateImageAttachments(
       hydrated.push({
         ...image,
         dataBase64: arrayBufferToBase64(buffer),
-        ...(image.contentType
-          ? {}
-          : { contentType: response.contentType ?? 'image/jpeg' }),
+        contentType: image.contentType?.startsWith('image/')
+          ? image.contentType
+          : response.contentType?.startsWith('image/') ? response.contentType : 'image/jpeg',
       })
     } catch (error) {
+      if (error instanceof ImageTooLargeError) {
+        notes.push(`有一张图片太大（${Math.round(error.bytes / 1024)} KB），没有读取`)
+        continue
+      }
       if (error instanceof HttpStatusError) {
         notes.push(`有一张图片下载失败（HTTP ${error.status}）`)
         continue

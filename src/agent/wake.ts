@@ -45,6 +45,7 @@
  */
 import type { Session } from '@qqbot/sdk'
 import type { AgentConfig } from '../config/index.js'
+import { isTextMessage } from './inbound.js'
 
 /** 唤醒结果：不唤醒时给出原因，便于日志与排障 */
 export type WakeDecision =
@@ -95,7 +96,7 @@ export function decideWake(session: Session, config: AgentConfig): WakeDecision 
   if (session.addressedToOthers) return { wake: false, reason: 'addressed-to-others' }
 
   const raw = session.content ?? ''
-  if (!raw.trim() && !(session.attachments?.length ?? 0)) return { wake: false, reason: 'empty' }
+  if (!isTextMessage(session)) return { wake: false, reason: 'empty' }
 
   // 技能激活是一条**特殊情况**：`/skill <id> <任务>` 必须进模型，
   // 因为技能正文只有模型才能用上。

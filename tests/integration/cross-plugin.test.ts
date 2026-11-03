@@ -274,11 +274,15 @@ describe('真实跨插件调用', () => {
     )
     const h = await harness(chat, [p])
     const claim = await h.agent.submit(await h.authorize())
+    const saveCheckpoint = vi.spyOn(h.agent, 'saveCheckpoint')
     expect((await h.run(h.ctx, h.agent, claim)).ok).toBe(false)
     expect(h.reply).toHaveBeenCalledWith(expect.stringContaining('结果尚未确认'))
     expect(write).toHaveBeenCalledTimes(1)
     expect(chat).toHaveBeenCalledTimes(1)
-    expect((await h.agent.checkpoint(claim.runId!))?.inFlight?.name).toBe('plugin.writer.query')
+    expect(saveCheckpoint.mock.calls.at(-1)?.[1].inFlight?.name).toBe('plugin.writer.query')
+    expect(await h.agent.runStatus(claim.runId!)).toBe('failed')
+    expect(await h.agent.checkpoint(claim.runId!)).toBeNull()
+    expect(await h.agent.poll()).toEqual({ acquired: false })
   })
 
   it('旧注册入口保留兼容，但自报的提供者不能越过框架服务依赖', async () => {
