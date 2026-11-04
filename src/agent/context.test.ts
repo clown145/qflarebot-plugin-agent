@@ -286,7 +286,7 @@ describe('插件提示词片段注入', () => {
       pluginPrompts: ['## 来自插件 weather\n天气要用中文'],
     })
     const content = systemOf(messages)
-    expect(content.indexOf('天气要用中文')).toBeLessThan(content.indexOf('纯文本'))
+    expect(content.indexOf('天气要用中文')).toBeLessThan(content.indexOf('不要输出思考过程'))
   })
 
   it('没有片段时不产生空段落', () => {

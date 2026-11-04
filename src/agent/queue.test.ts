@@ -181,8 +181,8 @@ describe('执行流与 DO 队列的衔接', () => {
     expect(vi.mocked(s.llm.chat).mock.calls[0]?.[0].messages.at(-1)?.content).toContain('old request')
     expect(vi.mocked(s.llm.chat).mock.calls[1]?.[0].messages.at(-1)?.content).toContain('new request')
     expect(s.send.mock.calls.map((call) => call[2]?.messageId)).toEqual(['old-user-message', 'new-user-message'])
-    expect(s.send.mock.calls[0]?.[1]).toMatchObject({ text: expect.stringContaining('old-user') })
-    expect(s.send.mock.calls[1]?.[1]).toMatchObject({ text: expect.stringContaining('new-user') })
+    expect(s.send.mock.calls[0]?.[1]).toMatchObject({ markdown: { content: expect.stringContaining('old-user') } })
+    expect(s.send.mock.calls[1]?.[1]).toMatchObject({ markdown: { content: expect.stringContaining('new-user') } })
     expect((await s.agent.history(20)).filter((item) => item.role === 'user').map((item) => item.content))
       .toEqual(['old request', 'new request'])
   })
@@ -198,6 +198,10 @@ describe('执行流与 DO 队列的衔接', () => {
     expect(requests).toHaveLength(2)
     expect(requests[0]?.[0].messages.at(-1)?.content).toContain('old request')
     expect(requests[1]?.[0].messages.at(-1)?.content).toContain('new reminder')
+    expect(s.send.mock.calls.map((call) => call[1])).toEqual([
+      { markdown: { content: '<@old-user> 完成' } },
+      { markdown: { content: expect.stringContaining('完成') } },
+    ])
     expect(await s.agent.stats()).toMatchObject({ locked: false, pending: 0 })
   })
 

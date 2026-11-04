@@ -257,7 +257,7 @@ async function runLoopOnce(input: {
   //
   // **人格提示词是追加，不是替换**（`personaPrompt` 单独传）：
   // 基础提示词里的运行时约定（时间、会话、工具规范、回复格式）不能被丢掉，
-  // 否则配了人格之后模型就开始输出 Markdown、也不知道有工具了。
+  // 否则配了人格之后模型就丢失回复约定、也不知道有工具了。
   // 其他插件注册的提示词片段。读失败不该中断对话——这是增强，不是必需品。
   // 注意它属于 system 的**稳定部分**：只要插件不改片段，前缀缓存就命中。
   const fragmentBlock = buildFragmentBlock(
@@ -549,7 +549,7 @@ export async function executeRun(
       replied = (await reply.media(item).catch(() => false)) || replied
     }
 
-    // 4b. 再发纯文本。工具已经发过就不重复发
+    // 4b. 再发模型的文本回复。工具已经发过就不重复发
     //
     // 出站也要过一遍内容安全（对标 AstrBot 的 ResultDecorateStage）：
     // 只查入站不够——模型可能把用户诱导出的敏感内容再复述一遍，
@@ -823,7 +823,8 @@ export function replyFromSession(session: {
   reply: (message: import('@qqbot/sdk').OutgoingMessage) => Promise<{ ok: boolean }>
 }): ReplyFn {
   const reply = (async (text: string) => {
-    const result = await session.reply(text)
+    // 与 API 回复通道一致：原生 Markdown 被拒绝时由框架回退为文本。
+    const result = await session.reply({ markdown: { content: text } })
     return result.ok
   }) as ReplyFn
 

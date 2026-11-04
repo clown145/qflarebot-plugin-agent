@@ -1071,7 +1071,8 @@ function makeApiReply(
   const reply = (async (text: string) => {
     // @ 只加在**文本**回复上：媒体消息带 @ 会变成独立一行，看着很怪
     const withAt = withMention(text, message.userId, message.scene, mentionMode)
-    const result = await ctx.api.sendMessage(target, { text: withAt }, nextOptions())
+    // 默认使用原生 Markdown；明确的 MD 权限拒绝由框架回退为文本，保留被动回复凭据。
+    const result = await ctx.api.sendMessage(target, { markdown: { content: withAt } }, nextOptions())
     if (!result.ok) {
       ctx.logger.warn('主动回复失败', { conversation: message.conversation, error: result.error })
     }

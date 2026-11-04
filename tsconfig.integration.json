@@ -5,6 +5,9 @@
       "@qqbot/runtime/testing": [
         "../QFlareBot/packages/runtime/src/testing/index.ts"
       ],
+      "@qqbot/api": [
+        "../QFlareBot/packages/api/src/index.ts"
+      ],
       "@qflarebot-test/t2i": [
         "../QFlareBot/plugins/t2i/src/index.ts"
       ]

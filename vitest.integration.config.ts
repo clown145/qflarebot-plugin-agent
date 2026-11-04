@@ -14,6 +14,9 @@ export default defineConfig({
       '@qqbot/runtime/testing': fileURLToPath(
         new URL('../QFlareBot/packages/runtime/src/testing/index.ts', import.meta.url),
       ),
+      '@qqbot/api': fileURLToPath(
+        new URL('../QFlareBot/packages/api/src/index.ts', import.meta.url),
+      ),
       '@qflarebot-test/t2i': fileURLToPath(
         new URL('../QFlareBot/plugins/t2i/src/index.ts', import.meta.url),
       ),

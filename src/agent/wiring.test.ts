@@ -216,7 +216,7 @@ describe('工具白名单与提示词一致', () => {
  * `req.system_prompt += "\n# Persona Instructions\n\n{prompt}\n"`）。
  *
  * 为什么单独测：早期实现是 `persona.prompt ?? config.system_prompt`（替换），
- * 结果配了人格就丢掉了全部运行时信息——模型开始输出 Markdown、不知道现在几点、
+ * 结果配了人格就丢掉了全部运行时信息——模型丢失回复约定、不知道现在几点、
  * 也不知道自己有工具。这类回归不会报错，只会「用着不对劲」，所以必须锁住。
  */
 describe('人格提示词是追加不是替换', () => {
@@ -243,7 +243,9 @@ describe('人格提示词是追加不是替换', () => {
     const userContent = String(last && 'content' in last ? last.content : '')
 
     // 回复格式要求（稳定）留在 system
-    expect(systemContent).toContain('纯文本')
+    expect(systemContent).toContain('不要输出思考过程')
+    expect(systemContent).not.toContain('纯文本')
+    expect(systemContent).not.toContain('不要用 Markdown')
     // 时间/会话（每轮变）在 user 里，避免破坏缓存
     expect(userContent).toContain('现在时间')
     expect(userContent).not.toBe('')
@@ -264,7 +266,7 @@ describe('人格提示词是追加不是替换', () => {
     const messages = buildMessages(message, [], { ...baseOptions, personaPrompt })
     const system = messages[0]
     const content = system && system.role === 'system' ? String(system.content) : ''
-    expect(content.indexOf('# Persona Instructions')).toBeLessThan(content.indexOf('纯文本'))
+    expect(content.indexOf('# Persona Instructions')).toBeLessThan(content.indexOf('不要输出思考过程'))
   })
 
   it('没有人格时不出现人格段落（不留空标题）', () => {
